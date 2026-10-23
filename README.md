@@ -117,8 +117,9 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
 
 ## 已知限制
 
-- **只实现 HAP 加密路径**：老式 raw 配对（`X-Apple-HKP: 3`）和 AES-CTR 视频加密没有实现。
-  现代 Apple TV 走的就是 HAP。
+- **只实现 HAP（TLV8）配对**：最早的那套裸二进制配对（68/96 字节交换、控制通道不加密）和
+  AES-CTR 视频加密没有实现。现代 Apple TV 与 macOS 接收器走的都是 HAP。
+  注意 `X-Apple-HKP: 3` 不是"裸配对"：它仍是 HAP TLV8，只是配对类型不同（见上表）。
 - **没有音频**：SETUP 里给了音频描述（含 32 字节音频流密钥占位），但不发音频包。
 - **没有 mDNS 发现**：接收端地址写在配置里。
 - **没有编码器**：画面内容在编译期固定；`tools/make_frames.py` 换图即可。
