@@ -1,0 +1,4 @@
+__pycache__/
+hap_tests
+hap_tests.dSYM/
+build/

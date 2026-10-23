@@ -1,0 +1,29 @@
+idf_component_register(
+    SRCS
+        "src/hap_tlv.c"
+        "src/hap_mpi.c"
+        "src/hap_srp.c"
+        "src/hap_setup.c"
+        "src/hap_verify.c"
+        "src/hap_channel.c"
+        "src/hap_kdf.c"
+        "src/hap_identity.c"
+        "src/hap_x25519.c"
+        "third_party/ed25519/randombytes.c"
+        "third_party/ed25519/add_scalar.c"
+        "third_party/ed25519/fe.c"
+        "third_party/ed25519/ge.c"
+        "third_party/ed25519/key_exchange.c"
+        "third_party/ed25519/keypair.c"
+        "third_party/ed25519/sc.c"
+        "third_party/ed25519/sign.c"
+        "third_party/ed25519/verify.c"
+        "third_party/ed25519/sha512.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+        "third_party/ed25519"
+    REQUIRES
+        mbedtls
+)

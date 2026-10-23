@@ -1,0 +1,18 @@
+/*
+ * Copy this file to app_config_local.h (same directory) and fill in the
+ * values for your network. app_config_local.h is git-ignored.
+ */
+#pragma once
+
+#define APP_WIFI_SSID "your-ssid"
+#define APP_WIFI_PASSWORD "your-password"
+
+/* Apple TV / test receiver address on that network. */
+#define APP_AIRPLAY_TARGET_HOST "192.168.1.10"
+#define APP_AIRPLAY_TARGET_PORT 7000
+
+/* Optional overrides */
+// #define APP_DEVICE_NAME "ESP32-S3 AirPlay"
+// #define APP_FRAME_INTERVAL_MS 10000
+// #define APP_FALLBACK_AP_SSID "airplay-esp32"
+// #define APP_FALLBACK_AP_PASSWORD "airplay1234"
