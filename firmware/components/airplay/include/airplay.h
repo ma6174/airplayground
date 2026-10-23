@@ -54,6 +54,14 @@ typedef struct {
  * the receiver goes away or the connection fails. Blocking. */
 esp_err_t airplay_mirror(const airplay_config_t *config);
 
+/* Politely ends the session that airplay_mirror is running (or about to run).
+ * Safe to call from any task and when no session is live; the call returns
+ * once the control connection has been torn down. */
+void airplay_request_stop(void);
+
+/* True between airplay_mirror being requested and it returning. */
+bool airplay_is_running(void);
+
 /* After a failed session: how long the receiver asked us to stay away. Pairing
  * failures are throttled with a HomeKit backoff, and retrying early only
  * extends it. Zero when the failure carried no backoff. */

@@ -66,12 +66,19 @@ python -m esptool --port /dev/cu.usbmodem1101 --after watchdog-reset chip-id
 
 ### 3. 运行
 
-上电后固件会：跑 FairPlay 自检 → 连 Wi-Fi → 读/建控制器身份 → 配对 → FairPlay → SETUP →
-循环发送静态帧。会话中断后每 10 秒重试一次。
+上电后固件：FairPlay 自检 → 连 Wi-Fi → 起控制页面，然后**空闲待命，不主动连接**。
+投屏由设备自带的 HTTP 接口触发（GET/POST 均可）：
+
+```sh
+curl http://<设备IP>:8080/start    # 开始投屏（未配对时会先要配对码）
+curl http://<设备IP>:8080/stop     # 礼貌断开（向接收端发 TEARDOWN）
+curl http://<设备IP>:8080/status   # idle / mirroring / 上次会话的结束原因
+```
+
+配对码的三条投递通道见 [docs/runbook.md](docs/runbook.md)。
 
 电视上看到的内容：`ESP32-S3 / AirPlay mirroring`、`FairPlay OK`（协议阶段清单）、
 `Still image`（说明画面上是预编码帧），每 10 秒切换一张。
-
 ## 没有 Wi-Fi 密码时：让设备自己开热点
 
 `APP_WIFI_SSID` 留空时，设备不连外部网络，而是起一个热点

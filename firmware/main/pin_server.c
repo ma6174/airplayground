@@ -11,6 +11,7 @@ static const char *TAG = "pin_server";
 
 static httpd_handle_t s_server;
 static QueueHandle_t s_codes;
+static pin_server_session_hooks_t s_hooks;
 
 /* The queue is also the wake-up: waiting on it is a real block, unlike polling
  * a flag that depends on both tasks being scheduled. */
@@ -93,6 +94,32 @@ void pin_server_submit(const char pin[5])
     }
 }
 
+void pin_server_set_session_hooks(const pin_server_session_hooks_t *hooks)
+{
+    s_hooks = hooks == NULL ? (pin_server_session_hooks_t){0} : *hooks;
+}
+
+/* One shared handler for the three session endpoints: the answer is whatever
+ * the hook returns, so curl shows a plain sentence instead of a status page. */
+static esp_err_t handle_session(httpd_req_t *request)
+{
+    const char *(*hook)(void) = NULL;
+    if (strcmp(request->user_ctx, "start") == 0) {
+        hook = s_hooks.start;
+    } else if (strcmp(request->user_ctx, "stop") == 0) {
+        hook = s_hooks.stop;
+    } else {
+        hook = s_hooks.status;
+    }
+
+    httpd_resp_set_type(request, "text/plain");
+    if (hook == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "session control not wired up\n");
+    }
+    return httpd_resp_send(request, hook(), HTTPD_RESP_USE_STRLEN);
+}
+
 esp_err_t pin_server_start(void)
 {
     if (s_server != NULL) {
@@ -118,9 +145,19 @@ esp_err_t pin_server_start(void)
 
     httpd_uri_t form = {.uri = "/", .method = HTTP_GET, .handler = handle_form};
     httpd_uri_t pin = {.uri = "/pin", .method = HTTP_POST, .handler = handle_pin};
+    httpd_uri_t start = {.uri = "/start", .method = HTTP_GET,
+                         .handler = handle_session, .user_ctx = "start"};
+    httpd_uri_t stop = {.uri = "/stop", .method = HTTP_GET,
+                        .handler = handle_session, .user_ctx = "stop"};
+    httpd_uri_t status = {.uri = "/status", .method = HTTP_GET,
+                          .handler = handle_session, .user_ctx = "status"};
     httpd_register_uri_handler(s_server, &form);
     httpd_register_uri_handler(s_server, &pin);
-    ESP_LOGI(TAG, "pairing page on http://<device>:%d/", PIN_SERVER_PORT);
+    httpd_register_uri_handler(s_server, &start);
+    httpd_register_uri_handler(s_server, &stop);
+    httpd_register_uri_handler(s_server, &status);
+    ESP_LOGI(TAG, "pairing page on http://<device>:%d/ (also /start /stop /status)",
+             PIN_SERVER_PORT);
     return ESP_OK;
 }
 

@@ -29,6 +29,12 @@ static ap_session_t s_session;
  * receiver counts as a failure. */
 static bool s_receiver_wants_pin;
 
+/* Session state shared with whoever may call airplay_request_stop() from
+ * another task. Plain volatile bools: single writer each, and the frame loop
+ * only needs to see the value eventually. */
+static volatile bool s_mirroring;
+static volatile bool s_stop_requested;
+
 static uint64_t random_u64(void)
 {
     uint64_t value = 0;
@@ -707,7 +713,7 @@ static esp_err_t stream_frames(ap_session_t *session)
     int feedback_failures = 0;
     esp_err_t result = ESP_OK;
 
-    while (!session->stop) {
+    while (!session->stop && !s_stop_requested) {
         uint64_t now = ap_millis();
 
         if (now >= next_feedback) {
@@ -898,6 +904,9 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
+    s_mirroring = true;
+    s_stop_requested = false;
+
     ap_session_t *session = &s_session;
     memset(session, 0, sizeof(*session));
     session->config = config;
@@ -970,5 +979,16 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
     } else {
         AP_LOGI("mirroring session ended");
     }
+    s_mirroring = false;
     return result;
+}
+
+void airplay_request_stop(void)
+{
+    s_stop_requested = true;
+}
+
+bool airplay_is_running(void)
+{
+    return s_mirroring;
 }
