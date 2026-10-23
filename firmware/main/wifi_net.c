@@ -71,6 +71,10 @@ static esp_err_t start_station(const wifi_net_config_t *config)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &station));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Modem sleep (the default) drops multicast between DTIMs, and mDNS
+     * announcements are multicast: receivers that only announce on boot would
+     * never be seen. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     EventBits_t bits = xEventGroupWaitBits(s_events, CONNECTED_BIT | FAILED_BIT, pdFALSE, pdFALSE,
                                            pdMS_TO_TICKS(30000));

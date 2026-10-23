@@ -7,7 +7,9 @@
 #define APP_WIFI_SSID "your-ssid"
 #define APP_WIFI_PASSWORD "your-password"
 
-/* Apple TV / test receiver address on that network. */
+/* Apple TV / test receiver address on that network. This is the default
+ * target for /start; at runtime any discovered receiver can be used instead
+ * via /start?name=<receiver> (see GET /targets). */
 #define APP_AIRPLAY_TARGET_HOST "192.168.1.10"
 #define APP_AIRPLAY_TARGET_PORT 7000
 

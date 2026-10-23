@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 
@@ -15,13 +16,21 @@
 
 esp_err_t pin_server_start(void);
 
-/* Handlers for the session-control endpoints (/start, /stop, /status). Each
- * returns a short one-line answer; NULL hooks make the endpoints report that
- * session control is unavailable. */
+/* Handlers for the session-control endpoints. Each returns a short one-line
+ * answer; NULL hooks make the endpoints report that session control or
+ * discovery is unavailable. */
 typedef struct {
-    const char *(*start)(void);
+    /* name and host come from the /start query string (?name= or ?host=, plus
+     * an optional ?port=); NULL or empty means the configured default
+     * receiver. */
+    const char *(*start)(const char *name, const char *host, int port);
     const char *(*stop)(void);
     const char *(*status)(void);
+    /* Writes the discovered receiver list into buf; returns buf, or NULL when
+     * the browse failed. The browse blocks for a couple of seconds. */
+    const char *(*targets)(char *buf, size_t len);
+    /* Drops the receiver with this name from the list. */
+    const char *(*forget)(const char *name);
 } pin_server_session_hooks_t;
 
 void pin_server_set_session_hooks(const pin_server_session_hooks_t *hooks);
