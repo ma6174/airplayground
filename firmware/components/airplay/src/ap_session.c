@@ -174,8 +174,11 @@ static esp_err_t pair_setup(ap_session_t *session, const char *pin)
     for (int step = 0; step < 3; step++) {
         if (ap_client_request(&session->client, "POST", "/pair-setup", AP_CONTENT_TYPE_OCTET,
                               session->msg, message_len, headers, &response) != 0) {
-            AP_LOGE("pair-setup: step %d rejected (status %d); this sender implements HAP pairing "
-                    "only", step + 1, response.status);
+            size_t rejected_len = 0;
+            const uint8_t *rejected = ap_client_body(&session->client, &rejected_len);
+            AP_LOGE("pair-setup: step %d rejected (status %d, %u body bytes)", step + 1,
+                    response.status, (unsigned)rejected_len);
+            ap_log_hex("pair-setup rejection", rejected, rejected_len);
             goto done;
         }
 
