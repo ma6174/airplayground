@@ -11,3 +11,4 @@ firmware/main/app_config_local.h
 # Editor and OS noise
 .DS_Store
 *.swp
+firmware/.cache/

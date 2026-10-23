@@ -25,6 +25,67 @@
 
 static const char *TAG = "app";
 
+/* Session control state, touched from the HTTP server task and the session
+ * task. Single-writer volatile bools are enough: the readers only need the
+ * value eventually. */
+static volatile bool s_session_stop;
+static char s_last_result[80];
+static TaskHandle_t s_session_task;
+static airplay_config_t s_config;
+/* The session task outlives app_main, so everything the config points at must
+ * not live on app_main's stack. */
+static hap_identity_t s_identity;
+static char s_local_ip[16];
+
+static void session_task(void *argument)
+{
+    (void)argument;
+    snprintf(s_last_result, sizeof(s_last_result), "idle since boot");
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_session_stop) {
+            /* /stop arrived before the session even started. */
+            s_session_stop = false;
+            snprintf(s_last_result, sizeof(s_last_result), "stopped before it started");
+            continue;
+        }
+        ESP_LOGI(TAG, "starting a mirroring session on request");
+        esp_err_t err = airplay_mirror(&s_config);
+        snprintf(s_last_result, sizeof(s_last_result),
+                 err == ESP_OK ? "last session: ok" : "last session: %s",
+                 err == ESP_OK ? "" : esp_err_to_name(err));
+        /* The session ends on failure, on /stop, or when the receiver goes
+         * away. Nothing restarts it automatically: /start does that. */
+        s_session_stop = false;
+        ESP_LOGI(TAG, "%s", s_last_result);
+    }
+}
+
+static const char *hook_start(void)
+{
+    if (airplay_is_running()) {
+        return "already mirroring\n";
+    }
+    s_session_stop = false;
+    xTaskNotifyGive(s_session_task);
+    return "starting\n";
+}
+
+static const char *hook_stop(void)
+{
+    if (!airplay_is_running()) {
+        return "not mirroring\n";
+    }
+    s_session_stop = true;
+    airplay_request_stop();
+    return "stopping\n";
+}
+
+static const char *hook_status(void)
+{
+    return airplay_is_running() ? "mirroring\n" : s_last_result;
+}
+
 static void log_banner(void)
 {
     esp_chip_info_t chip;
@@ -106,6 +167,10 @@ static bool prompt_pin(char pin[5], void *user_data)
 
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(180000);
     while (xTaskGetTickCount() < deadline) {
+        if (s_session_stop) {
+            ESP_LOGW(TAG, "stop requested; giving up on the pairing code");
+            return false;
+        }
         if (pin_server_wait(pin, 5000)) {
             ESP_LOGI(TAG, "pairing code accepted");
             return true;
@@ -135,8 +200,8 @@ void app_main(void)
     ESP_LOGW(TAG, "self-test disabled (APP_RUN_SELFTEST=0)");
 #endif
 
-    hap_identity_t identity;
-    if (app_identity_load(&identity) != ESP_OK) {
+    hap_identity_t *identity = &s_identity;
+    if (app_identity_load(identity) != ESP_OK) {
         ESP_LOGE(TAG, "no controller identity; pairing will not survive a reboot");
     }
 
@@ -153,8 +218,8 @@ void app_main(void)
         return;
     }
 
-    char local_ip[16];
-    wifi_net_ip(local_ip, sizeof(local_ip));
+    char *local_ip = s_local_ip;
+    wifi_net_ip(local_ip, sizeof(s_local_ip));
     if (pin_server_start() != ESP_OK) {
         ESP_LOGW(TAG, "pairing web page unavailable; PIN can still arrive over the bench hook");
     }
@@ -179,15 +244,20 @@ void app_main(void)
         .request_pin = prompt_pin,
         .frames = media_still_frames(),
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
-        .identity = &identity,
+        .identity = identity,
     };
+    s_config = config;
 
-    for (;;) {
-        err = airplay_mirror(&config);
-        uint32_t backoff = airplay_backoff_ms();
-        uint32_t wait_ms = backoff > 10000 ? backoff + 2000 : 10000;
-        ESP_LOGW(TAG, "session finished (%s); retrying in %u s", esp_err_to_name(err),
-                 (unsigned)(wait_ms / 1000));
-        vTaskDelay(pdMS_TO_TICKS(wait_ms));
+    static const pin_server_session_hooks_t hooks = {
+        .start = hook_start,
+        .stop = hook_stop,
+        .status = hook_status,
+    };
+    pin_server_set_session_hooks(&hooks);
+    if (xTaskCreate(session_task, "session", 8192, NULL, 4, &s_session_task) != pdPASS) {
+        ESP_LOGE(TAG, "cannot start the session task; mirroring is unavailable");
+        return;
     }
+    ESP_LOGI(TAG, "idle; POST/GET http://%s:%d/start to begin mirroring", local_ip,
+             PIN_SERVER_PORT);
 }

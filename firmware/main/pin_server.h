@@ -15,6 +15,17 @@
 
 esp_err_t pin_server_start(void);
 
+/* Handlers for the session-control endpoints (/start, /stop, /status). Each
+ * returns a short one-line answer; NULL hooks make the endpoints report that
+ * session control is unavailable. */
+typedef struct {
+    const char *(*start)(void);
+    const char *(*stop)(void);
+    const char *(*status)(void);
+} pin_server_session_hooks_t;
+
+void pin_server_set_session_hooks(const pin_server_session_hooks_t *hooks);
+
 /* Returns true and fills pin (4 digits + NUL) once a code has been submitted. */
 bool pin_server_take(char pin[5]);
 

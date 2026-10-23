@@ -6,11 +6,12 @@
 ## 硬件与串口
 
 - 板子：esp32-s3-wroom-1，16 MB flash。
-- 两个 USB 口都是 **USB-Serial/JTAG**（`/dev/cu.usbmodem1101`、`/dev/cu.usbmodem585A0472461`），
-  同一块板的两个口，flash 和日志走哪个都行；约定 flash/日志用 `/dev/cu.usbmodem1101`。
+- 两个 USB 口都是 **USB-Serial/JTAG**（设备名形如 `/dev/cu.usbmodem…`，每台主机、每个口
+  都不一样，用 `ls /dev/cu.usbmodem*` 现查）。flash 和日志走哪个都行。
 - **控制台只能读不能写**：USB-Serial/JTAG 口上主机写入的字节到不了固件的 `STDIN`
   （设备侧 `read()` 一直 `EAGAIN`；UART0 口同理）。所以配对码不要走串口输入，
   用下面的 HTTP 投递通道。
+- 烧写时会独占串口：常驻的日志桥接要先停掉，烧完再起新的（见下文）。
 - 烧写/日志/配对是三种不同的线序需求，换线前先看本文对应小节，不要凭感觉插拔。
 
 ## 编译
@@ -31,18 +32,19 @@ cd firmware/components/airplay/test && ./run.sh
 ## 烧写、复位、看日志
 
 ```sh
-idf.py -p /dev/cu.usbmodem1101 flash
+idf.py -p /dev/cu.usbmodem… flash
 # S3 烧完停在 download 模式，app 不会自己跑，复位一下：
-python -m esptool --port /dev/cu.usbmodem1101 --after watchdog-reset chip-id
+python -m esptool --port /dev/cu.usbmodem… --after watchdog-reset chip-id
 ```
 
-`chip-id` 只是借这条命令发复位，不用换线、不用拔插。
+`chip-id` 只是借这条命令发复位，不用换线、不用拔插。注意先停掉占着串口的日志桥接，
+复位成功后再启动（桥接开着 esptool 打不开串口）。
 
-看日志用 `idf.py -p /dev/cu.usbmodem1101 monitor`，或常驻的桥接脚本
+看日志用 `idf.py -p /dev/cu.usbmodem… monitor`，或常驻的桥接脚本
 （日志落文件，方便 grep；FIFO 入参用于带真实 UART 控制台的板子，本板用不上）：
 
 ```sh
-python3 firmware/tools/pin_bridge.py /dev/cu.usbmodem1101 /tmp/pin_fifo > /tmp/bridge.log 2>&1 &
+~/.espressif/python_env/*/bin/python firmware/tools/pin_bridge.py /dev/cu.usbmodem… /tmp/pin_fifo > /tmp/bridge.log 2>&1 &
 tail -f /tmp/bridge.log        # 日志里偶有二进制字节，grep 记得加 -a
 ```
 
@@ -79,7 +81,8 @@ Wi-Fi、目标接收端等凭据放在 `firmware/main/app_config_local.h`
    python3 -m http.server 7001 --bind <主机IP> --directory /tmp/pin_serve
    ```
 
-3. 复位设备，等日志出现 `waiting for the pairing code`，同时接收端屏幕会显示 4 位码。
+3. 复位设备后调 `curl http://<设备IP>:8080/start` 触发连接（固件平时空闲，不会自己连），
+   等日志出现 `waiting for the pairing code`，同时接收端屏幕会显示 4 位码。
 4. **一分钟内**把码投进去（设备每 2 秒来拉一次）：
 
    ```sh
@@ -87,8 +90,8 @@ Wi-Fi、目标接收端等凭据放在 `firmware/main/app_config_local.h`
    ```
 
 5. 等日志走到 `pair-setup complete` → FairPlay 握手 → 三段 SETUP → `frame 0 sent`。
-6. 成功一次之后，接收端记住了这台设备：以后每次上电直接 pair-verify，
-   约 1 秒开流，**不再要码**。
+6. 成功一次之后，接收端记住了这台设备：以后每次只需 `curl /start`，
+   pair-verify 直接过（实测 1 秒开流），**不再要码**。
 
 ## 「AirPlay server 限制」：失败惩罚与解除
 
@@ -98,6 +101,20 @@ Wi-Fi、目标接收端等凭据放在 `firmware/main/app_config_local.h`
 - **解除**：`killall ControlCenter`。关开「隔空播放接收器」开关**无效**。
 - **纪律**：一次配对一次对。投递通道先起好、看到屏幕码再写、写完盯日志；
   不确定码对不对就等下一轮，不要连续重试把惩罚拉满。
+
+## 会话控制接口
+
+设备平时空闲；投屏会话由 HTTP 接口控制（设备 `8080` 端口，GET/POST 均可）：
+
+| 接口 | 作用 |
+|---|---|
+| `GET /start` | 开始一次投屏会话；正在投则回 `already mirroring` |
+| `GET /stop` | 礼貌结束会话（TEARDOWN）；空闲时回 `not mirroring` |
+| `GET /status` | `mirroring` 或最近一次会话的结束原因 |
+| `GET /` | 配对码输入页 |
+| `POST /pin` | 提交互配对码（`code=1234`） |
+
+配对等待、SETUP 阶段、送帧循环里都会响应 `/stop`，停止时向接收端发 TEARDOWN。
 
 ## 配对类型速查（X-Apple-HKP）
 
