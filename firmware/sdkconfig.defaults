@@ -12,8 +12,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-CONFIG_LWIP_MAX_SOCKETS=8
+CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_SO_RCVTIMEO=y
+CONFIG_LWIP_SO_SNDTIMEO=y
 
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
@@ -24,11 +26,11 @@ CONFIG_MBEDTLS_HKDF_C=y
 CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
 
-# Logs go out on UART0 (the board's USB-UART port) and are mirrored to the
-# native USB-Serial/JTAG port, so either cable works. Only UART0 accepts input,
-# which matters for the pairing-code prompt.
-CONFIG_ESP_CONSOLE_UART_DEFAULT=y
-CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+# The native USB-Serial/JTAG port is the console: it is also the port used for
+# flashing, and it is the only path that can accept input for the pairing-code
+# prompt.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 
 # SRP-6a needs a few seconds of uninterrupted big-integer work during
 # pairing, which starves the idle task.

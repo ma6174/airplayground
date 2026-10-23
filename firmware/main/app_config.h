@@ -38,11 +38,30 @@
 #define APP_DEVICE_NAME "ESP32-S3 AirPlay"
 #endif
 
+/* Set to 1 for receivers that ask for an on-screen code (Apple TV, macOS
+ * AirPlay receiver): go straight to the code flow, because a failed
+ * empty-PIN attempt makes the receiver throttle the next pairing. */
+#ifndef APP_FORCE_PIN_PAIRING
+#define APP_FORCE_PIN_PAIRING 0
+#endif
+
 /* 4-digit code for receivers that demand one. Leave empty to be prompted on the
  * console when the receiver asks (Apple TV shows the code on screen only when
  * the session needs it). */
 #ifndef APP_PAIRING_PIN
 #define APP_PAIRING_PIN ""
+#endif
+
+/* Bench helper: when non-zero, the device polls http://<receiver host>:<port>/pin
+ * for the pairing code. Useful when the network does not allow the browser or
+ * curl to reach the device itself. Zero disables it. */
+#ifndef APP_PIN_FETCH_PORT
+#define APP_PIN_FETCH_PORT 0
+#endif
+
+/* Host that serves the code (defaults to the receiver). */
+#ifndef APP_PIN_FETCH_HOST
+#define APP_PIN_FETCH_HOST APP_AIRPLAY_TARGET_HOST
 #endif
 
 /* Fallback access point, used when APP_WIFI_SSID is empty. */

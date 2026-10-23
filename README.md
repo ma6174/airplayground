@@ -124,8 +124,13 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
 - **没有编码器**：画面内容在编译期固定；`tools/make_frames.py` 换图即可。
 - **配对要等**：SRP-6a 的 3072 位模幂在 S3 上一轮约 8 秒（期间 CPU 打满，看门狗超时已调到 30 秒）。
   接收端接受过这台设备后，后续会话走 pair-verify，不再重跑 SRP。
-- **PIN 流程靠串口输入**：接收端要配对码时，串口提示后 60 秒内输入 4 位数字，或在
-  `app_config_local.h` 里预置 `APP_PAIRING_PIN`。
+- **配对码有三条输入路径**：本机 HTTP 页面（`http://<device>:8080/`）、串口、以及
+  `APP_PIN_FETCH_PORT` 指向的"设备去拉码"钩子（某些网络不允许主机连设备）。
+  也可以直接把码编译进 `APP_PAIRING_PIN`。
+- **接收端限流要遵守**：配对失败会被 HomeKit 退避（最长可达 30 分钟），重试过早只会
+  延长惩罚；固件会读 `0x08` 重试延迟并等满（`airplay_backoff_ms()`）。
+- **要求配对码的接收端要设 `APP_FORCE_PIN_PAIRING=1`**：先试 transient 会失败，而那次
+  失败本身会触发限流，把携带正确码的尝试挡在门外。
 
 ## 调试
 
@@ -152,6 +157,10 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
   三段 SETUP → 数据通道 → RECORD → 逐帧发送 → 心跳/feedback/事件通道，接收端侧
   `fairplay=44 setup=40 video=…/…B`，零错误。
 - 三套 host 测试（fairplay 474 项、hap 133 项、airplay plist/帧头/RTSP 解析）全绿。
+- 与 macOS 自带「隔空播放接收器」联调：`/info`、pair-verify、pair-setup 的 SRP 全部通过
+  （屏幕上的 4 位码被接受，M4 回 ok），M5 上传身份那一步被接收端以 **HTTP 470
+  （Connection Authorization Required）** 拒绝 —— macOS 只信任 Apple 设备，
+  需要把「允许隔空播放来自」设为「同一网络中的任何人」再试。
 
 ## 路线图
 
