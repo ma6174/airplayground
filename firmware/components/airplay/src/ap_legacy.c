@@ -51,6 +51,66 @@ void ap_legacy_aes_block(const uint8_t key[16], const uint8_t in[16], uint8_t ou
 }
 #endif
 
+/* ---------------------------------------------------------- audio packets */
+
+/* One RAOP audio packet: 12-byte RTP header, then a CBC-encrypted payload.
+ * Only the 16-byte-aligned head is encrypted; the tail travels in the clear
+ * (RPiPlay lib/raop_buffer.c:158-182). */
+int ap_legacy_audio_packet(uint8_t *out, size_t cap, uint16_t seq, uint32_t rtp_time,
+                           const uint8_t key[16], const uint8_t iv[16], size_t payload_len)
+{
+    if (cap < 12 + payload_len) {
+        return -1;
+    }
+    out[0] = 0x80;
+    out[1] = 0x60; /* payload type 96 */
+    out[2] = (uint8_t)(seq >> 8);
+    out[3] = (uint8_t)seq;
+    out[4] = (uint8_t)(rtp_time >> 24);
+    out[5] = (uint8_t)(rtp_time >> 16);
+    out[6] = (uint8_t)(rtp_time >> 8);
+    out[7] = (uint8_t)rtp_time;
+    memset(out + 8, 0, 4); /* SSRC */
+    memset(out + 12, 0, payload_len);
+
+#if defined(AP_HOST_BUILD)
+    /* The host tests only check the framing, not the CBC step. */
+    (void)key;
+    (void)iv;
+#else
+    size_t aligned = payload_len / 16 * 16;
+    if (aligned > 0) {
+        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+        psa_set_key_algorithm(&attributes, PSA_ALG_CBC_NO_PADDING);
+        psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+        psa_set_key_bits(&attributes, 128);
+        psa_key_id_t key_id = 0;
+        if (psa_import_key(&attributes, key, 16, &key_id) != PSA_SUCCESS) {
+            return -1;
+        }
+        psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
+        size_t produced = 0;
+        psa_status_t status = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CBC_NO_PADDING);
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_set_iv(&op, iv, 16);
+        }
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_update(&op, out + 12, aligned, out + 12, aligned, &produced);
+        }
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_finish(&op, out + 12 + produced, cap - 12 - produced, &produced);
+        }
+        psa_cipher_abort(&op);
+        psa_destroy_key(key_id);
+        if (status != PSA_SUCCESS) {
+            return -1;
+        }
+    }
+#endif
+    return (int)(12 + payload_len);
+}
+
 static void counter_increment(uint8_t counter[16])
 {
     for (int i = 15; i >= 0; i--) {
@@ -96,13 +156,27 @@ static void derive_labelled(const char *label, const uint8_t mixed[16], uint8_t 
 }
 
 void ap_legacy_derive_stream_keys(const uint8_t stream_key[16], const uint8_t ecdh[32],
-                                  uint64_t connection_id, uint8_t skey[16], uint8_t siv[16])
+                                  uint8_t mode, uint64_t connection_id, uint8_t skey[16],
+                                  uint8_t siv[16])
 {
+    if (mode == 3) {
+        /* No derivation at all: the AES key is the stream key and the caller
+         * supplies the IV. */
+        memcpy(skey, stream_key, 16);
+        return;
+    }
+    static const uint8_t zeros[32];
     /* ekey' = SHA512(stream_key || ecdh)[0..16] - the same mixing primitive the
      * HAP path uses, with the legacy pair-verify secret in place of the HAP one.
      * Receivers without FairPlay get the bare key (no ecdh to mix in). */
     uint8_t mixed[16];
-    fp_stream_key(stream_key, ecdh, ecdh != NULL ? 32 : 0, ecdh != NULL, mixed);
+    if (mode == 1 && ecdh != NULL) {
+        fp_stream_key(stream_key, ecdh, 32, true, mixed);
+    } else if (mode == 2) {
+        fp_stream_key(stream_key, zeros, sizeof(zeros), true, mixed);
+    } else {
+        fp_stream_key(stream_key, NULL, 0, false, mixed);
+    }
 
     char label[32];
     snprintf(label, sizeof(label), "AirPlayStreamKey%llu", (unsigned long long)connection_id);
@@ -282,8 +356,8 @@ size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
 
 /* Small static pools: the legacy SETUP trees are a handful of values built
  * from one task, mirroring ap_setup.c's approach. */
-#define AP_LEGACY_VALUE_POOL 8
-#define AP_LEGACY_ENTRY_POOL 6
+#define AP_LEGACY_VALUE_POOL 24
+#define AP_LEGACY_ENTRY_POOL 16
 static ap_plist_value_t s_values[AP_LEGACY_VALUE_POOL];
 static ap_plist_entry_t s_entries[AP_LEGACY_ENTRY_POOL];
 static size_t s_value_used;
@@ -336,6 +410,27 @@ static ap_plist_value_t *make_data(const void *ptr, size_t len)
     return value;
 }
 
+static ap_plist_value_t *make_bool(bool value)
+{
+    ap_plist_value_t *slot = value_slot();
+    if (slot != NULL) {
+        slot->type = AP_PLIST_BOOL;
+        slot->as.boolean = value;
+    }
+    return slot;
+}
+
+static ap_plist_value_t *make_string(const char *text)
+{
+    ap_plist_value_t *slot = value_slot();
+    if (slot != NULL) {
+        slot->type = AP_PLIST_STRING;
+        slot->as.bytes.ptr = text;
+        slot->as.bytes.len = strlen(text);
+    }
+    return slot;
+}
+
 static ap_plist_value_t *make_dict(ap_plist_entry_t *entries, size_t count)
 {
     ap_plist_value_t *value = value_slot();
@@ -347,43 +442,84 @@ static ap_plist_value_t *make_dict(ap_plist_entry_t *entries, size_t count)
     return value;
 }
 
-size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const uint8_t eiv[16],
-                              const uint8_t ekey[72], uint16_t timing_port)
+size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t *setup)
 {
     pool_reset();
-    ap_plist_entry_t *entries = entry_slots(3);
-    (void)0;
+    ap_plist_entry_t *entries = entry_slots(11);
     if (entries == NULL) {
         return 0;
     }
     size_t count = 0;
-    entries[count++] = (ap_plist_entry_t){ "eiv", make_data(eiv, 16) };
-    if (ekey != NULL) {
-        entries[count++] = (ap_plist_entry_t){ "ekey", make_data(ekey, 72) };
+    entries[count++] = (ap_plist_entry_t){ "eiv", make_data(setup->eiv, 16) };
+    if (setup->ekey != NULL) {
+        entries[count++] = (ap_plist_entry_t){ "ekey", make_data(setup->ekey, 72) };
     }
-    entries[count++] = (ap_plist_entry_t){ "timingPort", make_uint(timing_port) };
+    entries[count++] = (ap_plist_entry_t){ "timingPort", make_uint(setup->timing_port) };
+    entries[count++] = (ap_plist_entry_t){ "et", make_uint(32) };
+    entries[count++] = (ap_plist_entry_t){ "timingProtocol", make_string("NTP") };
+    entries[count++] = (ap_plist_entry_t){ "isScreenMirroringSession", make_bool(true) };
+    entries[count++] = (ap_plist_entry_t){ "statsCollectionEnabled", make_bool(false) };
+    /* Receivers of this class sniff the sender identity before they arm the
+     * mirroring pipeline. */
+    entries[count++] = (ap_plist_entry_t){ "sourceVersion", make_string("220.68") };
+    entries[count++] = (ap_plist_entry_t){ "model", make_string("iPhone14,2") };
+    entries[count++] = (ap_plist_entry_t){ "name", make_string("esp32") };
+    if (setup->session_uuid != NULL) {
+        entries[count++] = (ap_plist_entry_t){ "sessionUUID", make_string(setup->session_uuid) };
+    }
     ap_plist_value_t *root = make_dict(entries, count);
     return root == NULL ? 0 : ap_plist_encode(root, out, cap);
 }
 
-size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id)
+size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, bool audio,
+                              uint16_t audio_control_port)
 {
     pool_reset();
-    ap_plist_entry_t *stream_entries = entry_slots(2);
-    if (stream_entries == NULL) {
+    size_t stream_count = audio ? 2 : 1;
+    /* Array items must be contiguous values: take both slots before filling. */
+    ap_plist_value_t *items = value_slot();
+    if (items == NULL || (audio && value_slot() == NULL)) {
         return 0;
     }
-    stream_entries[0] = (ap_plist_entry_t){ "type", make_uint(110) };
-    stream_entries[1] = (ap_plist_entry_t){ "streamConnectionID", make_uint(connection_id) };
-    ap_plist_value_t *stream = make_dict(stream_entries, 2);
+
+    ap_plist_entry_t *video_entries = entry_slots(3);
+    if (video_entries == NULL) {
+        return 0;
+    }
+    video_entries[0] = (ap_plist_entry_t){ "type", make_uint(110) };
+    video_entries[1] = (ap_plist_entry_t){ "streamConnectionID", make_uint(connection_id) };
+    video_entries[2] = (ap_plist_entry_t){ "latencyMs", make_uint(100) };
+    const ap_plist_value_t *video = make_dict(video_entries, 3);
+    if (video == NULL) {
+        return 0;
+    }
+    items[0] = *video;
+
+    if (audio) {
+        ap_plist_entry_t *audio_entries = entry_slots(6);
+        if (audio_entries == NULL) {
+            return 0;
+        }
+        audio_entries[0] = (ap_plist_entry_t){ "type", make_uint(96) };
+        audio_entries[1] = (ap_plist_entry_t){ "streamConnectionID", make_uint(connection_id + 1) };
+        audio_entries[2] = (ap_plist_entry_t){ "audioFormat", make_uint(0x40000) };
+        audio_entries[3] = (ap_plist_entry_t){ "controlPort", make_uint(audio_control_port) };
+        audio_entries[4] = (ap_plist_entry_t){ "ct", make_uint(1) };
+        audio_entries[5] = (ap_plist_entry_t){ "spf", make_uint(480) };
+        const ap_plist_value_t *audio_stream = make_dict(audio_entries, 6);
+        if (audio_stream == NULL) {
+            return 0;
+        }
+        items[1] = *audio_stream;
+    }
 
     ap_plist_value_t *array = value_slot();
-    if (stream == NULL || array == NULL) {
+    if (array == NULL) {
         return 0;
     }
     array->type = AP_PLIST_ARRAY;
-    array->as.array.items = stream;
-    array->as.array.count = 1;
+    array->as.array.items = items;
+    array->as.array.count = stream_count;
 
     ap_plist_entry_t *root_entries = entry_slots(1);
     if (root_entries == NULL) {

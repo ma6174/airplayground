@@ -80,6 +80,38 @@
 #define APP_LEGACY_DATA_MODE 1
 #endif
 
+/* Port for the mirror SETUP when the receiver answers it on another port than
+ * the advertised one (0 = use the advertised port). */
+#ifndef APP_LEGACY_STREAM_PORT
+#define APP_LEGACY_STREAM_PORT 0
+#endif
+
+/* Mix the pair-verify shared secret into the mirror stream keys (the standard
+ * derivation). Turn off for receivers that always mix in zeros. */
+#ifndef APP_LEGACY_KEY_MIX
+#define APP_LEGACY_KEY_MIX 1
+#endif
+
+/* 0 derives the mirror IV, 1 sends eiv through unchanged. */
+#ifndef APP_LEGACY_IV_SOURCE
+#define APP_LEGACY_IV_SOURCE 0
+#endif
+
+/* Send the SPS/PPS in-band with every legacy sync frame. */
+#ifndef APP_LEGACY_INBAND_SPS
+#define APP_LEGACY_INBAND_SPS 1
+#endif
+
+/* Pair before the legacy FairPlay exchange. Apple's own mirroring does not. */
+#ifndef APP_LEGACY_PAIRING
+#define APP_LEGACY_PAIRING 0
+#endif
+
+/* Ask for the audio stream as well (iOS sends one when it mirrors). */
+#ifndef APP_LEGACY_AUDIO
+#define APP_LEGACY_AUDIO 1
+#endif
+
 /* Fallback access point, used when APP_WIFI_SSID is empty. */
 #ifndef APP_FALLBACK_AP_SSID
 #define APP_FALLBACK_AP_SSID "airplay-esp32"

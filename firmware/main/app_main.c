@@ -68,11 +68,37 @@ static void session_task(void *argument)
     }
 }
 
-static const char *hook_start(const char *name, const char *host, int port)
+static const char *hook_start(const pin_start_request_t *request)
 {
     if (airplay_is_running()) {
         return "already mirroring\n";
     }
+
+    /* Per-session overrides let a receiver be probed without reflashing. */
+    if (request->data_mode >= 0) {
+        s_config.legacy_data_mode = (uint8_t)request->data_mode;
+    }
+    if (request->key_mix >= 0) {
+        s_config.legacy_key_mode = (uint8_t)request->key_mix;
+    }
+    if (request->iv_source >= 0) {
+        s_config.legacy_iv_source = (uint8_t)request->iv_source;
+    }
+    if (request->audio >= 0) {
+        s_config.legacy_audio = request->audio != 0;
+    }
+    if (request->pair >= 0) {
+        s_config.legacy_pairing = request->pair != 0;
+    }
+    if (request->sps >= 0) {
+        s_config.legacy_inband_sps = request->sps != 0;
+    }
+    if (request->interval_ms > 0) {
+        s_config.frame_interval_ms = (uint32_t)request->interval_ms;
+    }
+    const char *name = request->name;
+    const char *host = request->host;
+    int port = request->port;
 
     if (name != NULL && name[0] != '\0') {
         airplay_target_t target;
@@ -327,6 +353,12 @@ void app_main(void)
         .identity = identity,
         .legacy = APP_AIRPLAY_LEGACY != 0,
         .legacy_data_mode = APP_LEGACY_DATA_MODE,
+        .legacy_stream_port = APP_LEGACY_STREAM_PORT,
+        .legacy_key_mode = (uint8_t)(APP_LEGACY_KEY_MIX ? 1 : 0),
+        .legacy_iv_source = APP_LEGACY_IV_SOURCE,
+        .legacy_inband_sps = APP_LEGACY_INBAND_SPS != 0,
+        .legacy_pairing = APP_LEGACY_PAIRING != 0,
+        .legacy_audio = APP_LEGACY_AUDIO != 0,
     };
     s_config = config;
     ESP_LOGI(TAG, "default receiver %s:%d, GET /targets lists what else is on the LAN",

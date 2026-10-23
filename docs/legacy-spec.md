@@ -251,3 +251,49 @@ browse _airplay._tcp → TXT{deviceid,features,model,srcvers,flags,pi,gid?}, SRV
 2. 回环：以 RPiPlay 源码编译接收端，全链路走通 §1 十四步，画面出图。
 3. 极米实机：连 7001 → `/info` 空 body 容忍 → 出图；断电恢复/TEARDOWN 后重连。
 4. 角落：连续 keystream 跨帧一致性（第 1 帧与第 N 帧同ctx）；>16KB 记录分包（`recv` 循环天然支持，`raop_rtp_mirror.c:270-283`）；SPS/PPS 明文记录先行于 IDR。
+
+## 15. 实机结论：伪装成 AppleTV3,2 的贴牌盒子（极米投影仪 220.68）
+
+抓包对象：macOS 27 的屏幕镜像（`X-Apple-ProtocolVersion: 1`，不配对）对同一台盒子。
+以下每条都由抓包或离线解密验证。
+
+### 15.1 端口拓扑
+
+| 端口 | 行为 |
+| --- | --- |
+| 7001 | mDNS SRV 公告的端口，**stub**：任何 RTSP 请求回 `HTTP/1.1 200 OK` + 空 body，`/info` 也空 |
+| 7002 | **真正的 AirPlay RTSP 服务**：`fp-setup` 回 142B m2、SETUP 回 binary plist，Apple 的发送端也连这里 |
+| 7100 | 与 7001 相同的 stub |
+| 8080 | 厂商 Web UI（umi.js SPA） |
+
+因此按 mDNS 端口直连会把整条会话打在 stub 上：SETUP 都「成功」但永远拿不到 dataPort，数据通道也无从建立。遇到 `SETUP 2` 回空 body 的接收端，先把 SETUP 打到「同设备另一个 RTSP 端口」试，通常就是 `公告端口 + 1`。
+
+### 15.2 密钥派生（离线验证，可用于判定接收端是否走标准路径）
+
+用 `playfair_decrypt(m3, ekey)` 从抓包里解出 Apple 会话的 AES key，再比对四种派生：
+只有 **`mixed = aeskey`（不混任何配对密钥，直接进 `AirPlayStreamKey/IV` 哈希）** 能把 612 条视频记录全部解成合法访问单元；混零密钥、混真实配对密钥、裸 key+eiv 都解出乱码。
+
+```
+eaeskey   = aeskey                                # 无配对时不混 secret
+skey      = SHA512("AirPlayStreamKey" + decimal(streamConnectionID) || eaeskey)[0:16]
+siv       = SHA512("AirPlayStreamIV"  + decimal(streamConnectionID) || eaeskey)[0:16]
+```
+
+codec 记录（type 1）**不参与 keystream**，CTR 只在视频记录之间连续推进；把 codec 记录算进 keystream 会让后续每一帧都错位（曾经踩过）。
+
+### 15.3 128 字节记录头（对着 Apple 抓包逐字节核对）
+
+| 偏移 | 含义 |
+| --- | --- |
+| 0..3 | 载荷长度，小端 u32 |
+| 4 | 记录类型：0 视频 / 1 codec |
+| 5 | 0x10 标记同步帧（IDR），其余为 0 |
+| 6..7 | codec 记录为 `0x0116`（小端 `16 01`），视频记录为 0 |
+| 8..15 | boot 相对的 32.32 定点时间戳，小端（不带 1900 epoch） |
+| 16..23 / 40..47 / 56..63 | codec 记录里的宽高 float（三处都写），视频记录留 0 |
+
+发送端实测 30 帧/秒；音频是独立 UDP 通道，视频走分配到的 TCP 端口，帧为裸记录（无 `$` 交织）。
+
+### 15.4 未解之谜
+
+按上述规格复刻（不配对 + mode0 派生 + 1080p High profile + 双流 + 音频 UDP 喂包），这类盒子仍停在「进入投屏但黑屏」。它接受全部请求、分配 dataPort、接受数据不断连，但不出画。已排除：协议版本、密钥派生、帧头字段、SPS/PPS in-band、分辨率/档次、帧率（10/30 都试过）、音频流存在性。剩下的差异只可能在被加密的载荷内容（真正的 AAC-ELD 音频帧）或厂商私有 gating 上，需要一次 iOS 真实会话的抓包才能定论（`artifacts/mitm_capture.py` 用 ARP 欺骗把手机流量引到 Mac 上抓）。

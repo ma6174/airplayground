@@ -35,8 +35,12 @@ void ap_legacy_ctr_xor(ap_legacy_ctr_t *ctr, uint8_t *data, size_t len);
 
 /* skey/siv from the stream key mixed with the pair-verify secret and the
  * decimal string of the stream connection id. */
+/* Mixing modes for the receiver-side pair secret:
+ *   0 bare key (no secret), 1 the pair-verify secret, 2 an all-zero secret,
+ *   3 raw keys (skey = stream key, siv = eiv, no hashing at all). */
 void ap_legacy_derive_stream_keys(const uint8_t stream_key[16], const uint8_t ecdh[32],
-                                  uint64_t connection_id, uint8_t skey[16], uint8_t siv[16]);
+                                  uint8_t mode, uint64_t connection_id, uint8_t skey[16],
+                                  uint8_t siv[16]);
 
 /* AES-128 single block, provided per platform (PSA on device, CommonCrypto on
  * the test host). Exposed for the derivation test vectors. */
@@ -51,6 +55,10 @@ int ap_legacy_pair_setup(ap_client_t *client, const hap_identity_t *identity,
 int ap_legacy_pair_verify(ap_client_t *client, const hap_identity_t *identity,
                           const uint8_t receiver_ed[32], uint8_t ecdh_out[32]);
 
+/* Builds one audio packet (RTP header + CBC payload). */
+int ap_legacy_audio_packet(uint8_t *out, size_t cap, uint16_t seq, uint32_t rtp_time,
+                           const uint8_t key[16], const uint8_t iv[16], size_t payload_len);
+
 /* Writes one mirror record: [128-byte header][payload]. In interleaved mode the
  * record is wrapped in the RTSP `$`+channel+length framing, all on data_fd. */
 int ap_legacy_write_record(int fd, bool interleaved, uint8_t channel,
@@ -62,7 +70,17 @@ size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
                                 const char *sender_ip, const char *receiver_ip);
 /* SETUP 1 body: eiv + ekey + our NTP port. ekey == NULL omits the field, for
  * receivers that answer fp-setup with an empty body (no FairPlay at all). */
-size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const uint8_t eiv[16],
-                              const uint8_t ekey[72], uint16_t timing_port);
+typedef struct {
+    const uint8_t *eiv;
+    const uint8_t *ekey; /* NULL omits the field (no FairPlay) */
+    uint16_t timing_port;
+    const char *session_uuid;
+} ap_legacy_setup1_t;
+
+size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t *setup);
 /* SETUP 2 body: streams[{type:110, streamConnectionID}]. */
-size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id);
+/* Mirror SETUP. With audio the request also asks for the type 96 stream; iOS
+ * sends both, and receivers of this class wait for the audio stream before
+ * they start rendering. */
+size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, bool audio,
+                              uint16_t audio_control_port);

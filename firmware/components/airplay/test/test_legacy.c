@@ -85,7 +85,7 @@ int main(void)
      *    then the labelled second round). */
     uint8_t skey[16];
     uint8_t siv[16];
-    ap_legacy_derive_stream_keys(aeskey, ecdh, 1234567890, skey, siv);
+    ap_legacy_derive_stream_keys(aeskey, ecdh, 1, 1234567890, skey, siv);
     expect_hex(skey, SKEY_HEX, "skey derivation");
     expect_hex(siv, SIV_HEX, "siv derivation");
 
@@ -137,7 +137,7 @@ int main(void)
 
     /* 6. The legacy frame headers. */
     uint8_t header[AP_FRAME_HEADER_LEN];
-    ap_frame_build_legacy(header, 0x010203, 0x01, 0, 1280, 720);
+    ap_frame_build_legacy(header, 0x010203, 0x01, 0, 1280, 720, false);
     expect(header[0] == 0x03 && header[1] == 0x02 && header[2] == 0x01 && header[3] == 0x00,
            "legacy codec record payload length");
     expect(header[4] == 0x01, "legacy codec record type");
@@ -147,12 +147,14 @@ int main(void)
     memcpy(&width, header + 56, 4);
     expect(width == 1280.0f, "legacy codec display width");
     expect(header[8] == 0 && header[15] == 0, "legacy codec timestamp is zero");
+    expect(header[6] == 0x16 && header[7] == 0x01, "legacy codec record option field");
 
-    ap_frame_build_legacy(header, 0x0102, 0x00, 0x0000000500000000ULL, 0, 0);
+    ap_frame_build_legacy(header, 0x0102, 0x00, 0x0000000500000000ULL, 0, 0, true);
     expect(header[4] == 0x00, "legacy video record type");
     expect(header[8] == 0 && header[9] == 0 && header[10] == 0 && header[11] == 0 &&
                header[12] == 0x05,
                "legacy video timestamp little-endian");
+    expect(header[5] == 0x10, "legacy sync frame marker");
 
     /* 7. The SETUP plists round-trip through the reader. */
     uint8_t eiv[16];
@@ -163,8 +165,10 @@ int main(void)
     for (size_t i = 0; i < sizeof(ekey); i++) {
         ekey[i] = (uint8_t)(0xC0 + i);
     }
-    uint8_t body[256];
-    size_t body_len = ap_legacy_build_setup1(body, sizeof(body), eiv, ekey, 54321);
+    uint8_t body[768];
+    ap_legacy_setup1_t setup1 = { .eiv = eiv, .ekey = ekey, .timing_port = 54321,
+                                  .session_uuid = "01234567-89AB-CDEF-0123-456789ABCDEF" };
+    size_t body_len = ap_legacy_build_setup1(body, sizeof(body), &setup1);
     expect(body_len > 0, "setup1 encodes");
     ap_plist_reader_t reader;
     expect(ap_plist_decode(&reader, body, body_len), "setup1 decodes");
@@ -176,7 +180,7 @@ int main(void)
     expect(ap_plist_dict_get(&reader, ap_plist_root(&reader), "eiv", &field), "setup1 has eiv");
     expect(ap_plist_dict_get(&reader, ap_plist_root(&reader), "ekey", &field), "setup1 has ekey");
 
-    body_len = ap_legacy_build_setup2(body, sizeof(body), 0x0123456789ULL);
+    body_len = ap_legacy_build_setup2(body, sizeof(body), 0x0123456789ULL, false, 0);
     expect(body_len > 0, "setup2 encodes");
     expect(ap_plist_decode(&reader, body, body_len), "setup2 decodes");
     uint64_t streams = 0;

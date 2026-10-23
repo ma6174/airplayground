@@ -672,7 +672,8 @@ static esp_err_t allocate_frame_scratch(ap_session_t *session)
     /* One allocation for the sealed access unit: ChaCha20-Poly1305 output
      * cannot alias the flash-resident plaintext. Sized once to the largest
      * frame, never per frame. */
-    session->frame_scratch_len = largest + AP_FRAME_TAG_LEN;
+    /* Legacy sync frames carry the SPS/PPS in-band, so leave room for them. */
+    session->frame_scratch_len = largest + AP_FRAME_TAG_LEN + 128;
     session->frame_scratch = (uint8_t *)malloc(session->frame_scratch_len);
     if (session->frame_scratch == NULL) {
         AP_LOGE("no memory for a %u byte frame buffer", (unsigned)session->frame_scratch_len);
@@ -703,7 +704,8 @@ static esp_err_t stream_frames(ap_session_t *session)
     if (legacy) {
         /* The codec record rides unencrypted with the raster dimensions in the
          * header floats (RPiPlay lib/raop_rtp_mirror.c:350-375). */
-        ap_frame_build_legacy(header, frames->avcc_len, 0x01, 0, frames->width, frames->height);
+        ap_frame_build_legacy(header, frames->avcc_len, 0x01, 0, frames->width, frames->height,
+                              false);
         if (ap_legacy_write_record(session->data.fd,
                                    session->legacy_transport == 1 || session->legacy_transport == 3,
                                    0, header, frames->avcc, frames->avcc_len) != 0) {
@@ -719,6 +721,20 @@ static esp_err_t stream_frames(ap_session_t *session)
     AP_LOGI("codec packet sent: avcC %u bytes, %ux%u", (unsigned)frames->avcc_len, (unsigned)frames->width,
             (unsigned)frames->height);
 
+    uint64_t next_audio = 0;
+    if (legacy && session->config->legacy_audio && session->legacy_audio_port != 0) {
+        /* Audio rides UDP, unlike the TCP mirror channel. */
+        uint16_t local_port = 0;
+        session->legacy_audio_fd = ap_socket_udp_open(&local_port);
+        if (session->legacy_audio_fd < 0) {
+            AP_LOGW("cannot open the audio socket");
+        } else {
+            AP_LOGI("legacy audio channel ready: local %u -> %s:%u", (unsigned)local_port,
+                    session->config->host, (unsigned)session->legacy_audio_port);
+            next_audio = ap_millis();
+        }
+    }
+
     size_t index = 0;
     uint64_t last_timestamp = 0;
     uint64_t next_frame = ap_millis();
@@ -730,6 +746,26 @@ static esp_err_t stream_frames(ap_session_t *session)
 
     while (!session->stop && !s_stop_requested) {
         uint64_t now = ap_millis();
+
+        if (session->legacy_audio_fd >= 0 && now >= next_audio) {
+            /* Feed the audio channel so receivers that gate video on it see a
+             * live stream. The payload is silence; the codec never runs. */
+            uint8_t packet[12 + AP_LEGACY_AUDIO_CHUNK];
+            int len = ap_legacy_audio_packet(packet, sizeof(packet), session->legacy_audio_seq,
+                                             session->legacy_audio_rtp_time,
+                                             session->legacy_skey, session->aesiv,
+                                             AP_LEGACY_AUDIO_CHUNK);
+            if (len > 0 && ap_socket_send_to(session->legacy_audio_fd, session->config->host,
+                                             session->legacy_audio_port, packet,
+                                             (size_t)len) != 0) {
+                AP_LOGW("legacy audio write failed");
+                ap_socket_close(session->legacy_audio_fd);
+                session->legacy_audio_fd = -1;
+            }
+            session->legacy_audio_seq++;
+            session->legacy_audio_rtp_time += AP_LEGACY_AUDIO_CHUNK / 4;
+            next_audio = now + AP_LEGACY_AUDIO_INTERVAL_MS;
+        }
 
         if (now >= next_feedback) {
             if (send_feedback(session) == 0) {
@@ -774,9 +810,22 @@ static esp_err_t stream_frames(ap_session_t *session)
                     AP_LOGE("still frame %u does not fit the scratch buffer", (unsigned)index);
                     return ESP_FAIL;
                 }
-                memcpy(session->frame_scratch, payload, payload_len);
+                /* Hardware decoders that ignore the out-of-band avcC need the
+                 * parameter sets in-band with every sync frame. */
+                if (idr && session->config->legacy_inband_sps) {
+                    size_t assembled = ap_frame_add_parameter_sets(
+                        session->frame_scratch, session->frame_scratch_len, frames->avcc,
+                        frames->avcc_len, payload, payload_len);
+                    if (assembled == 0) {
+                        AP_LOGE("still frame %u plus parameter sets does not fit", (unsigned)index);
+                        return ESP_FAIL;
+                    }
+                    payload_len = assembled;
+                } else {
+                    memcpy(session->frame_scratch, payload, payload_len);
+                }
                 ap_legacy_ctr_xor(&session->legacy_ctr, session->frame_scratch, payload_len);
-                ap_frame_build_legacy(header, payload_len, 0x00, timestamp, 0, 0);
+                ap_frame_build_legacy(header, payload_len, 0x00, timestamp, 0, 0, idr);
                 if (ap_legacy_write_record(session->data.fd,
                                            session->legacy_transport == 1 ||
                                                session->legacy_transport == 3,
@@ -820,13 +869,19 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
         return ESP_FAIL;
     }
 
-    uint8_t receiver_ed[32];
-    if (ap_legacy_pair_setup(&session->client, session->identity, receiver_ed) != 0 ||
-        ap_legacy_pair_verify(&session->client, session->identity, receiver_ed,
-                              session->shared) != 0) {
-        return ESP_FAIL;
+    /* Apple's own screen mirroring skips pairing on this class of receiver and
+     * lets FairPlay carry the key material, so pairing is optional. */
+    if (session->config->legacy_pairing) {
+        uint8_t receiver_ed[32];
+        if (ap_legacy_pair_setup(&session->client, session->identity, receiver_ed) != 0 ||
+            ap_legacy_pair_verify(&session->client, session->identity, receiver_ed,
+                                  session->shared) != 0) {
+            return ESP_FAIL;
+        }
+        AP_LOGI("legacy pair-verify complete");
+    } else {
+        AP_LOGI("legacy session without pairing, as Apple sends it");
     }
-    AP_LOGI("legacy pair-verify complete");
 
     /* FairPlay v3 with the ekey chain: the same primitives the HAP path uses,
      * but the wrapped key travels in SETUP 1 instead of shk over HAP. */
@@ -894,10 +949,14 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
         return ESP_FAIL;
     }
 
-    uint8_t plist[256];
-    size_t plist_len = ap_legacy_build_setup1(plist, sizeof(plist), session->aesiv,
-                                              fairplay ? session->ekey : NULL,
-                                              session->timing_port);
+    uint8_t plist[512];
+    ap_legacy_setup1_t setup1 = {
+        .eiv = session->aesiv,
+        .ekey = fairplay ? session->ekey : NULL,
+        .timing_port = session->timing_port,
+        .session_uuid = session->session_uuid,
+    };
+    size_t plist_len = ap_legacy_build_setup1(plist, sizeof(plist), &setup1);
     if (plist_len == 0 ||
         ap_client_request(&session->client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
                           plist_len, NULL, &response) != 0) {
@@ -906,23 +965,62 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     }
     AP_LOGI("legacy SETUP 1: timingPort=%u", (unsigned)session->timing_port);
 
-    ap_header_t transport[2] = {
+    /* Apple queries /info and the volume between the two SETUPs. */
+    (void)ap_client_request(&session->client, "GET", "/info", NULL, NULL, 0, NULL, &response);
+    (void)ap_client_request(&session->client, "GET_PARAMETER", session->uri, "text/parameters",
+                            "volume", 6, NULL, &response);
+
+    ap_header_t transport[3] = {
         /* Ask for the data stream on this connection; receivers that would
          * rather hand out a port ignore the interleaved part and answer with
          * a dataPort instead. */
         { "Transport", "RTP/AVP/TCP;interleaved=0-1" },
+        { "X-Apple-ProtocolVersion", "1" },
         { NULL, NULL },
     };
-    plist_len = ap_legacy_build_setup2(plist, sizeof(plist), session->video_stream_id);
+    /* Apple sends RECORD before the mirror SETUP; some receivers start their
+     * decoder only once the session is recording. */
+    {
+        ap_header_t record_headers[4] = {
+            { "Session", session->session_uuid },
+            { "Range", "npt=0-" },
+            { "RTP-Info", "seq=0;rtptime=0" },
+            { NULL, NULL },
+        };
+        if (ap_client_request(&session->client, "RECORD", session->uri, NULL, NULL, 0,
+                              record_headers, &response) != 0) {
+            AP_LOGE("legacy RECORD failed (status %d)", response.status);
+            return ESP_FAIL;
+        }
+        session->legacy_recorded = true;
+    }
+
+    /* Some receivers keep the advertised port as an RTSP stub and answer the
+     * mirror SETUP on a second port; that port allocates the data channel. */
+    ap_client_t *stream_client = &session->client;
+    uint16_t stream_port = session->config->legacy_stream_port;
+    if (stream_port != 0 && stream_port != session->config->port) {
+        if (ap_client_connect(&session->stream_client, session->config->host, stream_port,
+                              AP_CONTROL_CONNECT_TIMEOUT_MS) != 0) {
+            AP_LOGE("cannot reach the mirror port %u", (unsigned)stream_port);
+            return ESP_FAIL;
+        }
+        session->stream_client_open = true;
+        stream_client = &session->stream_client;
+        AP_LOGI("legacy SETUP 2 goes to port %u", (unsigned)stream_port);
+    }
+    plist_len = ap_legacy_build_setup2(plist, sizeof(plist), session->video_stream_id,
+                                       session->config->legacy_audio,
+                                       session->legacy_audio_control_port);
     if (plist_len == 0 ||
-        ap_client_request(&session->client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
+        ap_client_request(stream_client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
                           plist_len, transport, &response) != 0) {
         AP_LOGE("legacy SETUP 2 failed (status %d)", response.status);
         return ESP_FAIL;
     }
 
     body_len = 0;
-    const uint8_t *body = ap_client_body(&session->client, &body_len);
+    const uint8_t *body = ap_client_body(stream_client, &body_len);
     ap_plist_reader_t reader;
     uint64_t streams = 0;
     uint64_t stream = 0;
@@ -932,6 +1030,16 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
                     ap_plist_array_get(&reader, streams, 0, &stream) &&
                     ap_plist_dict_uint(&reader, stream, "dataPort", &port) && port != 0 &&
                     port <= 65535;
+    if (has_port && session->config->legacy_audio) {
+        uint64_t audio_stream = 0;
+        uint64_t audio_port = 0;
+        if (ap_plist_array_get(&reader, streams, 1, &audio_stream) &&
+            ap_plist_dict_uint(&reader, audio_stream, "dataPort", &audio_port) && audio_port != 0 &&
+            audio_port <= 65535) {
+            session->legacy_audio_port = (uint16_t)audio_port;
+            AP_LOGI("legacy SETUP 2: audio dataPort=%u", (unsigned)session->legacy_audio_port);
+        }
+    }
     if (has_port) {
         *data_port = (uint16_t)port;
         session->legacy_transport = 0;
@@ -951,9 +1059,13 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
 
     /* Without FairPlay there is no receiver-side mix step either, so the
      * stream keys come from the bare AES key. */
-    ap_legacy_derive_stream_keys(session->aeskey, fairplay ? session->shared : NULL,
+    uint8_t mode = fairplay ? session->config->legacy_key_mode : 0;
+    ap_legacy_derive_stream_keys(session->aeskey, session->shared, mode,
                                  session->video_stream_id, session->legacy_skey,
                                  session->legacy_siv);
+    if (mode == 3 || session->config->legacy_iv_source == 1) {
+        memcpy(session->legacy_siv, session->aesiv, sizeof(session->legacy_siv));
+    }
     return ESP_OK;
 }
 
@@ -972,6 +1084,7 @@ static esp_err_t session_run(ap_session_t *session)
     }
 
     uint16_t data_port = 0;
+    session->legacy_audio_fd = -1;
     if (session->config->legacy) {
         if (legacy_front_half(session, &data_port) != ESP_OK) {
             return ESP_FAIL;
@@ -991,6 +1104,22 @@ static esp_err_t session_run(ap_session_t *session)
         }
         ap_legacy_ctr_start(&session->legacy_ctr, session->legacy_skey, session->legacy_siv);
         AP_LOGI("legacy data channel ready on fd %d", session->data.fd);
+
+        /* Receivers that asked for audio expect the sender to connect that port
+         * too; iOS keeps it open for the whole session. */
+        session->legacy_audio_fd = -1;
+        if (session->config->legacy_audio && session->legacy_audio_port != 0) {
+            session->legacy_audio_fd =
+                ap_socket_connect(session->config->host, session->legacy_audio_port,
+                                  AP_DATA_CONNECT_TIMEOUT_MS);
+            if (session->legacy_audio_fd < 0) {
+                AP_LOGW("cannot reach the legacy audio port %u",
+                        (unsigned)session->legacy_audio_port);
+            } else {
+                ap_legacy_ctr_start(&session->legacy_audio_ctr, session->aeskey, session->aesiv);
+                AP_LOGI("legacy audio channel ready on fd %d", session->legacy_audio_fd);
+            }
+        }
     } else {
     if (discover(session) != ESP_OK) {
         return ESP_FAIL;
@@ -1039,7 +1168,7 @@ static esp_err_t session_run(ap_session_t *session)
     AP_LOGI("video data channel connected to port %u", (unsigned)data_port);
     }
 
-    if (session->config->legacy || !session->skip_record) {
+    if (!session->config->legacy && !session->skip_record) {
         ap_header_t headers[4] = {
             { "Session", session->session_uuid },
             { "Range", "npt=0-" },
@@ -1084,6 +1213,10 @@ static void session_teardown(ap_session_t *session)
      * control connection goes away. */
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    if (session->stream_client_open) {
+        ap_client_close(&session->stream_client);
+        session->stream_client_open = false;
+    }
     ap_client_close(&session->client);
 
     if (session->frame_scratch != NULL) {

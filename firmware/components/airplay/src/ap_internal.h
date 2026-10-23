@@ -14,6 +14,10 @@
 
 #include "airplay.h"
 #include "ap_client.h"
+
+/* Audio is filler that keeps the channel alive: 20 ms per packet, silence. */
+#define AP_LEGACY_AUDIO_CHUNK 96
+#define AP_LEGACY_AUDIO_INTERVAL_MS 20
 #include "ap_data.h"
 #include "ap_event.h"
 #include "ap_legacy.h"
@@ -85,6 +89,19 @@ typedef struct ap_session {
     ap_legacy_ctr_t legacy_ctr;
     /* 0: receiver handed out a dataPort; 1-4: see legacy_data_mode. */
     uint8_t legacy_transport;
+    /* Audio side of a legacy session (receivers that gate video on it). */
+    uint16_t legacy_audio_port;
+    int legacy_audio_fd;
+    uint16_t legacy_audio_control_port;
+    uint16_t legacy_audio_seq;
+    uint32_t legacy_audio_rtp_time;
+    ap_legacy_ctr_t legacy_audio_ctr;
+    /* RECORD already went out in the legacy front half. */
+    bool legacy_recorded;
+    /* Receivers that answer the mirror SETUP on a second RTSP port keep that
+     * connection in this client. */
+    ap_client_t stream_client;
+    bool stream_client_open;
 
     /* Protocol scratch. Only the session task touches these buffers. */
     uint8_t msg[1024];
