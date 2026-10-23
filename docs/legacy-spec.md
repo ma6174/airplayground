@@ -297,3 +297,31 @@ codec 记录（type 1）**不参与 keystream**，CTR 只在视频记录之间�
 ### 15.4 未解之谜
 
 按上述规格复刻（不配对 + mode0 派生 + 1080p High profile + 双流 + 音频 UDP 喂包），这类盒子仍停在「进入投屏但黑屏」。它接受全部请求、分配 dataPort、接受数据不断连，但不出画。已排除：协议版本、密钥派生、帧头字段、SPS/PPS in-band、分辨率/档次、帧率（10/30 都试过）、音频流存在性。剩下的差异只可能在被加密的载荷内容（真正的 AAC-ELD 音频帧）或厂商私有 gating 上，需要一次 iOS 真实会话的抓包才能定论（`artifacts/mitm_capture.py` 用 ARP 欺骗把手机流量引到 Mac 上抓）。
+
+### 15.5 严格接收端验证（UxPlay）
+
+UxPlay 1.62（RPiPlay 血统）装在局域网 Linux 机器上后，发送端第一次被「会真的检查」的接收端验收：
+
+| 环节 | 结果 |
+| --- | --- |
+| legacy pair-setup / pair-verify | 通过（修掉 bug 后，见下） |
+| FairPlay m1/m2/m3/m4 | 通过，ekey 被正确解开 |
+| SETUP 1 / SETUP 2 / RECORD | 通过，拿到 dataPort |
+| 视频流解密 + 解码 | 通过（`-vdmp` 的 dump 持续增长） |
+
+由此修掉两个真实 bug：
+1. **pair-verify V2 的 keystream 要跳过 64 字节**（一个签名长度的「假轮」），跳 16 字节会让严格接收端直接断连；
+2. **FairPlay m1 的 mode 字节**：iOS 用 2、macOS 用 0，本实现原来发 3（不在 Apple 使用范围内）。
+
+### 15.6 iOS 发送端的真实参数（抓包，经 UxPlay 验证可出画）
+
+- 流程：`GET /info`（body 是 `{qualifier:[txtAirPlay]}`）→ pair-setup → pair-verify×2 → fp-setup×2 → SETUP 1 → GET_PARAMETER volume → RECORD → SETUP 2 → `POST /feedback` 每 2 s。
+- SETUP 2 里**只有 type 110（视频）**，没有音频流；接收端只回一个 `dataPort`。镜像音频并不经过这条 SETUP。
+- 每个请求都带 `DACP-ID`、`Active-Remote`；pair-verify 带 `X-Apple-PD: 1` 和 `X-Apple-AbsoluteTime`。
+- SETUP 1 的 plist：`et=32, eiv, ekey, sessionUUID, sessionCorrelationUUID, timingPort, timingProtocol=NTP, isScreenMirroringSession=true, statsCollectionEnabled=false, updateSessionRequest=false, combinedGetInfoWithControlSetup=true, sourceVersion=980.77.1, model=iPhone17,1, name=x, osName="iPhone OS", osVersion, osBuildVersion, deviceID, macAddress`。
+- codec 记录里的宽高是**被投设备的竖屏分辨率**（iPhone 17: 498x1080），High profile。
+- 密钥派生与是否配对绑定：**配对过就混 pair-verify 共享密钥，没配对就用裸 AES key**（两种都用真实抓包验证过）。
+
+### 15.7 仍未解：贴牌盒子不出画
+
+把上述全部照做（不配对 + 裸 key 派生 + iOS 身份字段 + DACP-ID/Active-Remote + iPhone 真实编码帧 + 1080p/竖屏两种分辨率 + 单流/双流 + 10/33 fps），盒子仍然进镜像态、分配 dataPort、稳定收流、不出画。同一条发送链路对 UxPlay 完全正常，所以问题不在码流、密钥与请求格式，而在这台盒子自己的取流条件上。确定它需要什么的唯一办法是抓一次 iOS → 盒子的会话（ARP 中间人在回程上被盒子忽略；改为 Wi-Fi 监听模式 + 用 PSK 解密 pcap）。

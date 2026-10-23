@@ -62,6 +62,15 @@ static void write_format(writer_t *writer, const char *format, ...)
     write_raw(writer, scratch, (size_t)written);
 }
 
+void ap_client_set_extra_header(ap_client_t *client, int slot, const char *line)
+{
+    if (slot < 0 || slot > 1) {
+        return;
+    }
+    snprintf(client->extra_headers[slot], sizeof(client->extra_headers[slot]), "%s",
+             line != NULL ? line : "");
+}
+
 void ap_client_attach_fd(ap_client_t *client, int fd)
 {
     memset(client, 0, sizeof(*client));
@@ -121,6 +130,13 @@ size_t ap_client_build(ap_client_t *client, const char *method, const char *uri,
     if (authorization != NULL) {
         write_str(&writer, "Authorization: ");
         write_str(&writer, authorization);
+        write_str(&writer, "\r\n");
+    }
+    for (int i = 0; i < 2; i++) {
+        if (client->extra_headers[i][0] == '\0') {
+            continue;
+        }
+        write_str(&writer, client->extra_headers[i]);
         write_str(&writer, "\r\n");
     }
     if (headers != NULL) {

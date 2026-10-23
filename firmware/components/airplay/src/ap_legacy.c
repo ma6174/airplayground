@@ -356,8 +356,8 @@ size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
 
 /* Small static pools: the legacy SETUP trees are a handful of values built
  * from one task, mirroring ap_setup.c's approach. */
-#define AP_LEGACY_VALUE_POOL 24
-#define AP_LEGACY_ENTRY_POOL 16
+#define AP_LEGACY_VALUE_POOL 40
+#define AP_LEGACY_ENTRY_POOL 32
 static ap_plist_value_t s_values[AP_LEGACY_VALUE_POOL];
 static ap_plist_entry_t s_entries[AP_LEGACY_ENTRY_POOL];
 static size_t s_value_used;
@@ -445,7 +445,7 @@ static ap_plist_value_t *make_dict(ap_plist_entry_t *entries, size_t count)
 size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t *setup)
 {
     pool_reset();
-    ap_plist_entry_t *entries = entry_slots(11);
+    ap_plist_entry_t *entries = entry_slots(20);
     if (entries == NULL) {
         return 0;
     }
@@ -461,9 +461,14 @@ size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t
     entries[count++] = (ap_plist_entry_t){ "statsCollectionEnabled", make_bool(false) };
     /* Receivers of this class sniff the sender identity before they arm the
      * mirroring pipeline. */
-    entries[count++] = (ap_plist_entry_t){ "sourceVersion", make_string("220.68") };
-    entries[count++] = (ap_plist_entry_t){ "model", make_string("iPhone14,2") };
+    entries[count++] = (ap_plist_entry_t){ "sourceVersion", make_string("930.7.1") };
+    entries[count++] = (ap_plist_entry_t){ "model", make_string("iPhone17,1") };
     entries[count++] = (ap_plist_entry_t){ "name", make_string("esp32") };
+    entries[count++] = (ap_plist_entry_t){ "osName", make_string("iPhone OS") };
+    entries[count++] = (ap_plist_entry_t){ "osVersion", make_string("26.0") };
+    entries[count++] = (ap_plist_entry_t){ "osBuildVersion", make_string("23A344") };
+    entries[count++] = (ap_plist_entry_t){ "updateSessionRequest", make_bool(false) };
+    entries[count++] = (ap_plist_entry_t){ "combinedGetInfoWithControlSetup", make_bool(true) };
     if (setup->session_uuid != NULL) {
         entries[count++] = (ap_plist_entry_t){ "sessionUUID", make_string(setup->session_uuid) };
     }

@@ -949,7 +949,7 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
         return ESP_FAIL;
     }
 
-    uint8_t plist[512];
+    uint8_t plist[1024];
     ap_legacy_setup1_t setup1 = {
         .eiv = session->aesiv,
         .ekey = fairplay ? session->ekey : NULL,
@@ -1081,6 +1081,14 @@ static esp_err_t session_run(ap_session_t *session)
      * typed for pairing. */
     if (session->config->pin != NULL && session->config->pin[0] != '\0') {
         ap_client_set_password(&session->client, session->config->pin);
+    }
+    if (session->config->legacy) {
+        char line[64];
+        snprintf(line, sizeof(line), "DACP-ID: %016llX",
+                 (unsigned long long)(ap_millis() * 2654435761u));
+        ap_client_set_extra_header(&session->client, 0, line);
+        snprintf(line, sizeof(line), "Active-Remote: %u", (unsigned)(ap_millis() & 0xffffffffu));
+        ap_client_set_extra_header(&session->client, 1, line);
     }
 
     uint16_t data_port = 0;
