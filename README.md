@@ -131,7 +131,8 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
 - **接收端限流要遵守**：配对失败会被 HomeKit 退避（最长可达 30 分钟），重试过早只会
   延长惩罚；固件会读 `0x08` 重试延迟并等满（`airplay_backoff_ms()`）。
 - **要求配对码的接收端要设 `APP_FORCE_PIN_PAIRING=1`**：先试 transient 会失败，而那次
-  失败本身会触发限流，把携带正确码的尝试挡在门外。
+  失败本身会触发限流，把携带正确码的尝试挡在门外。配对成功一次之后接收端会记住这台设备，
+  以后每次开机直接 pair-verify（实测 1 秒内开流，不再需要码）。
 
 ## 调试
 
