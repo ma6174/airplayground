@@ -84,6 +84,9 @@ static const char *hook_start(const pin_start_request_t *request)
     if (request->iv_source >= 0) {
         s_config.legacy_iv_source = (uint8_t)request->iv_source;
     }
+    if (request->stream_port >= 0) {
+        s_config.legacy_stream_port = (uint16_t)request->stream_port;
+    }
     if (request->audio >= 0) {
         s_config.legacy_audio = request->audio != 0;
     }

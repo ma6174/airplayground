@@ -19,7 +19,7 @@ static const uint8_t fairplay_kdf_suffix[17] = {
 };
 
 static const uint8_t fpsap_m1_payload[4] = {
-	0x02, 0x00, 0x03, 0xbb,
+	0x02, 0x00, 0x02, 0xbb,
 };
 
 static const uint8_t fpsap_m3_label[3] = {

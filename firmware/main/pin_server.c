@@ -149,7 +149,8 @@ static esp_err_t handle_start(httpd_req_t *request)
      * scratch buffer room for a longest legal name before decoding. */
     char value[192];
     pin_start_request_t start = { .port = 0, .data_mode = -1, .key_mix = -1, .iv_source = -1,
-                                  .interval_ms = 0, .sps = -1, .pair = -1, .audio = -1 };
+                                  .interval_ms = 0, .sps = -1, .pair = -1, .audio = -1,
+                                  .stream_port = -1 };
     char name[64] = "";
     char host[48] = "";
 
@@ -184,6 +185,9 @@ static esp_err_t handle_start(httpd_req_t *request)
         }
         if (httpd_query_key_value(query, "iv", value, sizeof(value)) == ESP_OK) {
             start.iv_source = atoi(value);
+        }
+        if (httpd_query_key_value(query, "sport", value, sizeof(value)) == ESP_OK) {
+            start.stream_port = atoi(value);
         }
         if (httpd_query_key_value(query, "audio", value, sizeof(value)) == ESP_OK) {
             start.audio = atoi(value);

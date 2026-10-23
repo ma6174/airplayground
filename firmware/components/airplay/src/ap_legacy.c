@@ -275,7 +275,7 @@ int ap_legacy_pair_verify(ap_client_t *client, const hap_identity_t *identity,
     }
 
     /* V2: our signature over ourX25519 || peerX25519, sealed with the
-     * keystream advanced by one block (pairing.c:222-227, "one fake round"). */
+     * keystream advanced by one signature-sized fake round (pairing.c:222-227). */
     uint8_t my_sig[64];
     uint8_t my_signed[64];
     memcpy(my_signed, my_x25519_pub, 32);
@@ -284,8 +284,8 @@ int ap_legacy_pair_verify(ap_client_t *client, const hap_identity_t *identity,
 
     ap_legacy_ctr_t ctr2;
     ap_legacy_ctr_start(&ctr2, pv_key, pv_iv);
-    uint8_t skip[16];
-    ap_legacy_ctr_xor(&ctr2, skip, 16);
+    uint8_t skip[64];
+    ap_legacy_ctr_xor(&ctr2, skip, sizeof(skip));
 
     uint8_t v2[68] = { 0x00, 0, 0, 0 };
     memcpy(v2 + 4, my_sig, 64);
