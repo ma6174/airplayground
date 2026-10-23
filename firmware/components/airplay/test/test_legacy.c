@@ -56,6 +56,17 @@ static void expect_hex(const uint8_t *got, const char *want_hex, const char *wha
     }
 }
 
+static const uint8_t *find_bytes(const uint8_t *hay, size_t hay_len, const char *needle,
+                                 size_t needle_len)
+{
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            return hay + i;
+        }
+    }
+    return NULL;
+}
+
 int main(void)
 {
     /* Inputs shared with the vector generator: /tmp/legacy_vectors/gen_vectors.c,
@@ -193,6 +204,26 @@ int main(void)
                port == 0x0123456789ULL,
            "setup2 streamConnectionID");
     expect(ap_plist_dict_uint(&reader, stream, "type", &port) && port == 110, "setup2 type 110");
+
+    /* iOS names the timestamps its frame header carries; receivers look them up
+     * there. Each entry is a one-key dict, so a mis-built tree shows up as
+     * missing or repeated names rather than a decode failure. */
+    static const char *const stamps[] = { "SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc" };
+    uint64_t info = 0;
+    expect(ap_plist_dict_get(&reader, stream, "timestampInfo", &info) &&
+               ap_plist_array_count(&reader, info) == 5,
+           "setup2 timestampInfo has five entries");
+    size_t searched = 0;
+    bool stamps_ok = true;
+    for (size_t i = 0; i < 5; i++) {
+        const uint8_t *hit = find_bytes(body + searched, body_len - searched, stamps[i], 5);
+        if (hit == NULL) {
+            stamps_ok = false;
+            break;
+        }
+        searched = (size_t)(hit - body) + 5;
+    }
+    expect(stamps_ok, "setup2 timestampInfo names in order");
 
     if (failures == 0) {
         printf("all legacy checks passed\n");

@@ -325,3 +325,29 @@ UxPlay 1.62（RPiPlay 血统）装在局域网 Linux 机器上后，发送端第
 ### 15.7 仍未解：贴牌盒子不出画
 
 把上述全部照做（不配对 + 裸 key 派生 + iOS 身份字段 + DACP-ID/Active-Remote + iPhone 真实编码帧 + 1080p/竖屏两种分辨率 + 单流/双流 + 10/33 fps），盒子仍然进镜像态、分配 dataPort、稳定收流、不出画。同一条发送链路对 UxPlay 完全正常，所以问题不在码流、密钥与请求格式，而在这台盒子自己的取流条件上。确定它需要什么的唯一办法是抓一次 iOS → 盒子的会话（ARP 中间人在回程上被盒子忽略；改为 Wi-Fi 监听模式 + 用 PSK 解密 pcap）。
+
+### 15.8 iOS 直接投这台盒子时发了什么（ARP 中间人 + SNAT 抓到的明文）
+
+盒子不接受双向投毒（会按自己的 ARP 缓存直回手机），但**只投手机侧 + 在中间机上 SNAT** 就够：手机以为盒子在中间机 MAC 上，中间机把源地址改写成自己再转发给盒子，回包自然回到中间机。这样两头都不需要配合，RTSP 与视频连接全部明文可见。
+
+抓到的会话（未配对，特征与"配对与否决定派生"一致）：
+
+```
+POST /fp-setup   (16B  m1)        POST /fp-setup (164B m3)
+SETUP rtsp://<box>/<session-id>   body: et/eiv/ekey/timingPort/isScreenMirroringSession/
+                                        sourceVersion/clientInfo… + model/osName/deviceID/sessionCorrelationUUID
+GET /info        (无 body)
+GET_PARAMETER volume
+RECORD
+SETUP            body: streams[0] = { type:110, streamConnectionID:<负 int64>,
+                                      timestampInfo:[SubSu,BePxT,AfPxT,BefEn,EmEnc], latencyMs:100 }
+POST /feedback   每 2 秒
+```
+
+要点：
+- **没有 pair-setup / pair-verify**，`SETUP 2` 只有一条视频流（与 UxPlay 会话一致）。
+- `timestampInfo` 声明帧头里带哪几个时间戳，接收端据此在 128 字节头里找它们；**字段缺失或结构错误时接收端不报错，只是不渲染**。
+- 用抓到的 m1/m3/ekey 再走一遍 PlayFair + SHA512 派生，390 条记录、611 KB 全部解成合法 H.264，再次确认派生公式（裸 key + `AirPlayStreamKey/IV` + 十进制 streamConnectionID）。
+- 解密后的帧头与实现逐字节一致：视频帧 `+4=0`、`+6..7=0`、IDR 帧 `+5=0x10`、`+8` 小端 32.32 时间戳；codec 记录 `+4=1`、`+6..7=0x0116`、宽高 float 放在 `+16/+20`、`+40/+44`、`+56/+60`。
+
+本仓库的 `ap_legacy_build_setup2` 曾把这个 `timestampInfo` 数组写成嵌套垃圾（`value_slot()` 只分配一个槽却当数组写了五个，后续分配立即覆盖），已修并加单测。

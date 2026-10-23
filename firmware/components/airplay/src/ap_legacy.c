@@ -356,8 +356,8 @@ size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
 
 /* Small static pools: the legacy SETUP trees are a handful of values built
  * from one task, mirroring ap_setup.c's approach. */
-#define AP_LEGACY_VALUE_POOL 40
-#define AP_LEGACY_ENTRY_POOL 32
+#define AP_LEGACY_VALUE_POOL 72
+#define AP_LEGACY_ENTRY_POOL 52
 static ap_plist_value_t s_values[AP_LEGACY_VALUE_POOL];
 static ap_plist_entry_t s_entries[AP_LEGACY_ENTRY_POOL];
 static size_t s_value_used;
@@ -377,6 +377,18 @@ static ap_plist_value_t *value_slot(void)
     ap_plist_value_t *value = &s_values[s_value_used++];
     memset(value, 0, sizeof(*value));
     return value;
+}
+
+/* Contiguous run of slots: array items must be stored next to each other. */
+static ap_plist_value_t *value_slots(size_t count)
+{
+    if (s_value_used + count > AP_LEGACY_VALUE_POOL) {
+        return NULL;
+    }
+    ap_plist_value_t *first = &s_values[s_value_used];
+    s_value_used += count;
+    memset(first, 0, count * sizeof(*first));
+    return first;
 }
 
 static ap_plist_entry_t *entry_slots(size_t count)
@@ -487,14 +499,43 @@ size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, 
         return 0;
     }
 
-    ap_plist_entry_t *video_entries = entry_slots(3);
+    /* The sender states which timestamps its frame header carries; receivers
+     * use the list to find them in the header. */
+    static const char *const stamp_names[] = { "SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc" };
+    const size_t stamp_count = sizeof(stamp_names) / sizeof(stamp_names[0]);
+    ap_plist_value_t *stamp_items = value_slots(stamp_count);
+    if (stamp_items == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < stamp_count; i++) {
+        ap_plist_entry_t *entry = entry_slots(1);
+        if (entry == NULL) {
+            return 0;
+        }
+        entry[0] = (ap_plist_entry_t){ "name", make_string(stamp_names[i]) };
+        const ap_plist_value_t *item = make_dict(entry, 1);
+        if (item == NULL) {
+            return 0;
+        }
+        stamp_items[i] = *item;
+    }
+    ap_plist_value_t *stamps = value_slot();
+    if (stamps == NULL) {
+        return 0;
+    }
+    stamps->type = AP_PLIST_ARRAY;
+    stamps->as.array.items = stamp_items;
+    stamps->as.array.count = stamp_count;
+
+    ap_plist_entry_t *video_entries = entry_slots(4);
     if (video_entries == NULL) {
         return 0;
     }
     video_entries[0] = (ap_plist_entry_t){ "type", make_uint(110) };
     video_entries[1] = (ap_plist_entry_t){ "streamConnectionID", make_uint(connection_id) };
-    video_entries[2] = (ap_plist_entry_t){ "latencyMs", make_uint(100) };
-    const ap_plist_value_t *video = make_dict(video_entries, 3);
+    video_entries[2] = (ap_plist_entry_t){ "timestampInfo", stamps };
+    video_entries[3] = (ap_plist_entry_t){ "latencyMs", make_uint(100) };
+    const ap_plist_value_t *video = make_dict(video_entries, 4);
     if (video == NULL) {
         return 0;
     }
