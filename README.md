@@ -41,7 +41,8 @@ docs/                      协议与 FairPlay 规格、C 参考实现、运维�
 ```sh
 cd firmware
 cp main/app_config_local.h.example main/app_config_local.h
-$EDITOR main/app_config_local.h      # Wi-Fi 账号密码 + Apple TV 的 IP
+$EDITOR main/app_config_local.h      # Wi-Fi 账号密码；接收端地址是默认目标，
+                                     # 也可不填、用 /targets 查名字后 /start?name= 连
 ```
 
 `app_config_local.h` 已在 `.gitignore` 里。可选配置项：`APP_DEVICE_NAME`（电视上显示的名字）、
@@ -66,11 +67,14 @@ python -m esptool --port /dev/cu.usbmodem1101 --after watchdog-reset chip-id
 
 ### 3. 运行
 
-上电后固件：FairPlay 自检 → 连 Wi-Fi → 起控制页面，然后**空闲待命，不主动连接**。
+上电后固件：FairPlay 自检 → 连 Wi-Fi → 起 mDNS 发现与控制页面，然后**空闲待命，不主动连接**。
 投屏由设备自带的 HTTP 接口触发（GET/POST 均可）：
 
 ```sh
-curl http://<设备IP>:8080/start    # 开始投屏（未配对时会先要配对码）
+curl http://<设备IP>:8080/targets   # 列出局域网接收端（mDNS，约 3 秒；老设备带 [legacy] 标记）
+curl http://<设备IP>:8080/start    # 连默认接收端（编译配置 APP_AIRPLAY_TARGET_HOST）
+curl 'http://<设备IP>:8080/start?name=Living%20Room'  # 按名字连（大小写不敏感，唯一子串也可）
+curl http://<设备IP>:8080/start?host=192.168.1.35     # 按地址连，临时覆盖默认目标
 curl http://<设备IP>:8080/stop     # 礼貌断开（向接收端发 TEARDOWN）
 curl http://<设备IP>:8080/status   # idle / mirroring / 上次会话的结束原因
 ```

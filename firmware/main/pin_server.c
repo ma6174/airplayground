@@ -1,5 +1,7 @@
 #include "pin_server.h"
 
+#include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_http_server.h"
@@ -99,18 +101,13 @@ void pin_server_set_session_hooks(const pin_server_session_hooks_t *hooks)
     s_hooks = hooks == NULL ? (pin_server_session_hooks_t){0} : *hooks;
 }
 
-/* One shared handler for the three session endpoints: the answer is whatever
- * the hook returns, so curl shows a plain sentence instead of a status page. */
+/* One shared handler for /stop and /status: the answer is whatever the hook
+ * returns, so curl shows a plain sentence instead of a status page. */
 static esp_err_t handle_session(httpd_req_t *request)
 {
-    const char *(*hook)(void) = NULL;
-    if (strcmp(request->user_ctx, "start") == 0) {
-        hook = s_hooks.start;
-    } else if (strcmp(request->user_ctx, "stop") == 0) {
-        hook = s_hooks.stop;
-    } else {
-        hook = s_hooks.status;
-    }
+    const char *(*hook)(void) = strcmp(request->user_ctx, "stop") == 0
+                                    ? s_hooks.stop
+                                    : s_hooks.status;
 
     httpd_resp_set_type(request, "text/plain");
     if (hook == NULL) {
@@ -120,7 +117,111 @@ static esp_err_t handle_session(httpd_req_t *request)
     return httpd_resp_send(request, hook(), HTTPD_RESP_USE_STRLEN);
 }
 
-esp_err_t pin_server_start(void)
+/* Query-string values arrive percent-encoded and receiver names contain
+ * spaces; decode in place. */
+static void url_decode(char *text)
+{
+    char *out = text;
+    for (char *cursor = text; *cursor != '\0'; cursor++) {
+        if (*cursor == '%' && isxdigit((unsigned char)cursor[1]) &&
+            isxdigit((unsigned char)cursor[2])) {
+            char hex[3] = {cursor[1], cursor[2], '\0'};
+            *out++ = (char)strtol(hex, NULL, 16);
+            cursor += 2;
+        } else if (*cursor == '+') {
+            *out++ = ' ';
+        } else {
+            *out++ = *cursor;
+        }
+    }
+    *out = '\0';
+}
+
+static esp_err_t handle_start(httpd_req_t *request)
+{
+    httpd_resp_set_type(request, "text/plain");
+    if (s_hooks.start == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "session control not wired up\n");
+    }
+
+    /* Values arrive percent-encoded, and UTF-8 names expand 3x, so give the
+     * scratch buffer room for a longest legal name before decoding. */
+    char value[192];
+    char name[64] = "";
+    char host[48] = "";
+    int port = 0;
+
+    char query[256];
+    esp_err_t err = httpd_req_get_url_query_str(request, query, sizeof(query));
+    if (err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "query is too long\n");
+    }
+    if (err == ESP_OK) {
+        err = httpd_query_key_value(query, "name", value, sizeof(value));
+        if (err == ESP_OK) {
+            url_decode(value);
+            strlcpy(name, value, sizeof(name));
+        } else if (err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "name is too long\n");
+        }
+        err = httpd_query_key_value(query, "host", value, sizeof(value));
+        if (err == ESP_OK) {
+            url_decode(value);
+            strlcpy(host, value, sizeof(host));
+        } else if (err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "host is too long\n");
+        }
+        if (httpd_query_key_value(query, "port", value, sizeof(value)) == ESP_OK) {
+            port = atoi(value);
+        }
+    }
+
+    return httpd_resp_send(request, s_hooks.start(name, host, port), HTTPD_RESP_USE_STRLEN);
+}
+
+/* The browse takes seconds and the list can be long; keep it off the handler
+ * stack. Single client at a time is fine here (max_open_sockets is 2 and one
+ * of those belongs to the pairing page). */
+static char s_target_list[1024];
+
+static esp_err_t handle_targets(httpd_req_t *request)
+{
+    httpd_resp_set_type(request, "text/plain");
+    if (s_hooks.targets == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "discovery not wired up\n");
+    }
+    if (s_hooks.targets(s_target_list, sizeof(s_target_list)) == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "receiver browse failed\n");
+    }
+    return httpd_resp_send(request, s_target_list, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t handle_forget(httpd_req_t *request)
+{
+    httpd_resp_set_type(request, "text/plain");
+    if (s_hooks.forget == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "session control not wired up\n");
+    }
+
+    char name[64] = "";
+    char query[160];
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "name", name, sizeof(name)) == ESP_ERR_HTTPD_RESULT_TRUNC) {
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "name is too long\n");
+        }
+        url_decode(name);
+    }
+    if (name[0] == '\0') {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected ?name=<receiver>\n");
+    }
+    return httpd_resp_send(request, s_hooks.forget(name), HTTPD_RESP_USE_STRLEN);
+}
+
+ esp_err_t pin_server_start(void)
 {
     if (s_server != NULL) {
         return ESP_OK;
@@ -135,6 +236,8 @@ esp_err_t pin_server_start(void)
     config.lru_purge_enable = true;
     /* Keep the page from eating the sockets the AirPlay session needs. */
     config.max_open_sockets = 2;
+    /* /start and /targets run the receiver browse on this task. */
+    config.stack_size = 6144;
 
     esp_err_t err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
@@ -145,8 +248,9 @@ esp_err_t pin_server_start(void)
 
     httpd_uri_t form = {.uri = "/", .method = HTTP_GET, .handler = handle_form};
     httpd_uri_t pin = {.uri = "/pin", .method = HTTP_POST, .handler = handle_pin};
-    httpd_uri_t start = {.uri = "/start", .method = HTTP_GET,
-                         .handler = handle_session, .user_ctx = "start"};
+    httpd_uri_t start = {.uri = "/start", .method = HTTP_GET, .handler = handle_start};
+    httpd_uri_t targets = {.uri = "/targets", .method = HTTP_GET, .handler = handle_targets};
+    httpd_uri_t forget = {.uri = "/forget", .method = HTTP_GET, .handler = handle_forget};
     httpd_uri_t stop = {.uri = "/stop", .method = HTTP_GET,
                         .handler = handle_session, .user_ctx = "stop"};
     httpd_uri_t status = {.uri = "/status", .method = HTTP_GET,
@@ -154,9 +258,11 @@ esp_err_t pin_server_start(void)
     httpd_register_uri_handler(s_server, &form);
     httpd_register_uri_handler(s_server, &pin);
     httpd_register_uri_handler(s_server, &start);
+    httpd_register_uri_handler(s_server, &targets);
+    httpd_register_uri_handler(s_server, &forget);
     httpd_register_uri_handler(s_server, &stop);
     httpd_register_uri_handler(s_server, &status);
-    ESP_LOGI(TAG, "pairing page on http://<device>:%d/ (also /start /stop /status)",
+    ESP_LOGI(TAG, "pairing page on http://<device>:%d/ (also /targets /start /stop /status)",
              PIN_SERVER_PORT);
     return ESP_OK;
 }
