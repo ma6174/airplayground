@@ -125,6 +125,9 @@ size_t ap_client_build(ap_client_t *client, const char *method, const char *uri,
     }
     if (headers != NULL) {
         for (const ap_header_t *header = headers; header->name != NULL; header++) {
+            if (header->value == NULL) {
+                continue; /* an unset header is simply not sent */
+            }
             write_str(&writer, header->name);
             write_str(&writer, ": ");
             write_str(&writer, header->value);

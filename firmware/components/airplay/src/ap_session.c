@@ -348,14 +348,27 @@ static const char *request_code(ap_session_t *session)
 static esp_err_t pair_and_verify(ap_session_t *session)
 {
     const char *pin = NULL;
-
     bool want_pin = session->pin_required || session->config->force_pin || s_receiver_wants_pin;
+
+    /* Every pairing request carries this header, including the pair-verify
+     * attempt below, so it needs a value before the first request goes out. */
+    session->hkp = session->prefers_legacy_pairing ? "3" : "4";
+
+    /* A receiver that has paired with us before accepts pair-verify straight
+     * away, and a rejected pair-verify does not start a pairing backoff, so this
+     * is always the first thing to try - even for receivers that want a code. */
+    if (session->config->identity != NULL) {
+        if (pair_verify(session) == ESP_OK) {
+            AP_LOGI("known identity verified without pair-setup");
+            return ESP_OK;
+        }
+        AP_LOGW("pair-verify alone was rejected; pairing again");
+    }
 
     if (session->config->pin != NULL && session->config->pin[0] != '\0') {
         pin = session->config->pin;
         session->hkp = session->prefers_legacy_pairing ? "3" : "5";
     } else if (want_pin) {
-        session->hkp = session->prefers_legacy_pairing ? "3" : "5";
         pin = request_code(session);
         if (pin == NULL) {
             AP_LOGE("receiver requires a pairing code and none was supplied");
@@ -363,16 +376,6 @@ static esp_err_t pair_and_verify(ap_session_t *session)
         }
     } else {
         session->hkp = "4";
-    }
-
-    /* A persisted identity may already be paired, in which case the receiver
-     * accepts pair-verify straight away and the user sees no PIN prompt. */
-    if (session->config->identity != NULL && pin == NULL) {
-        if (pair_verify(session) == ESP_OK) {
-            AP_LOGI("known identity verified without pair-setup");
-            return ESP_OK;
-        }
-        AP_LOGW("pair-verify alone was rejected; running pair-setup");
     }
 
     esp_err_t setup_result = pair_setup(session, pin);
