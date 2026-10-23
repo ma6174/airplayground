@@ -736,7 +736,7 @@ static void run_setup_case(const char *name, const char *pin, const uint8_t *sal
     snprintf(label, sizeof label, "%s: pair-setup completes", name);
     hap_identity_generate(&identity);
     srp_server_init(&server, pin, salt, secret_b);
-    setup = hap_setup_new(&identity, pin);
+    setup = hap_setup_new(&identity, pin, expect_acl);
     if (setup == NULL) {
         report(label, 0, "hap_setup_new failed");
         return;
@@ -903,7 +903,7 @@ static void test_setup(void)
         hap_setup_t *setup;
 
         hap_identity_generate(&identity);
-        setup = hap_setup_new(&identity, "");
+        setup = hap_setup_new(&identity, "", false);
         srp_server_init(&server, "", srp_transient_salt, srp_transient_secret_b);
         hap_setup_begin(setup, message, sizeof message, &len);
         {

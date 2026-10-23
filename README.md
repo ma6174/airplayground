@@ -157,9 +157,11 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
   三段 SETUP → 数据通道 → RECORD → 逐帧发送 → 心跳/feedback/事件通道，接收端侧
   `fairplay=44 setup=40 video=…/…B`，零错误。
 - 三套 host 测试（fairplay 474 项、hap 133 项、airplay plist/帧头/RTSP 解析）全绿。
-- 与 macOS 自带「隔空播放接收器」联调：`/info`、pair-verify、pair-setup 的 SRP 全部通过
-  （屏幕上的 4 位码被接受，M4 回 ok），M5 上传身份那一步被接收端以 **HTTP 470
-  （Connection Authorization Required）** 拒绝。
+- 与 macOS 自带「隔空播放接收器」联调通过：屏幕 4 位码配对（M1–M6）→ pair-verify →
+  FairPlay → 三段 SETUP → 数据通道持续发送 720p 静帧，`/feedback` 每 2 秒被 200 应答。
+  **关键细节**：macOS 的 features 里 bit 27（legacy pairing）是置位的，这类接收端要求
+  `X-Apple-HKP: 3` 且 M5 **不能**带 `com.apple.ScreenCapture` ACL；用 `X-Apple-HKP: 5` + ACL
+  会在 M5 收到 **HTTP 470（Connection Authorization Required）**。参考实现也是这么选的。
 - macOS 接收器对配对失败会施加很长的退避：**连续失败后 `/pair-setup` 直接回 `RetryDelay`
   1200~2000 秒，连 `/pair-pin-start` 也会 400**；把「隔空播放接收器」关掉再打开**不会**清掉它，
   参考实现（doubletake，同一台机器上跑）同样被挡 —— 说明这是接收端按设备/来源记的策略，

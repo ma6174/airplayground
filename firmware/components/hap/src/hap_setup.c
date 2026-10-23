@@ -31,6 +31,7 @@ struct hap_setup {
     hap_srp_t srp;
     char pin[HAP_SETUP_PIN_MAX + 1];
     bool transient;
+    bool include_acl;
     int state;
 };
 
@@ -56,7 +57,7 @@ static const char *tlv_error_name(int code)
     }
 }
 
-hap_setup_t *hap_setup_new(hap_identity_t *identity, const char *pin)
+hap_setup_t *hap_setup_new(hap_identity_t *identity, const char *pin, bool include_acl)
 {
     hap_setup_t *setup;
 
@@ -70,6 +71,7 @@ hap_setup_t *hap_setup_new(hap_identity_t *identity, const char *pin)
     }
     setup->identity = identity;
     setup->transient = (pin == NULL || pin[0] == '\0');
+    setup->include_acl = include_acl && !setup->transient;
     if (!setup->transient) {
         if (strlen(pin) > HAP_SETUP_PIN_MAX) {
             HAP_LOGE("setup: pairing code is longer than %d characters", HAP_SETUP_PIN_MAX);
@@ -224,7 +226,7 @@ int hap_setup_m4(hap_setup_t *setup, const uint8_t *in, size_t in_len, uint8_t *
     hap_tlv_put(&sub, HAP_TLV_PUBLIC_KEY, setup->identity->public_key,
                 sizeof setup->identity->public_key);
     hap_tlv_put(&sub, HAP_TLV_SIGNATURE, signature, sizeof signature);
-    if (!setup->transient) {
+    if (setup->include_acl) {
         /* Screen-capture pairing only: receivers reject such an identity
          * without the ACL request. */
         hap_tlv_put(&sub, HAP_TLV_ACL, (const uint8_t *)HAP_ACL_SCREEN_CAPTURE,
