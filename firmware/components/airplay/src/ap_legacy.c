@@ -484,6 +484,16 @@ size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t
     if (setup->session_uuid != NULL) {
         entries[count++] = (ap_plist_entry_t){ "sessionUUID", make_string(setup->session_uuid) };
     }
+    if (setup->session_correlation_uuid != NULL) {
+        entries[count++] = (ap_plist_entry_t){ "sessionCorrelationUUID",
+                                              make_string(setup->session_correlation_uuid) };
+    }
+    if (setup->device_id != NULL) {
+        entries[count++] = (ap_plist_entry_t){ "deviceID", make_string(setup->device_id) };
+    }
+    if (setup->mac_address != NULL) {
+        entries[count++] = (ap_plist_entry_t){ "macAddress", make_string(setup->mac_address) };
+    }
     ap_plist_value_t *root = make_dict(entries, count);
     return root == NULL ? 0 : ap_plist_encode(root, out, cap);
 }

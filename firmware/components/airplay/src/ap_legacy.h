@@ -75,6 +75,9 @@ typedef struct {
     const uint8_t *ekey; /* NULL omits the field (no FairPlay) */
     uint16_t timing_port;
     const char *session_uuid;
+    const char *session_correlation_uuid; /* iOS sends both session ids */
+    const char *device_id;                /* stable per device, MAC shaped */
+    const char *mac_address;              /* the interface the session runs on */
 } ap_legacy_setup1_t;
 
 size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t *setup);

@@ -950,11 +950,20 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     }
 
     uint8_t plist[1024];
+    char correlation_uuid[37];
+    {
+        uint8_t bytes[16];
+        ap_random_bytes(bytes, sizeof(bytes));
+        format_uuid(bytes, correlation_uuid);
+    }
     ap_legacy_setup1_t setup1 = {
         .eiv = session->aesiv,
         .ekey = fairplay ? session->ekey : NULL,
         .timing_port = session->timing_port,
         .session_uuid = session->session_uuid,
+        .session_correlation_uuid = correlation_uuid,
+        .device_id = session->device_id,
+        .mac_address = session->device_id,
     };
     size_t plist_len = ap_legacy_build_setup1(plist, sizeof(plist), &setup1);
     if (plist_len == 0 ||
