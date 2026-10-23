@@ -70,6 +70,16 @@
 #define APP_AIRPLAY_LEGACY 0
 #endif
 
+/* How the legacy mirror stream reaches a receiver that hands out no dataPort:
+ *   1 = RTSP interleaved (`$`+channel+length) on the control connection
+ *   2 = raw records ([128-byte header][payload]) on the control connection
+ *   3 = interleaved on a second connection to the RTSP port
+ *   4 = raw records on a second connection to the RTSP port
+ * Receivers that do answer SETUP with a dataPort ignore this. */
+#ifndef APP_LEGACY_DATA_MODE
+#define APP_LEGACY_DATA_MODE 1
+#endif
+
 /* Fallback access point, used when APP_WIFI_SSID is empty. */
 #ifndef APP_FALLBACK_AP_SSID
 #define APP_FALLBACK_AP_SSID "airplay-esp32"

@@ -51,10 +51,17 @@ int ap_legacy_pair_setup(ap_client_t *client, const hap_identity_t *identity,
 int ap_legacy_pair_verify(ap_client_t *client, const hap_identity_t *identity,
                           const uint8_t receiver_ed[32], uint8_t ecdh_out[32]);
 
+/* Writes one mirror record: [128-byte header][payload]. In interleaved mode the
+ * record is wrapped in the RTSP `$`+channel+length framing, all on data_fd. */
+int ap_legacy_write_record(int fd, bool interleaved, uint8_t channel,
+                           const uint8_t header[AP_FRAME_HEADER_LEN], const uint8_t *payload,
+                           size_t payload_len);
+
 /* Builds the ANNOUNCE SDP body. */
 size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
                                 const char *sender_ip, const char *receiver_ip);
-/* SETUP 1 body: eiv + ekey + our NTP port. */
+/* SETUP 1 body: eiv + ekey + our NTP port. ekey == NULL omits the field, for
+ * receivers that answer fp-setup with an empty body (no FairPlay at all). */
 size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const uint8_t eiv[16],
                               const uint8_t ekey[72], uint16_t timing_port);
 /* SETUP 2 body: streams[{type:110, streamConnectionID}]. */

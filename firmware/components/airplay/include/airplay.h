@@ -52,6 +52,10 @@ typedef struct {
      * + two SETUPs, AES-128-CTR mirror records. For receivers advertising
      * AppleTV3,2 / AirTunes 220.x - modern receivers must stay on the HAP path. */
     bool legacy;
+    /* Transport for the mirror stream when the receiver hands out no dataPort:
+     * 1 interleaved on the control connection, 2 raw on the control connection,
+     * 3 interleaved on a second connection, 4 raw on a second connection. */
+    uint8_t legacy_data_mode;
 } airplay_config_t;
 
 /* Runs one mirroring session: pair, FairPlay, SETUP, stream still images until

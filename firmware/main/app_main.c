@@ -99,8 +99,11 @@ static const char *hook_start(const char *name, const char *host, int port)
         }
         strlcpy(s_target_host, target.host, sizeof(s_target_host));
         s_config.port = target.port;
-        ESP_LOGI(TAG, "\"%s\" resolved to %s:%u", name, s_target_host,
-                 (unsigned)s_config.port);
+        /* The advertised model/version decides the protocol generation: an
+         * AppleTV3,2-style box only speaks legacy AirTunes. */
+        s_config.legacy = target.legacy;
+        ESP_LOGI(TAG, "\"%s\" resolved to %s:%u (%s)", name, s_target_host,
+                 (unsigned)s_config.port, target.legacy ? "legacy AirTunes" : "HAP");
     } else if (host != NULL && host[0] != '\0') {
         strlcpy(s_target_host, host, sizeof(s_target_host));
         if (port > 0) {
@@ -323,6 +326,7 @@ void app_main(void)
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
         .identity = identity,
         .legacy = APP_AIRPLAY_LEGACY != 0,
+        .legacy_data_mode = APP_LEGACY_DATA_MODE,
     };
     s_config = config;
     ESP_LOGI(TAG, "default receiver %s:%d, GET /targets lists what else is on the LAN",

@@ -704,8 +704,9 @@ static esp_err_t stream_frames(ap_session_t *session)
         /* The codec record rides unencrypted with the raster dimensions in the
          * header floats (RPiPlay lib/raop_rtp_mirror.c:350-375). */
         ap_frame_build_legacy(header, frames->avcc_len, 0x01, 0, frames->width, frames->height);
-        if (ap_socket_write_all(session->data.fd, header, sizeof(header)) != 0 ||
-            ap_socket_write_all(session->data.fd, frames->avcc, frames->avcc_len) != 0) {
+        if (ap_legacy_write_record(session->data.fd,
+                                   session->legacy_transport == 1 || session->legacy_transport == 3,
+                                   0, header, frames->avcc, frames->avcc_len) != 0) {
             AP_LOGE("legacy codec record write failed");
             return ESP_FAIL;
         }
@@ -776,8 +777,10 @@ static esp_err_t stream_frames(ap_session_t *session)
                 memcpy(session->frame_scratch, payload, payload_len);
                 ap_legacy_ctr_xor(&session->legacy_ctr, session->frame_scratch, payload_len);
                 ap_frame_build_legacy(header, payload_len, 0x00, timestamp, 0, 0);
-                if (ap_socket_write_all(session->data.fd, header, sizeof(header)) != 0 ||
-                    ap_socket_write_all(session->data.fd, session->frame_scratch, payload_len) != 0) {
+                if (ap_legacy_write_record(session->data.fd,
+                                           session->legacy_transport == 1 ||
+                                               session->legacy_transport == 3,
+                                           0, header, session->frame_scratch, payload_len) != 0) {
                     AP_LOGE("video frame %u write failed", (unsigned)index);
                     result = ESP_FAIL;
                     break;
@@ -840,25 +843,34 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     }
     size_t body_len = 0;
     const uint8_t *m2 = ap_client_body(&session->client, &body_len);
-    uint8_t m3[FP_M3_LEN];
-    if (fp_exchange_m3(&session->fp, m2, body_len, m3) != 0 ||
-        ap_client_request(&session->client, "POST", "/fp-setup", AP_CONTENT_TYPE_OCTET, m3,
-                          sizeof(m3), NULL, &response) != 0) {
-        AP_LOGE("legacy FairPlay: m3 rejected");
-        return ESP_FAIL;
-    }
-    const uint8_t *m4 = ap_client_body(&session->client, &body_len);
-    if (fp_confirm_m4(&session->fp, m4, body_len) != 0) {
-        AP_LOGE("legacy FairPlay: m4 confirmation failed");
-        return ESP_FAIL;
-    }
     ap_random_bytes(session->aeskey, sizeof(session->aeskey));
     ap_random_bytes(session->aesiv, sizeof(session->aesiv));
-    if (fp_wrap_key(&session->fp, session->aeskey, fairplay_random, NULL, session->ekey) != 0) {
-        AP_LOGE("legacy FairPlay: ekey wrapping failed");
-        return ESP_FAIL;
+
+    /* Third-party boxes often stub FairPlay out: m1 is answered with an empty
+     * body. There is no ekey to wrap in that case, the bare AES key is the
+     * stream key, and SETUP 1 goes out without the ekey field. */
+    bool fairplay = body_len != 0;
+    if (fairplay) {
+        uint8_t m3[FP_M3_LEN];
+        if (fp_exchange_m3(&session->fp, m2, body_len, m3) != 0 ||
+            ap_client_request(&session->client, "POST", "/fp-setup", AP_CONTENT_TYPE_OCTET, m3,
+                              sizeof(m3), NULL, &response) != 0) {
+            AP_LOGE("legacy FairPlay: m3 rejected");
+            return ESP_FAIL;
+        }
+        const uint8_t *m4 = ap_client_body(&session->client, &body_len);
+        if (fp_confirm_m4(&session->fp, m4, body_len) != 0) {
+            AP_LOGE("legacy FairPlay: m4 confirmation failed");
+            return ESP_FAIL;
+        }
+        if (fp_wrap_key(&session->fp, session->aeskey, fairplay_random, NULL, session->ekey) != 0) {
+            AP_LOGE("legacy FairPlay: ekey wrapping failed");
+            return ESP_FAIL;
+        }
+        AP_LOGI("legacy FairPlay handshake complete (ekey wrapped)");
+    } else {
+        AP_LOGW("receiver answered fp-setup with no body; continuing without FairPlay");
     }
-    AP_LOGI("legacy FairPlay handshake complete");
 
     /* SETUP 1 hands out our timing port, so the responder must listen first. */
     ap_clock_use_ntp(&session->clock);
@@ -883,7 +895,8 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     }
 
     uint8_t plist[256];
-    size_t plist_len = ap_legacy_build_setup1(plist, sizeof(plist), session->aesiv, session->ekey,
+    size_t plist_len = ap_legacy_build_setup1(plist, sizeof(plist), session->aesiv,
+                                              fairplay ? session->ekey : NULL,
                                               session->timing_port);
     if (plist_len == 0 ||
         ap_client_request(&session->client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
@@ -894,7 +907,10 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     AP_LOGI("legacy SETUP 1: timingPort=%u", (unsigned)session->timing_port);
 
     ap_header_t transport[2] = {
-        { "Transport", "RTP/AVP/TCP" },
+        /* Ask for the data stream on this connection; receivers that would
+         * rather hand out a port ignore the interleaved part and answer with
+         * a dataPort instead. */
+        { "Transport", "RTP/AVP/TCP;interleaved=0-1" },
         { NULL, NULL },
     };
     plist_len = ap_legacy_build_setup2(plist, sizeof(plist), session->video_stream_id);
@@ -908,24 +924,36 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     body_len = 0;
     const uint8_t *body = ap_client_body(&session->client, &body_len);
     ap_plist_reader_t reader;
-    if (!ap_plist_decode(&reader, body, body_len)) {
-        AP_LOGE("legacy SETUP 2 reply is not a binary plist");
-        return ESP_FAIL;
-    }
     uint64_t streams = 0;
     uint64_t stream = 0;
     uint64_t port = 0;
-    if (!ap_plist_dict_get(&reader, ap_plist_root(&reader), "streams", &streams) ||
-        !ap_plist_array_get(&reader, streams, 0, &stream) ||
-        !ap_plist_dict_uint(&reader, stream, "dataPort", &port) || port == 0 || port > 65535) {
-        AP_LOGE("legacy SETUP 2 reply carries no dataPort");
-        return ESP_FAIL;
+    bool has_port = body_len != 0 && ap_plist_decode(&reader, body, body_len) &&
+                    ap_plist_dict_get(&reader, ap_plist_root(&reader), "streams", &streams) &&
+                    ap_plist_array_get(&reader, streams, 0, &stream) &&
+                    ap_plist_dict_uint(&reader, stream, "dataPort", &port) && port != 0 &&
+                    port <= 65535;
+    if (has_port) {
+        *data_port = (uint16_t)port;
+        session->legacy_transport = 0;
+        AP_LOGI("legacy SETUP 2: dataPort=%u", (unsigned)*data_port);
+    } else {
+        session->legacy_transport = session->config->legacy_data_mode;
+        if (session->legacy_transport < 1 || session->legacy_transport > 4) {
+            session->legacy_transport = 2;
+        }
+        *data_port = 0;
+        AP_LOGI("legacy SETUP 2: no dataPort; transport mode %u (%s on the %s connection)",
+                (unsigned)session->legacy_transport,
+                session->legacy_transport == 1 || session->legacy_transport == 3 ? "interleaved"
+                                                                               : "raw records",
+                session->legacy_transport <= 2 ? "control" : "second");
     }
-    *data_port = (uint16_t)port;
-    AP_LOGI("legacy SETUP 2: dataPort=%u", (unsigned)*data_port);
 
-    ap_legacy_derive_stream_keys(session->aeskey, session->shared, session->video_stream_id,
-                                 session->legacy_skey, session->legacy_siv);
+    /* Without FairPlay there is no receiver-side mix step either, so the
+     * stream keys come from the bare AES key. */
+    ap_legacy_derive_stream_keys(session->aeskey, fairplay ? session->shared : NULL,
+                                 session->video_stream_id, session->legacy_skey,
+                                 session->legacy_siv);
     return ESP_OK;
 }
 
@@ -948,14 +976,21 @@ static esp_err_t session_run(ap_session_t *session)
         if (legacy_front_half(session, &data_port) != ESP_OK) {
             return ESP_FAIL;
         }
-        session->data.fd = ap_socket_connect(session->config->host, data_port,
-                                             AP_DATA_CONNECT_TIMEOUT_MS);
-        if (session->data.fd < 0) {
-            AP_LOGE("cannot connect to the legacy data port %u", (unsigned)data_port);
-            return ESP_FAIL;
+        if (session->legacy_transport >= 1 && session->legacy_transport <= 2) {
+            /* The stream rides the control connection itself. */
+            session->data.fd = session->client.fd;
+        } else {
+            uint16_t connect_port =
+                session->legacy_transport >= 3 ? session->config->port : data_port;
+            session->data.fd =
+                ap_socket_connect(session->config->host, connect_port, AP_DATA_CONNECT_TIMEOUT_MS);
+            if (session->data.fd < 0) {
+                AP_LOGE("cannot connect to the legacy data port %u", (unsigned)connect_port);
+                return ESP_FAIL;
+            }
         }
         ap_legacy_ctr_start(&session->legacy_ctr, session->legacy_skey, session->legacy_siv);
-        AP_LOGI("legacy data channel connected to port %u", (unsigned)data_port);
+        AP_LOGI("legacy data channel ready on fd %d", session->data.fd);
     } else {
     if (discover(session) != ESP_OK) {
         return ESP_FAIL;

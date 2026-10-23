@@ -1,5 +1,6 @@
 #include "ap_legacy.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -98,9 +99,10 @@ void ap_legacy_derive_stream_keys(const uint8_t stream_key[16], const uint8_t ec
                                   uint64_t connection_id, uint8_t skey[16], uint8_t siv[16])
 {
     /* ekey' = SHA512(stream_key || ecdh)[0..16] - the same mixing primitive the
-     * HAP path uses, with the legacy pair-verify secret in place of the HAP one. */
+     * HAP path uses, with the legacy pair-verify secret in place of the HAP one.
+     * Receivers without FairPlay get the bare key (no ecdh to mix in). */
     uint8_t mixed[16];
-    fp_stream_key(stream_key, ecdh, 32, true, mixed);
+    fp_stream_key(stream_key, ecdh, ecdh != NULL ? 32 : 0, ecdh != NULL, mixed);
 
     char label[32];
     snprintf(label, sizeof(label), "AirPlayStreamKey%llu", (unsigned long long)connection_id);
@@ -223,6 +225,42 @@ int ap_legacy_pair_verify(ap_client_t *client, const hap_identity_t *identity,
     return 0;
 }
 
+/* ------------------------------------------------------------ data records */
+
+int ap_legacy_write_record(int data_fd, bool interleaved, uint8_t channel,
+                           const uint8_t header[AP_FRAME_HEADER_LEN], const uint8_t *payload,
+                           size_t payload_len)
+{
+    if (!interleaved) {
+        if (ap_socket_write_all(data_fd, header, AP_FRAME_HEADER_LEN) != 0) {
+            return -1;
+        }
+        return payload_len == 0 ? 0 : ap_socket_write_all(data_fd, payload, payload_len);
+    }
+
+    /* RTSP interleaved binary: 0x24, channel, big-endian 16-bit length. The
+     * interleaved stream normally rides its own connection to the RTSP port;
+     * data_fd is that connection. */
+    size_t total = AP_FRAME_HEADER_LEN + payload_len;
+    if (total > 0xffff) {
+        return -1;
+    }
+    uint8_t prefix[4] = { 0x24, channel, (uint8_t)(total >> 8), (uint8_t)total };
+    if (ap_socket_write_all(data_fd, prefix, sizeof(prefix)) != 0 ||
+        ap_socket_write_all(data_fd, header, AP_FRAME_HEADER_LEN) != 0) {
+        AP_LOGE("interleaved write failed: %s", strerror(errno));
+        return -1;
+    }
+    if (payload_len == 0) {
+        return 0;
+    }
+    if (ap_socket_write_all(data_fd, payload, payload_len) != 0) {
+        AP_LOGE("interleaved payload write failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* --------------------------------------------------------- session bodies */
 
 size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
@@ -314,13 +352,17 @@ size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const uint8_t eiv[16],
 {
     pool_reset();
     ap_plist_entry_t *entries = entry_slots(3);
+    (void)0;
     if (entries == NULL) {
         return 0;
     }
-    entries[0] = (ap_plist_entry_t){ "eiv", make_data(eiv, 16) };
-    entries[1] = (ap_plist_entry_t){ "ekey", make_data(ekey, 72) };
-    entries[2] = (ap_plist_entry_t){ "timingPort", make_uint(timing_port) };
-    ap_plist_value_t *root = make_dict(entries, 3);
+    size_t count = 0;
+    entries[count++] = (ap_plist_entry_t){ "eiv", make_data(eiv, 16) };
+    if (ekey != NULL) {
+        entries[count++] = (ap_plist_entry_t){ "ekey", make_data(ekey, 72) };
+    }
+    entries[count++] = (ap_plist_entry_t){ "timingPort", make_uint(timing_port) };
+    ap_plist_value_t *root = make_dict(entries, count);
     return root == NULL ? 0 : ap_plist_encode(root, out, cap);
 }
 

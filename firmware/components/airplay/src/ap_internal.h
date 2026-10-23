@@ -83,6 +83,8 @@ typedef struct ap_session {
     uint8_t legacy_skey[16];
     uint8_t legacy_siv[16];
     ap_legacy_ctr_t legacy_ctr;
+    /* 0: receiver handed out a dataPort; 1-4: see legacy_data_mode. */
+    uint8_t legacy_transport;
 
     /* Protocol scratch. Only the session task touches these buffers. */
     uint8_t msg[1024];
