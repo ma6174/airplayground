@@ -73,9 +73,20 @@
 #define APP_FALLBACK_AP_PASSWORD "airplay1234"
 #endif
 
-/* How long each still image stays on screen before the next one is sent. */
+/* How long each still image stays on screen before the next one is sent.
+ * Applies to the still-image source only; the live source runs at
+ * MEDIA_PATTERN_FPS. */
 #ifndef APP_FRAME_INTERVAL_MS
 #define APP_FRAME_INTERVAL_MS 10000
+#endif
+
+/* Encode the video at runtime instead of replaying flash-resident still
+ * images: a built-in animated test pattern goes through the esp_h264 software
+ * encoder at APP_LIVE_FPS. Needs roughly a megabyte of free memory; when the
+ * chip cannot provide it, the boot log says so and mirroring falls back to
+ * the still images. */
+#ifndef APP_USE_LIVE_VIDEO
+#define APP_USE_LIVE_VIDEO 1
 #endif
 
 /* Keep the FairPlay self-test at boot: it re-derives every published test

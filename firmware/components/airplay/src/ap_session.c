@@ -654,16 +654,25 @@ static esp_err_t setup_video(ap_session_t *session, uint16_t *data_port)
 
 static esp_err_t allocate_frame_scratch(ap_session_t *session)
 {
-    const airplay_frames_t *frames = session->config->frames;
     size_t largest = 0;
-    for (size_t i = 0; i < frames->frame_count; i++) {
-        size_t len = 0;
-        if (frames->frame(i, &len) == NULL || len == 0) {
-            AP_LOGE("still frame %u is empty", (unsigned)i);
+    if (session->config->live_source != NULL) {
+        /* A live source has no enumerable frames; it publishes its bound. */
+        largest = session->config->live_source->max_au_len;
+        if (largest == 0) {
+            AP_LOGE("live source publishes no access-unit bound");
             return ESP_FAIL;
         }
-        if (len > largest) {
-            largest = len;
+    } else {
+        const airplay_frames_t *frames = session->config->frames;
+        for (size_t i = 0; i < frames->frame_count; i++) {
+            size_t len = 0;
+            if (frames->frame(i, &len) == NULL || len == 0) {
+                AP_LOGE("still frame %u is empty", (unsigned)i);
+                return ESP_FAIL;
+            }
+            if (len > largest) {
+                largest = len;
+            }
         }
     }
 
@@ -689,20 +698,43 @@ static int send_feedback(ap_session_t *session)
 
 static esp_err_t stream_frames(ap_session_t *session)
 {
+    const airplay_live_source_t *live = session->config->live_source;
     const airplay_frames_t *frames = session->config->frames;
     uint32_t interval = session->config->frame_interval_ms;
+    if (live != NULL) {
+        interval = live->interval_ms;
+    }
     if (interval == 0) {
         interval = 1000;
     }
 
+    const uint8_t *avcc = NULL;
+    size_t avcc_len = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    if (live != NULL) {
+        avcc = live->codec_record(live->user, &avcc_len);
+        width = live->width;
+        height = live->height;
+    } else {
+        avcc = frames->avcc;
+        avcc_len = frames->avcc_len;
+        width = frames->width;
+        height = frames->height;
+    }
+    if (avcc == NULL || avcc_len == 0 || width == 0 || height == 0) {
+        AP_LOGE("content source carries no usable codec record");
+        return ESP_FAIL;
+    }
+
     uint64_t timeline_id = 0;
-    if (ap_data_send_codec(&session->data, frames->avcc, frames->avcc_len, frames->width, frames->height,
+    if (ap_data_send_codec(&session->data, avcc, avcc_len, width, height,
                            ap_clock_now(&session->clock, &timeline_id)) != 0) {
         AP_LOGE("codec packet write failed");
         return ESP_FAIL;
     }
-    AP_LOGI("codec packet sent: avcC %u bytes, %ux%u", (unsigned)frames->avcc_len, (unsigned)frames->width,
-            (unsigned)frames->height);
+    AP_LOGI("codec packet sent: avcC %u bytes, %ux%u", (unsigned)avcc_len, (unsigned)width,
+            (unsigned)height);
 
     size_t index = 0;
     uint64_t last_timestamp = 0;
@@ -738,10 +770,22 @@ static esp_err_t stream_frames(ap_session_t *session)
 
         if (now >= next_frame) {
             size_t payload_len = 0;
-            const uint8_t *payload = frames->frame(index, &payload_len);
-            if (payload == NULL || payload_len == 0) {
-                AP_LOGE("still frame %u disappeared", (unsigned)index);
-                return ESP_FAIL;
+            const uint8_t *payload = NULL;
+            bool idr = false;
+            if (live != NULL) {
+                if (live->next_frame(live->user, &payload, &payload_len, &idr) != ESP_OK ||
+                    payload == NULL || payload_len == 0) {
+                    AP_LOGE("live source failed to produce a frame");
+                    result = ESP_FAIL;
+                    break;
+                }
+            } else {
+                payload = frames->frame(index, &payload_len);
+                if (payload == NULL || payload_len == 0) {
+                    AP_LOGE("still frame %u disappeared", (unsigned)index);
+                    return ESP_FAIL;
+                }
+                idr = ap_avcc_has_idr(payload, payload_len);
             }
 
             uint64_t timestamp = ap_clock_now(&session->clock, &timeline_id);
@@ -750,10 +794,9 @@ static esp_err_t stream_frames(ap_session_t *session)
             }
             last_timestamp = timestamp;
 
-            bool idr = ap_avcc_has_idr(payload, payload_len);
             if (ap_data_send_frame(&session->data, payload, payload_len, idr, timestamp, timeline_id,
                                    session->frame_scratch, session->frame_scratch_len) != 0) {
-                AP_LOGE("video frame %u write failed", (unsigned)index);
+                AP_LOGE("video frame write failed");
                 result = ESP_FAIL;
                 break;
             }
@@ -761,10 +804,12 @@ static esp_err_t stream_frames(ap_session_t *session)
                 first_frame_sent = true;
                 next_heartbeat = ap_millis() + AP_HEARTBEAT_INTERVAL_MS;
             }
-            AP_LOGI("frame %u sent: %u bytes, idr=%d, timestamp=%llu", (unsigned)index,
-                    (unsigned)payload_len, idr ? 1 : 0, (unsigned long long)timestamp);
+            AP_LOGI("frame sent: %u bytes, idr=%d, timestamp=%llu", (unsigned)payload_len,
+                    idr ? 1 : 0, (unsigned long long)timestamp);
 
-            index = (index + 1) % frames->frame_count;
+            if (live == NULL) {
+                index = (index + 1) % frames->frame_count;
+            }
             next_frame = now + interval;
         }
 
@@ -898,9 +943,18 @@ uint32_t airplay_backoff_ms(void)
 
 esp_err_t airplay_mirror(const airplay_config_t *config)
 {
-    if (config == NULL || config->host == NULL || config->frames == NULL ||
-        config->frames->frame == NULL || config->frames->frame_count == 0 ||
-        config->frames->avcc == NULL || config->frames->avcc_len == 0) {
+    if (config == NULL || config->host == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (config->live_source != NULL) {
+        if (config->frames != NULL || config->live_source->codec_record == NULL ||
+            config->live_source->next_frame == NULL || config->live_source->max_au_len == 0 ||
+            config->live_source->width == 0 || config->live_source->height == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    } else if (config->frames == NULL || config->frames->frame == NULL ||
+               config->frames->frame_count == 0 || config->frames->avcc == NULL ||
+               config->frames->avcc_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 

@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "media_frames.h"
+#include "media_live.h"
 #include "nvs_flash.h"
 #include "pin_fetch.h"
 #include "pin_server.h"
@@ -267,6 +268,17 @@ void app_main(void)
 
     log_banner();
 
+    /* The live encoder takes about a megabyte, so claim it before anything
+     * else has a chance to fragment the heap. When it fails, mirroring falls
+     * back to the flash-resident still images. */
+    bool live_video = false;
+#if APP_USE_LIVE_VIDEO
+    live_video = media_live_init();
+    if (!live_video) {
+        ESP_LOGE(TAG, "live video unavailable; mirroring will use the still images");
+    }
+#endif
+
 #if APP_RUN_SELFTEST
     if (fp_selftest() != 0) {
         ESP_LOGE(TAG, "FairPlay self-test FAILED: the handshake cannot work, fix the port first");
@@ -319,13 +331,15 @@ void app_main(void)
         .pin = APP_PAIRING_PIN,
         .force_pin = APP_FORCE_PIN_PAIRING != 0,
         .request_pin = prompt_pin,
-        .frames = media_still_frames(),
+        .live_source = live_video ? media_live_source() : NULL,
+        .frames = live_video ? NULL : media_still_frames(),
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
         .identity = identity,
     };
     s_config = config;
     ESP_LOGI(TAG, "default receiver %s:%d, GET /targets lists what else is on the LAN",
              s_target_host, APP_AIRPLAY_TARGET_PORT);
+    ESP_LOGI(TAG, "video source: %s", live_video ? "live encoder (test pattern)" : "still images");
 
     static const pin_server_session_hooks_t hooks = {
         .start = hook_start,

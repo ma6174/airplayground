@@ -1,8 +1,11 @@
 /*
- * Still images baked into flash as pre-encoded H.264 access units.
+ * Content sources for the mirroring session.
  *
- * tools/make_frames.py regenerates src/frames.c from a directory of images, so
- * the firmware never needs an encoder at runtime.
+ * media_still_frames() replays pre-encoded H.264 access units baked into
+ * flash by tools/make_frames.py - the baseline that works on any board.
+ * media_live_source() encodes a test pattern at runtime with the esp_h264
+ * software encoder; it needs about a megabyte of free memory and falls back
+ * to the still images when the chip cannot provide it.
  */
 #pragma once
 

@@ -27,6 +27,7 @@ cd firmware && . ~/esp/esp-idf/export.sh && idf.py build
 cd firmware/components/fairplay/test && make
 cd firmware/components/hap/test && make
 cd firmware/components/airplay/test && ./run.sh
+cd firmware/components/media/test && ./run.sh
 ```
 
 ## 烧写、复位、看日志
@@ -142,12 +143,18 @@ macOS 的「隔空播放接收器」bit27 置位，必须用 3；用 5+ACL 会�
 
 ## 换投的图
 
+默认画面是片上软编码的动画测试图案（`esp_h264`/OpenH264，320x180@10fps），
+不需要任何工具。两种情况下才会用到静态帧：
+
+- 板子内存不够起编码器（启动日志会有 `live video unavailable`），固件自动回退；
+- 想要清晰的大分辨率画面（720p 文字）：用 `APP_USE_LIVE_VIDEO=0` 切回静态帧。
+
 ```sh
 python3 firmware/tools/make_frames.py 图1.png 图2.png 图3.png
 ```
 
-生成 720p H.264 Baseline IDR 帧（每帧 18~27 KB），替换 `firmware/main/` 里的帧数据后重编。
-设备端只回放字节，编码在主机完成（S3 软编官方上限只有 320×240@11fps）。
+生成 720p H.264 Baseline IDR 帧（每帧 18~27 KB），替换 `firmware/components/media/src/frames.c`
+后重编。设备端只回放字节，编码在主机完成。
 
 ## 故障速查
 
