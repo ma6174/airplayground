@@ -28,9 +28,10 @@ firmware/
 │   └── media/             预编码的静态帧（由 tools/make_frames.py 生成）
 ├── media-src/             静态帧的源图
 ├── tools/make_frames.py   源图 → H.264 访问单元 → frames.c
+├── tools/pin_bridge.py    常驻串口桥：日志落文件（FIFO 写入仅对真实 UART 板有意义）
 ├── partitions.csv         3 MB 应用分区
 └── sdkconfig.defaults     esp32s3 / 16 MB flash / USB-Serial-JTAG 控制台
-docs/protocol.md            Wire-level reference: headers, plists, frame layout
+docs/                      协议与 FairPlay 规格、C 参考实现、运维手册（见下文「文档」）
 ```
 
 ## 快速开始
@@ -52,14 +53,16 @@ $EDITOR main/app_config_local.h      # Wi-Fi 账号密码 + Apple TV 的 IP
 . ~/esp/esp-idf/export.sh
 idf.py set-target esp32s3
 idf.py build
-idf.py -p /dev/cu.usbmodem* flash monitor
+idf.py -p /dev/cu.usbmodem1101 flash
+python -m esptool --port /dev/cu.usbmodem1101 --after watchdog-reset chip-id
 ```
 
-日志走 UART0（板子的 USB-UART 口），同时镜像到原生 USB-Serial/JTAG 口，两个口都能看到。
-配对码输入只在 UART0 口有效。
+最后一条不是查芯片，是借它发复位：S3 用原生 USB 口烧完会停在 download 模式，
+不复位 app 不会跑（不用换线、不用拔插）。
 
-注意：S3 用原生 USB 口烧写后芯片会停在 download 模式，不会自己跑起来；换到 UART 口（换线即断电）
-或按一下 RST 才会启动。
+板子的两个 USB 口都是 USB-Serial/JTAG，日志两个口都能看；但**这台板的控制台只能读不能写**
+（主机写入的字节到不了固件 STDIN），所以配对码不走串口输入，走 HTTP 投递 ——
+完整步骤见 [docs/runbook.md](docs/runbook.md)。
 
 ### 3. 运行
 
@@ -76,12 +79,11 @@ idf.py -p /dev/cu.usbmodem* flash monitor
 主机连上这个热点后，可以在 `192.168.4.2` 跑仓库里的 Go 测试接收端做整链路台架验证：
 
 ```sh
-cd /Users/ma6174/airplay/doubletake
 go run ./cmd/doubletake-test-receiver -listen 0.0.0.0:7000 -profile modern -stats-interval 5s
 ```
 
-然后把 `APP_AIRPLAY_TARGET_HOST` 设为 `192.168.4.2`。这条路径不需要 Apple TV，
-也不占用你家网络的密码。
+（在 doubletake 参考实现的检出目录里执行。）然后把 `APP_AIRPLAY_TARGET_HOST` 设为
+`192.168.4.2`。这条路径不需要 Apple TV，也不占用你家网络的密码。
 
 ## 协议做了什么
 
@@ -106,10 +108,10 @@ TCP → dataPort                        128 字节头 + AVCC 帧（ChaCha20-Poly
 串口里看到
 
 ```
-I (xxx) fairplay: self-test: 0 failures
+I (xxx) fairplay: selftest: 474 checks, 0 failures
 ```
 
-才算 FairPlay 移植正确；任何一条失败都会指明具体用例。这些向量同时可以在 macOS 上直接跑：
+才算 FairPlay 移植正确；任何一条失败都会指明具体用例。这套向量也可以在主机上直接跑：
 
 ```sh
 cd firmware/components/fairplay/test && make && ./fairplay_test
@@ -119,15 +121,17 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
 
 - **只实现 HAP（TLV8）配对**：最早的那套裸二进制配对（68/96 字节交换、控制通道不加密）和
   AES-CTR 视频加密没有实现。现代 Apple TV 与 macOS 接收器走的都是 HAP。
-  注意 `X-Apple-HKP: 3` 不是"裸配对"：它仍是 HAP TLV8，只是配对类型不同（见上表）。
+  注意 `X-Apple-HKP: 3` 不是"裸配对"：它仍是 HAP TLV8，只是配对类型不同
+  （4/5/3 的区分见 [docs/protocol.md](docs/protocol.md) 的 Pairing types）。
 - **没有音频**：SETUP 里给了音频描述（含 32 字节音频流密钥占位），但不发音频包。
 - **没有 mDNS 发现**：接收端地址写在配置里。
 - **没有编码器**：画面内容在编译期固定；`tools/make_frames.py` 换图即可。
 - **配对要等**：SRP-6a 的 3072 位模幂在 S3 上一轮约 8 秒（期间 CPU 打满，看门狗超时已调到 30 秒）。
   接收端接受过这台设备后，后续会话走 pair-verify，不再重跑 SRP。
-- **配对码有三条输入路径**：本机 HTTP 页面（`http://<device>:8080/`）、串口、以及
-  `APP_PIN_FETCH_PORT` 指向的"设备去拉码"钩子（某些网络不允许主机连设备）。
-  也可以直接把码编译进 `APP_PAIRING_PIN`。
+- **配对码有三条输入路径**：本机 HTTP 页面（`http://<device>:8080/`）、串口（仅对带真实
+  UART 控制台的板子有效，本板是 USB-Serial/JTAG 只读）、以及 `APP_PIN_FETCH_HOST/PORT`
+  指向的"设备去主机拉码"钩子。也可以直接把码编译进 `APP_PAIRING_PIN`。
+  本板实测可用的是 HTTP 页面与拉码钩子。
 - **接收端限流要遵守**：配对失败会被 HomeKit 退避（最长可达 30 分钟），重试过早只会
   延长惩罚；固件会读 `0x08` 重试延迟并等满（`airplay_backoff_ms()`）。
 - **要求配对码的接收端要设 `APP_FORCE_PIN_PAIRING=1`**：先试 transient 会失败，而那次
@@ -136,7 +140,8 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
 
 ## 调试
 
-- 日志同时出现在两个 USB 口：烧写口（原生 USB-Serial/JTAG）和 UART 口。
+- 日志同时出现在两个 USB 口（都是 USB-Serial/JTAG），`idf.py monitor` 或
+  `firmware/tools/pin_bridge.py` 都能读；控制台写入无效（见「快速开始」）。
 - S3 用原生 USB 口烧完会停在 download 模式，需要复位才会跑起来。不换线也能复位：
 
   ```sh
@@ -150,7 +155,20 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
   ```
 
   `-profile modern` 是「HAP 配对 + PTP 时基 + streamConnections 音频描述」的现代接收端形态，
-  和本固件选择的路径一致；`video=/B` 计数增长说明帧已收到并解密。
+  和本固件选择的路径一致；`video=N/…B` 计数增长说明帧已收到并解密。
+
+更多实操细节（两个 USB 口的分工、配对投码的完整流程、接收端限流的解除、故障速查表）
+都在 [docs/runbook.md](docs/runbook.md)。
+
+## 文档
+
+- [docs/runbook.md](docs/runbook.md) — **实操手册**：编译、烧写、复位、看日志、配对投码、限流解除、故障速查
+- [docs/protocol.md](docs/protocol.md) — 会话时序与报文走读（实现视角）
+- [docs/protocol-spec.md](docs/protocol-spec.md) — 发送端协议规格全文，逐条标注参考实现出处
+- [docs/fairplay-spec.md](docs/fairplay-spec.md) — FairPlay SAP 移植规格（算法、常量、向量）
+- [docs/fairplay-port-report.md](docs/fairplay-port-report.md) — mbedtls 4.1/PSA 适配验证记录
+- [docs/fairplay-reference/](docs/fairplay-reference/) — 独立可编译的 C 参考实现 + 474 组向量
+  （`cc -O2 fairplay_ref.c && ./a.out` 应输出 `ALL PASS`）
 
 ## 验证过的部分
 
