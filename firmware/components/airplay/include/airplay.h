@@ -48,6 +48,10 @@ typedef struct {
     uint32_t frame_interval_ms;
     /* Long-term controller identity, owned by the caller and persisted there. */
     hap_identity_t *identity;
+    /* Talk the legacy AirTunes protocol (pre-HAP): raw pair exchanges, ANNOUNCE
+     * + two SETUPs, AES-128-CTR mirror records. For receivers advertising
+     * AppleTV3,2 / AirTunes 220.x - modern receivers must stay on the HAP path. */
+    bool legacy;
 } airplay_config_t;
 
 /* Runs one mirroring session: pair, FairPlay, SETUP, stream still images until

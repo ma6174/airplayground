@@ -245,6 +245,7 @@ void app_main(void)
         .frames = media_still_frames(),
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
         .identity = identity,
+        .legacy = APP_AIRPLAY_LEGACY != 0,
     };
     s_config = config;
 

@@ -16,6 +16,7 @@
 #include "ap_client.h"
 #include "ap_data.h"
 #include "ap_event.h"
+#include "ap_legacy.h"
 #include "ap_ntp.h"
 #include "ap_platform.h"
 #include "fairplay.h"
@@ -74,6 +75,14 @@ typedef struct ap_session {
 
     ap_data_channel_t data;
     ap_event_channel_t event;
+
+    /* Legacy (AirTunes) stream state: the ekey-wrapped key is unwrapped on the
+     * receiver with m3, then mixed with the pair-verify secret. */
+    uint8_t aeskey[FP_RAW_KEY_LEN];
+    uint8_t aesiv[FP_IV_LEN];
+    uint8_t legacy_skey[16];
+    uint8_t legacy_siv[16];
+    ap_legacy_ctr_t legacy_ctr;
 
     /* Protocol scratch. Only the session task touches these buffers. */
     uint8_t msg[1024];

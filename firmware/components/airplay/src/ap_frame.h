@@ -31,6 +31,13 @@ void ap_frame_build_video(uint8_t header[AP_FRAME_HEADER_LEN], size_t payload_le
 
 void ap_frame_build_heartbeat(uint8_t header[AP_FRAME_HEADER_LEN]);
 
+/* Legacy (AirTunes) header: payload length and record type in [4], boot NTP
+ * timestamp at [8:16] for video records, source/display float pairs at
+ * [16:32] and [56:64] for the codec record. No timeline, no Poly1305 tag. */
+void ap_frame_build_legacy(uint8_t header[AP_FRAME_HEADER_LEN], size_t payload_len,
+                           uint8_t record_type, uint64_t timestamp, uint16_t width,
+                           uint16_t height);
+
 /* True when the AVCC access unit contains an IDR slice (NAL type 5). The
  * still-frame source does not label its frames, and the receiver needs the
  * keyframe flag to reset its decoder. */

@@ -9,6 +9,7 @@ idf_component_register(
         "src/ap_platform.c"
         "src/ap_plist.c"
         "src/ap_session.c"
+        "src/ap_legacy.c"
         "src/ap_setup.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"

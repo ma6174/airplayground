@@ -5,6 +5,8 @@
 #include "airplay.h"
 #include "ap_frame.h"
 #include "ap_internal.h"
+#include "ap_legacy.h"
+#include "ap_plist.h"
 #include "ap_setup.h"
 #include "esp_err.h"
 #include "fairplay.h"
@@ -690,14 +692,26 @@ static int send_feedback(ap_session_t *session)
 static esp_err_t stream_frames(ap_session_t *session)
 {
     const airplay_frames_t *frames = session->config->frames;
+    const bool legacy = session->config->legacy;
     uint32_t interval = session->config->frame_interval_ms;
     if (interval == 0) {
         interval = 1000;
     }
 
     uint64_t timeline_id = 0;
-    if (ap_data_send_codec(&session->data, frames->avcc, frames->avcc_len, frames->width, frames->height,
-                           ap_clock_now(&session->clock, &timeline_id)) != 0) {
+    uint8_t header[AP_FRAME_HEADER_LEN];
+    if (legacy) {
+        /* The codec record rides unencrypted with the raster dimensions in the
+         * header floats (RPiPlay lib/raop_rtp_mirror.c:350-375). */
+        ap_frame_build_legacy(header, frames->avcc_len, 0x01, 0, frames->width, frames->height);
+        if (ap_socket_write_all(session->data.fd, header, sizeof(header)) != 0 ||
+            ap_socket_write_all(session->data.fd, frames->avcc, frames->avcc_len) != 0) {
+            AP_LOGE("legacy codec record write failed");
+            return ESP_FAIL;
+        }
+    } else if (ap_data_send_codec(&session->data, frames->avcc, frames->avcc_len, frames->width,
+                                  frames->height,
+                                  ap_clock_now(&session->clock, &timeline_id)) != 0) {
         AP_LOGE("codec packet write failed");
         return ESP_FAIL;
     }
@@ -727,7 +741,7 @@ static esp_err_t stream_frames(ap_session_t *session)
             next_feedback = now + AP_FEEDBACK_INTERVAL_MS;
         }
 
-        if (first_frame_sent && now >= next_heartbeat) {
+        if (!legacy && first_frame_sent && now >= next_heartbeat) {
             if (ap_data_send_heartbeat(&session->data) != 0) {
                 AP_LOGE("data channel heartbeat failed");
                 result = ESP_FAIL;
@@ -744,15 +758,33 @@ static esp_err_t stream_frames(ap_session_t *session)
                 return ESP_FAIL;
             }
 
-            uint64_t timestamp = ap_clock_now(&session->clock, &timeline_id);
+            uint64_t timestamp = legacy ? ap_ntp_boot_timestamp() : ap_clock_now(&session->clock, &timeline_id);
             if (timestamp <= last_timestamp) {
                 timestamp = last_timestamp + 1;
             }
             last_timestamp = timestamp;
 
             bool idr = ap_avcc_has_idr(payload, payload_len);
-            if (ap_data_send_frame(&session->data, payload, payload_len, idr, timestamp, timeline_id,
-                                   session->frame_scratch, session->frame_scratch_len) != 0) {
+            if (legacy) {
+                /* The whole access unit is sealed with the continuous CTR
+                 * keystream; no tag, and the keystream position carries over
+                 * to the next record. */
+                if (payload_len > session->frame_scratch_len) {
+                    AP_LOGE("still frame %u does not fit the scratch buffer", (unsigned)index);
+                    return ESP_FAIL;
+                }
+                memcpy(session->frame_scratch, payload, payload_len);
+                ap_legacy_ctr_xor(&session->legacy_ctr, session->frame_scratch, payload_len);
+                ap_frame_build_legacy(header, payload_len, 0x00, timestamp, 0, 0);
+                if (ap_socket_write_all(session->data.fd, header, sizeof(header)) != 0 ||
+                    ap_socket_write_all(session->data.fd, session->frame_scratch, payload_len) != 0) {
+                    AP_LOGE("video frame %u write failed", (unsigned)index);
+                    result = ESP_FAIL;
+                    break;
+                }
+            } else if (ap_data_send_frame(&session->data, payload, payload_len, idr, timestamp,
+                                          timeline_id, session->frame_scratch,
+                                          session->frame_scratch_len) != 0) {
                 AP_LOGE("video frame %u write failed", (unsigned)index);
                 result = ESP_FAIL;
                 break;
@@ -774,6 +806,129 @@ static esp_err_t stream_frames(ap_session_t *session)
     return result;
 }
 
+/* Legacy (AirTunes) front half: raw pair, FairPlay ekey chain, ANNOUNCE and
+ * the two SETUPs. Returns the receiver's mirror data port. The NTP responder
+ * is running when this returns - SETUP 1 hands out its port. */
+static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
+{
+    ap_response_t response;
+    if (ap_client_request(&session->client, "OPTIONS", "*", NULL, NULL, 0, NULL, &response) != 0) {
+        AP_LOGE("legacy OPTIONS failed (status %d)", response.status);
+        return ESP_FAIL;
+    }
+
+    uint8_t receiver_ed[32];
+    if (ap_legacy_pair_setup(&session->client, session->identity, receiver_ed) != 0 ||
+        ap_legacy_pair_verify(&session->client, session->identity, receiver_ed,
+                              session->shared) != 0) {
+        return ESP_FAIL;
+    }
+    AP_LOGI("legacy pair-verify complete");
+
+    /* FairPlay v3 with the ekey chain: the same primitives the HAP path uses,
+     * but the wrapped key travels in SETUP 1 instead of shk over HAP. */
+    if (fp_session_init(&session->fp, fairplay_random, NULL) != 0) {
+        AP_LOGE("FairPlay: session init failed");
+        return ESP_FAIL;
+    }
+    uint8_t m1[FP_M1_LEN];
+    fp_message1(&session->fp, m1);
+    if (ap_client_request(&session->client, "POST", "/fp-setup", AP_CONTENT_TYPE_OCTET, m1,
+                          sizeof(m1), NULL, &response) != 0) {
+        AP_LOGE("legacy FairPlay: m1 rejected");
+        return ESP_FAIL;
+    }
+    size_t body_len = 0;
+    const uint8_t *m2 = ap_client_body(&session->client, &body_len);
+    uint8_t m3[FP_M3_LEN];
+    if (fp_exchange_m3(&session->fp, m2, body_len, m3) != 0 ||
+        ap_client_request(&session->client, "POST", "/fp-setup", AP_CONTENT_TYPE_OCTET, m3,
+                          sizeof(m3), NULL, &response) != 0) {
+        AP_LOGE("legacy FairPlay: m3 rejected");
+        return ESP_FAIL;
+    }
+    const uint8_t *m4 = ap_client_body(&session->client, &body_len);
+    if (fp_confirm_m4(&session->fp, m4, body_len) != 0) {
+        AP_LOGE("legacy FairPlay: m4 confirmation failed");
+        return ESP_FAIL;
+    }
+    ap_random_bytes(session->aeskey, sizeof(session->aeskey));
+    ap_random_bytes(session->aesiv, sizeof(session->aesiv));
+    if (fp_wrap_key(&session->fp, session->aeskey, fairplay_random, NULL, session->ekey) != 0) {
+        AP_LOGE("legacy FairPlay: ekey wrapping failed");
+        return ESP_FAIL;
+    }
+    AP_LOGI("legacy FairPlay handshake complete");
+
+    /* SETUP 1 hands out our timing port, so the responder must listen first. */
+    ap_clock_use_ntp(&session->clock);
+    session->timing_fd = ap_ntp_open(&session->timing_port);
+    if (session->timing_fd < 0) {
+        AP_LOGE("could not bind the NTP timing port");
+        return ESP_FAIL;
+    }
+    if (ap_ntp_start(session) != 0) {
+        return ESP_FAIL;
+    }
+
+    char announce[512];
+    size_t announce_len = ap_legacy_build_announce(
+        announce, sizeof(announce), session->session_uuid,
+        session->config->local_address != NULL ? session->config->local_address : "0.0.0.0",
+        session->config->host);
+    if (ap_client_request(&session->client, "ANNOUNCE", session->uri, "application/sdp", announce,
+                          announce_len, NULL, &response) != 0) {
+        AP_LOGE("legacy ANNOUNCE failed (status %d)", response.status);
+        return ESP_FAIL;
+    }
+
+    uint8_t plist[256];
+    size_t plist_len = ap_legacy_build_setup1(plist, sizeof(plist), session->aesiv, session->ekey,
+                                              session->timing_port);
+    if (plist_len == 0 ||
+        ap_client_request(&session->client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
+                          plist_len, NULL, &response) != 0) {
+        AP_LOGE("legacy SETUP 1 failed (status %d)", response.status);
+        return ESP_FAIL;
+    }
+    AP_LOGI("legacy SETUP 1: timingPort=%u", (unsigned)session->timing_port);
+
+    ap_header_t transport[2] = {
+        { "Transport", "RTP/AVP/TCP" },
+        { NULL, NULL },
+    };
+    plist_len = ap_legacy_build_setup2(plist, sizeof(plist), session->video_stream_id);
+    if (plist_len == 0 ||
+        ap_client_request(&session->client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
+                          plist_len, transport, &response) != 0) {
+        AP_LOGE("legacy SETUP 2 failed (status %d)", response.status);
+        return ESP_FAIL;
+    }
+
+    body_len = 0;
+    const uint8_t *body = ap_client_body(&session->client, &body_len);
+    ap_plist_reader_t reader;
+    if (!ap_plist_decode(&reader, body, body_len)) {
+        AP_LOGE("legacy SETUP 2 reply is not a binary plist");
+        return ESP_FAIL;
+    }
+    uint64_t streams = 0;
+    uint64_t stream = 0;
+    uint64_t port = 0;
+    if (!ap_plist_dict_get(&reader, ap_plist_root(&reader), "streams", &streams) ||
+        !ap_plist_array_get(&reader, streams, 0, &stream) ||
+        !ap_plist_dict_uint(&reader, stream, "dataPort", &port) || port == 0 || port > 65535) {
+        AP_LOGE("legacy SETUP 2 reply carries no dataPort");
+        return ESP_FAIL;
+    }
+    *data_port = (uint16_t)port;
+    AP_LOGI("legacy SETUP 2: dataPort=%u", (unsigned)*data_port);
+
+    ap_legacy_derive_stream_keys(session->aeskey, session->shared, session->video_stream_id,
+                                 session->legacy_skey, session->legacy_siv);
+    return ESP_OK;
+}
+
 static esp_err_t session_run(ap_session_t *session)
 {
     if (ap_client_connect(&session->client, session->config->host, session->config->port,
@@ -788,6 +943,20 @@ static esp_err_t session_run(ap_session_t *session)
         ap_client_set_password(&session->client, session->config->pin);
     }
 
+    uint16_t data_port = 0;
+    if (session->config->legacy) {
+        if (legacy_front_half(session, &data_port) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        session->data.fd = ap_socket_connect(session->config->host, data_port,
+                                             AP_DATA_CONNECT_TIMEOUT_MS);
+        if (session->data.fd < 0) {
+            AP_LOGE("cannot connect to the legacy data port %u", (unsigned)data_port);
+            return ESP_FAIL;
+        }
+        ap_legacy_ctr_start(&session->legacy_ctr, session->legacy_skey, session->legacy_siv);
+        AP_LOGI("legacy data channel connected to port %u", (unsigned)data_port);
+    } else {
     if (discover(session) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -814,7 +983,6 @@ static esp_err_t session_run(ap_session_t *session)
         return ESP_FAIL;
     }
 
-    uint16_t data_port = 0;
     if (setup_video(session, &data_port) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -834,10 +1002,9 @@ static esp_err_t session_run(ap_session_t *session)
         return ESP_FAIL;
     }
     AP_LOGI("video data channel connected to port %u", (unsigned)data_port);
+    }
 
-    if (session->skip_record) {
-        AP_LOGI("receiver asked to skip RECORD; the session is already active");
-    } else {
+    if (session->config->legacy || !session->skip_record) {
         ap_header_t headers[4] = {
             { "Session", session->session_uuid },
             { "Range", "npt=0-" },
@@ -952,8 +1119,9 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
         session->identity = &session->ephemeral_identity;
     }
 
-    AP_LOGI("mirroring to %s:%u as \"%s\" (%s)", config->host, (unsigned)config->port,
-            session->sender_name, session->device_id);
+    AP_LOGI("mirroring to %s:%u as \"%s\" (%s, %s)", config->host, (unsigned)config->port,
+            session->sender_name, session->device_id,
+            config->legacy ? "legacy AirTunes" : "HAP");
     AP_LOGI("session %s, audio stream %llu, video stream %llu", session->session_uuid,
             (unsigned long long)session->audio_stream_id,
             (unsigned long long)session->video_stream_id);

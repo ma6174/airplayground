@@ -64,6 +64,12 @@
 #define APP_PIN_FETCH_HOST APP_AIRPLAY_TARGET_HOST
 #endif
 
+/* Talk the legacy AirTunes protocol instead of HAP: for third-party receivers
+ * that advertise AppleTV3,2 / AirTunes 220.x (many projectors). */
+#ifndef APP_AIRPLAY_LEGACY
+#define APP_AIRPLAY_LEGACY 0
+#endif
+
 /* Fallback access point, used when APP_WIFI_SSID is empty. */
 #ifndef APP_FALLBACK_AP_SSID
 #define APP_FALLBACK_AP_SSID "airplay-esp32"

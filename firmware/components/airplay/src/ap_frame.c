@@ -63,6 +63,26 @@ void ap_frame_build_heartbeat(uint8_t header[AP_FRAME_HEADER_LEN])
     header[6] = 0x1e;
 }
 
+void ap_frame_build_legacy(uint8_t header[AP_FRAME_HEADER_LEN], size_t payload_len,
+                           uint8_t record_type, uint64_t timestamp, uint16_t width,
+                           uint16_t height)
+{
+    memset(header, 0, AP_FRAME_HEADER_LEN);
+    put_u32_le(header, (uint32_t)payload_len);
+    header[4] = record_type; /* 0x00 video, 0x01 codec config */
+    if (record_type == 0x00) {
+        /* Boot-relative NTP 32.32, little-endian, no epoch (RPiPlay
+         * lib/raop_rtp_mirror.c:294-300). The IDR hint byte is masked off by
+         * the receiver but iOS sets it, so keep it. */
+        put_u64_le(header + 8, timestamp);
+    } else {
+        put_float_le(header + 16, (float)width);
+        put_float_le(header + 20, (float)height);
+        put_float_le(header + 56, (float)width);
+        put_float_le(header + 60, (float)height);
+    }
+}
+
 bool ap_avcc_has_idr(const uint8_t *avcc, size_t len)
 {
     size_t offset = 0;
