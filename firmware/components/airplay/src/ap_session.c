@@ -106,6 +106,11 @@ static esp_err_t discover(ap_session_t *session)
 
     /* An encrypted session names itself as a PTP peer; receivers that do not
      * advertise the capability (feature bit 41) keep the NTP path. */
+    session->prefers_legacy_pairing =
+        session->has_features && (session->features & (1ULL << 27)) != 0;
+    if (session->prefers_legacy_pairing) {
+        AP_LOGI("receiver prefers the legacy pairing type (no screen-capture ACL)");
+    }
     session->use_ptp = !session->force_ntp && info.has_features && (info.features & (1ULL << 41)) != 0;
     session->timing_protocol = session->use_ptp ? "PTP" : "NTP";
     AP_LOGI("timing protocol: %s", session->timing_protocol);
@@ -150,7 +155,8 @@ static void note_backoff(ap_session_t *session, const uint8_t *body, size_t len)
 
 static esp_err_t pair_setup(ap_session_t *session, const char *pin)
 {
-    hap_setup_t *setup = hap_setup_new(session->identity, pin);
+    bool include_acl = session->hkp[0] == '5';
+    hap_setup_t *setup = hap_setup_new(session->identity, pin, include_acl);
     if (setup == NULL) {
         AP_LOGE("pair-setup: no session state");
         return ESP_FAIL;
@@ -330,7 +336,9 @@ static esp_err_t show_pin_on_receiver(ap_session_t *session)
  * has to come before asking the user for the digits. */
 static const char *request_code(ap_session_t *session)
 {
-    session->hkp = "5";
+    if (!session->prefers_legacy_pairing) {
+        session->hkp = "5";
+    }
     if (show_pin_on_receiver(session) != ESP_OK) {
         return NULL;
     }
@@ -345,8 +353,9 @@ static esp_err_t pair_and_verify(ap_session_t *session)
 
     if (session->config->pin != NULL && session->config->pin[0] != '\0') {
         pin = session->config->pin;
-        session->hkp = "5";
+        session->hkp = session->prefers_legacy_pairing ? "3" : "5";
     } else if (want_pin) {
+        session->hkp = session->prefers_legacy_pairing ? "3" : "5";
         pin = request_code(session);
         if (pin == NULL) {
             AP_LOGE("receiver requires a pairing code and none was supplied");

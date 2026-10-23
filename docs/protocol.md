@@ -36,7 +36,7 @@ User-Agent: AirPlay/935.7.1          every request
 CSeq: <n>                            per connection, starts at 1
 Content-Type: <type>                 only when the body is non-empty
 Content-Length: <n>                  always
-X-Apple-HKP: 4 | 5                   pair-setup/pair-verify: transient | PIN
+X-Apple-HKP: 4 | 5 | 3               pair-setup/pair-verify: transient | PIN+ACL | PIN
 X-Apple-Client-ID: <uuid>            pair-setup/pair-verify
 X-Apple-Client-Name: <name>          pair-setup/pair-verify
 X-Apple-PD: 1                        pair-verify
@@ -77,6 +77,20 @@ The stream key handed to the receiver as `shk` is
 `SHA-512(raw_key || pair-verify shared secret)[:16]`; `shiv` is 16 fresh random
 bytes. In an encrypted (HAP) session the legacy `ekey`/`eiv`/`et` session fields
 are not sent — the stream descriptor's `shk`/`shiv` are the key reference.
+
+## Pairing types
+
+The `X-Apple-HKP` header selects the pairing type, and the choice is not
+cosmetic:
+
+| value | used for | M5 content |
+|---|---|---|
+| 4 | transient (no code) | identity only |
+| 5 | code pairing, Apple TV | identity + `com.apple.ScreenCapture` ACL |
+| 3 | code pairing when the receiver advertises feature 27 (legacy pairing) | identity only |
+
+An Apple TV accepts 5; the macOS AirPlay receiver advertises feature 27 and
+answers 5 with HTTP 470 at M5, so it needs 3 and no ACL claim.
 
 ## SETUP
 

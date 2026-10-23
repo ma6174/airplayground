@@ -28,7 +28,10 @@ typedef struct ap_session {
 
     hap_identity_t ephemeral_identity;
     hap_identity_t *identity;
-    const char *hkp; /* "4" transient, "5" PIN */
+    const char *hkp; /* "4" transient, "5" PIN with ACL, "3" PIN without */
+    /* Feature 27: the receiver wants the legacy pairing type, which carries no
+     * screen-capture ACL claim. */
+    bool prefers_legacy_pairing;
     char pin[5];
     bool pin_required;
 

@@ -39,7 +39,9 @@ void hap_identity_sign(const hap_identity_t *identity, const uint8_t *message, s
  * pin == NULL or "" selects transient (no-PIN) pairing. */
 typedef struct hap_setup hap_setup_t;
 
-hap_setup_t *hap_setup_new(hap_identity_t *identity, const char *pin);
+/* include_acl claims com.apple.ScreenCapture rights in M5. Receivers that
+ * prefer legacy pairing reject that claim, so the caller decides. */
+hap_setup_t *hap_setup_new(hap_identity_t *identity, const char *pin, bool include_acl);
 void hap_setup_free(hap_setup_t *setup);
 int hap_setup_begin(hap_setup_t *setup, uint8_t *out, size_t out_cap, size_t *out_len);
 int hap_setup_m2(hap_setup_t *setup, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap,
