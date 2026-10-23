@@ -59,6 +59,7 @@ typedef struct ap_session {
      * NTP stamps our own boot clock and answers the receiver's probes. */
     bool use_ptp;
     bool force_ntp;
+    uint32_t backoff_ms;
     const char *timing_protocol;
     char timing_peer_id[37];
     ap_clock_t clock;

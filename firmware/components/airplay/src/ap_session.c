@@ -24,6 +24,11 @@ static const char *TAG = "airplay";
  * they do not fit on an ESP-IDF task stack. */
 static ap_session_t s_session;
 
+/* Set once a receiver has rejected transient pairing: the next session goes
+ * straight to the on-screen-code flow instead of spending an attempt that the
+ * receiver counts as a failure. */
+static bool s_receiver_wants_pin;
+
 static uint64_t random_u64(void)
 {
     uint64_t value = 0;
@@ -107,6 +112,42 @@ static esp_err_t discover(ap_session_t *session)
     return ESP_OK;
 }
 
+/* HomeKit throttles failing pairings. The reply is TLV8: 0x07 carries the error
+ * code and 0x08 the wait in little-endian seconds. Receivers pair the delay
+ * with an authentication failure as well as with the dedicated backoff code, and
+ * retrying early only extends it, so any delay counts. */
+static uint32_t pairing_backoff_ms(const uint8_t *tlv, size_t len)
+{
+    uint32_t seconds = 0;
+    bool delayed = false;
+
+    for (size_t index = 0; index + 1 < len;) {
+        uint8_t tag = tlv[index];
+        size_t length = tlv[index + 1];
+        if (index + 2 + length > len) {
+            break;
+        }
+        if (tag == 0x08) {
+            delayed = true;
+            seconds = 0;
+            for (size_t byte = 0; byte < length && byte < 4; byte++) {
+                seconds |= (uint32_t)tlv[index + 2 + byte] << (8 * byte);
+            }
+        }
+        index += 2 + length;
+    }
+    return delayed ? seconds * 1000u : 0;
+}
+
+static void note_backoff(ap_session_t *session, const uint8_t *body, size_t len)
+{
+    uint32_t delay = pairing_backoff_ms(body, len);
+    if (delay > session->backoff_ms) {
+        session->backoff_ms = delay;
+        AP_LOGW("receiver asked for a %u s pairing backoff", (unsigned)(delay / 1000u));
+    }
+}
+
 static esp_err_t pair_setup(ap_session_t *session, const char *pin)
 {
     hap_setup_t *setup = hap_setup_new(session->identity, pin);
@@ -151,6 +192,10 @@ static esp_err_t pair_setup(ap_session_t *session, const char *pin)
         if (rc != 0) {
             AP_LOGE("pair-setup: M%d rejected", 2 * step + 2);
             ap_log_hex("pair-setup reply", body, body_len);
+            note_backoff(session, body, body_len);
+            if (session->backoff_ms != 0) {
+                result = ESP_ERR_NOT_FINISHED;
+            }
             goto done;
         }
         AP_LOGI("pair-setup: M%d ok", 2 * step + 2);
@@ -278,21 +323,35 @@ static esp_err_t show_pin_on_receiver(ap_session_t *session)
     return ESP_FAIL;
 }
 
+/* The receiver only displays a code once /pair-pin-start arrives, so that call
+ * has to come before asking the user for the digits. */
+static const char *request_code(ap_session_t *session)
+{
+    session->hkp = "5";
+    if (show_pin_on_receiver(session) != ESP_OK) {
+        return NULL;
+    }
+    return ask_for_pin(session);
+}
+
 static esp_err_t pair_and_verify(ap_session_t *session)
 {
     const char *pin = NULL;
 
+    bool want_pin = session->pin_required || session->config->force_pin || s_receiver_wants_pin;
+
     if (session->config->pin != NULL && session->config->pin[0] != '\0') {
         pin = session->config->pin;
-    } else if (session->pin_required) {
-        pin = ask_for_pin(session);
+        session->hkp = "5";
+    } else if (want_pin) {
+        pin = request_code(session);
         if (pin == NULL) {
             AP_LOGE("receiver requires a pairing code and none was supplied");
             return ESP_FAIL;
         }
+    } else {
+        session->hkp = "4";
     }
-
-    session->hkp = pin != NULL ? "5" : "4";
 
     /* A persisted identity may already be paired, in which case the receiver
      * accepts pair-verify straight away and the user sees no PIN prompt. */
@@ -304,24 +363,26 @@ static esp_err_t pair_and_verify(ap_session_t *session)
         AP_LOGW("pair-verify alone was rejected; running pair-setup");
     }
 
-    if (pin != NULL && show_pin_on_receiver(session) != ESP_OK) {
-        return ESP_FAIL;
+    esp_err_t setup_result = pair_setup(session, pin);
+    if (setup_result == ESP_ERR_NOT_FINISHED) {
+        return setup_result;
     }
-
-    if (pair_setup(session, pin) != ESP_OK) {
+    if (setup_result != ESP_OK) {
         if (pin != NULL) {
             return ESP_FAIL;
         }
-        /* Some receivers advertise transient pairing and then reject the empty
-         * PIN anyway. Fall back to asking for the code instead of giving up. */
-        AP_LOGW("transient pair-setup was rejected; the receiver may want a code");
-        pin = ask_for_pin(session);
+        /* Transient pairing is the fast path; when the receiver rejects it, it
+         * wants a code instead. Remember that for the next session, because the
+         * rejected attempt has just started a pairing backoff. */
+        AP_LOGW("transient pair-setup was rejected; the receiver wants a pairing code");
+        s_receiver_wants_pin = true;
+        pin = request_code(session);
         if (pin == NULL) {
             return ESP_FAIL;
         }
-        session->hkp = "5";
-        if (show_pin_on_receiver(session) != ESP_OK || pair_setup(session, pin) != ESP_OK) {
-            return ESP_FAIL;
+        setup_result = pair_setup(session, pin);
+        if (setup_result != ESP_OK) {
+            return setup_result;
         }
     }
     return pair_verify(session);
@@ -709,8 +770,10 @@ static esp_err_t session_run(ap_session_t *session)
     if (discover(session) != ESP_OK) {
         return ESP_FAIL;
     }
-    if (pair_and_verify(session) != ESP_OK) {
-        return ESP_FAIL;
+    esp_err_t pairing = pair_and_verify(session);
+    if (pairing != ESP_OK) {
+        /* A pairing backoff has to reach the caller, which then waits it out. */
+        return pairing;
     }
     if (fairplay_setup(session) != ESP_OK) {
         return ESP_FAIL;
@@ -807,6 +870,11 @@ static void session_teardown(ap_session_t *session)
     }
 }
 
+uint32_t airplay_backoff_ms(void)
+{
+    return s_session.backoff_ms;
+}
+
 esp_err_t airplay_mirror(const airplay_config_t *config)
 {
     if (config == NULL || config->host == NULL || config->frames == NULL ||
@@ -878,6 +946,9 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
         result = session_run(session);
     }
     session_teardown(session);
+    if (result != ESP_ERR_NOT_FINISHED) {
+        session->backoff_ms = 0;
+    }
 
     if (result != ESP_OK) {
         AP_LOGE("mirroring session ended with an error");

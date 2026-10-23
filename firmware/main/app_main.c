@@ -1,6 +1,8 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "airplay.h"
@@ -17,6 +19,8 @@
 #include "freertos/task.h"
 #include "media_frames.h"
 #include "nvs_flash.h"
+#include "pin_fetch.h"
+#include "pin_server.h"
 #include "wifi_net.h"
 
 static const char *TAG = "app";
@@ -39,9 +43,54 @@ static void log_banner(void)
              MAC2STR(mac), esp_get_free_heap_size());
 }
 
-/* Reads the code the receiver is showing. The UART console has no select()
- * support, so the fd is switched to non-blocking and polled instead of being
- * waited on: a spin here would starve the idle task and trip the watchdog. */
+/* Bench hook: some networks cannot reach the device, so a task polls the host
+ * for the code and publishes it like a web-page submission. Running it in its
+ * own task keeps a stuck socket away from the pairing flow. */
+static void pin_fetch_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        char code[5];
+        if (pin_fetch_from_host(APP_PIN_FETCH_HOST, APP_PIN_FETCH_PORT, code)) {
+            pin_server_submit(code);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+/* Reads digits from the console in its own task: a console read can block, and
+ * the pairing flow must never wait on it. */
+static void console_pin_task(void *argument)
+{
+    (void)argument;
+    char code[5];
+    int typed = 0;
+
+    int previous_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (previous_flags >= 0) {
+        fcntl(STDIN_FILENO, F_SETFL, previous_flags | O_NONBLOCK);
+    }
+    for (;;) {
+        char key;
+        if (read(STDIN_FILENO, &key, 1) == 1) {
+            if (key >= '0' && key <= '9') {
+                code[typed++] = key;
+                if (typed == 4) {
+                    code[4] = '\0';
+                    pin_server_submit(code);
+                    typed = 0;
+                }
+            } else {
+                typed = 0;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/* Waits for the code the receiver is showing. It arrives either from the small
+ * HTTP page (the USB console cannot accept input) or from the console, and the
+ * wait is a poll so the idle task keeps running. */
 static bool prompt_pin(char pin[5], void *user_data)
 {
     (void)user_data;
@@ -50,42 +99,21 @@ static bool prompt_pin(char pin[5], void *user_data)
         return true;
     }
 
-    printf("\n*** The receiver demands a pairing code.\n"
-           "*** Enter the 4 digits shown on its screen: ");
-    fflush(stdout);
+    /* Anything already queued belongs to a previous request and is expired. */
+    pin_server_flush();
+    ESP_LOGW(TAG, "waiting for the pairing code (%s:%d/pin, web page, or console)",
+             APP_PIN_FETCH_HOST, APP_PIN_FETCH_PORT);
 
-    int previous_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    if (previous_flags >= 0) {
-        fcntl(STDIN_FILENO, F_SETFL, previous_flags | O_NONBLOCK);
-    }
-
-    int typed = 0;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
-    while (typed < 4 && xTaskGetTickCount() < deadline) {
-        int key = fgetc(stdin);
-        if (key == EOF) {
-            clearerr(stdin);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(180000);
+    while (xTaskGetTickCount() < deadline) {
+        if (pin_server_wait(pin, 5000)) {
+            ESP_LOGI(TAG, "pairing code accepted");
+            return true;
         }
-        if (key < '0' || key > '9') {
-            continue;
-        }
-        pin[typed++] = (char)key;
-        fputc(key, stdout);
-        fflush(stdout);
     }
-    pin[typed] = '\0';
-    printf("\n");
 
-    if (previous_flags >= 0) {
-        fcntl(STDIN_FILENO, F_SETFL, previous_flags);
-    }
-    if (typed != 4) {
-        ESP_LOGE(TAG, "no code entered; set APP_PAIRING_PIN in app_config_local.h to skip the prompt");
-        return false;
-    }
-    return true;
+    ESP_LOGE(TAG, "no code was entered; set APP_PAIRING_PIN in app_config_local.h to skip the prompt");
+    return false;
 }
 
 void app_main(void)
@@ -127,6 +155,17 @@ void app_main(void)
 
     char local_ip[16];
     wifi_net_ip(local_ip, sizeof(local_ip));
+    if (pin_server_start() != ESP_OK) {
+        ESP_LOGW(TAG, "pairing web page unavailable; PIN can still arrive over the bench hook");
+    }
+    if (xTaskCreate(console_pin_task, "pin_console", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "cannot start the console reader");
+    }
+    if (APP_PIN_FETCH_PORT != 0) {
+        if (xTaskCreate(pin_fetch_task, "pin_fetch", 6144, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGW(TAG, "cannot start the pairing-code fetch task");
+        }
+    }
     ESP_LOGI(TAG, "local address %s, receiver %s:%d", local_ip, APP_AIRPLAY_TARGET_HOST,
              APP_AIRPLAY_TARGET_PORT);
 
@@ -136,6 +175,7 @@ void app_main(void)
         .device_name = APP_DEVICE_NAME,
         .local_address = local_ip,
         .pin = APP_PAIRING_PIN,
+        .force_pin = APP_FORCE_PIN_PAIRING != 0,
         .request_pin = prompt_pin,
         .frames = media_still_frames(),
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
@@ -144,7 +184,10 @@ void app_main(void)
 
     for (;;) {
         err = airplay_mirror(&config);
-        ESP_LOGW(TAG, "session finished (%s); retrying in 10 s", esp_err_to_name(err));
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        uint32_t backoff = airplay_backoff_ms();
+        uint32_t wait_ms = backoff > 10000 ? backoff + 2000 : 10000;
+        ESP_LOGW(TAG, "session finished (%s); retrying in %u s", esp_err_to_name(err),
+                 (unsigned)(wait_ms / 1000));
+        vTaskDelay(pdMS_TO_TICKS(wait_ms));
     }
 }
