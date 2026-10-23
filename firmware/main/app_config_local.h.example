@@ -16,3 +16,9 @@
 // #define APP_FRAME_INTERVAL_MS 10000
 // #define APP_FALLBACK_AP_SSID "airplay-esp32"
 // #define APP_FALLBACK_AP_PASSWORD "airplay1234"
+//
+// Pairing (see docs/runbook.md):
+// #define APP_FORCE_PIN_PAIRING 1        /* needed for macOS receivers */
+// #define APP_PAIRING_PIN "1234"         /* fixed code instead of the screen code */
+// #define APP_PIN_FETCH_HOST "192.168.1.2" /* device polls http://<host>:<port>/pin */
+// #define APP_PIN_FETCH_PORT 7001
