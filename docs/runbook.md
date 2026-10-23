@@ -59,7 +59,7 @@ Wi-Fi、目标接收端等凭据放在 `firmware/main/app_config_local.h`
 | 宏 | 说明 |
 |---|---|
 | `APP_WIFI_SSID` / `APP_WIFI_PASSWORD` | Wi-Fi；留空则 fallback 到设备热点（见 README） |
-| `APP_AIRPLAY_TARGET_HOST` / `APP_AIRPLAY_TARGET_PORT` | 目标接收端地址（macOS 7000，参考接收端可自定义） |
+| `APP_AIRPLAY_TARGET_HOST` / `APP_AIRPLAY_TARGET_PORT` | 默认接收端地址（macOS 7000，参考接收端可自定义）；运行时可用 `/start?name=` 或 `?host=` 临时换 |
 | `APP_FORCE_PIN_PAIRING` | **macOS 接收器必须置 1**，见下文 |
 | `APP_PAIRING_PIN` | 编译期写死配对码（一般不用） |
 | `APP_PIN_FETCH_HOST` / `APP_PIN_FETCH_PORT` | 设备主动来拉的 HTTP 服务（投递配对码用） |
@@ -108,11 +108,24 @@ Wi-Fi、目标接收端等凭据放在 `firmware/main/app_config_local.h`
 
 | 接口 | 作用 |
 |---|---|
-| `GET /start` | 开始一次投屏会话；正在投则回 `already mirroring` |
+| `GET /targets` | 列出已知接收端（`_airplay._tcp` + `_raop._tcp`，即时返回；后台每 30 s 刷新；AirTunes 老设备带 `[legacy]` 标记） |
+| `GET /start` | 开始一次投屏会话；正在投则回 `already mirroring`。可选 query 参数：`?name=` 按名字选接收端（大小写不敏感精确匹配，其次唯一子串匹配，含空格用 `%20`），`?host=`/`?port=` 按地址选；都不带则用编译配置的默认接收端 |
+| `GET /forget?name=` | 忘掉指定名字的接收端（含 NVS 里的持久记录） |
 | `GET /stop` | 礼貌结束会话（TEARDOWN）；空闲时回 `not mirroring` |
 | `GET /status` | `mirroring` 或最近一次会话的结束原因 |
 | `GET /` | 配对码输入页 |
 | `POST /pin` | 提交互配对码（`code=1234`） |
+
+名字没匹配到时，响应里会带上网内实际发现的接收端名单，方便直接复制重试。
+
+### 只广播型老设备（极米这类）
+
+实测极米：**不理任何查询**（组播/单播 QM/QU 都不应答），但每 ~4 秒向全网持续广播全套记录（`_airplay._tcp` + `_raop._tcp`，含 PTR/SRV/TXT/A/NSEC）。当前实测：**它的广播包到不了 ESP32**（Mac 能听到；把原始包从 Mac 重放后 ESP32 完整解析入库）——纯 AP/路由器组播转发问题（疑 IGMP snooping/双频隔离），不是固件问题：
+
+- 路由器侧修复：关「IGMP Snooping/组播过滤」或开「组播转单播（IGMP Enhancement）」，或把 ESP32 与投影仪放同一频段/AP；
+- 固件侧兜底：`/start?host=&port=` 手动指定；接收到广播后 legacy 条目永久保存（NVS 断电不丢），名字变了或设备报废用 `/forget` 清掉；地址变了自动跟随（条目按名字为键）；
+- `[legacy]` 标记来自 TXT（`model=AppleTV3,2` 或 `srcvers=220.x`），legacy 会话路径据此路由；
+- Wi-Fi 省电已关（`WIFI_PS_NONE`）：省电模式会丢组播，这是另一类常见原因。
 
 配对等待、SETUP 阶段、送帧循环里都会响应 `/stop`，停止时向接收端发 TEARDOWN。
 

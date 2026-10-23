@@ -8,6 +8,7 @@
 #include "airplay.h"
 #include "app_config.h"
 #include "app_identity.h"
+#include "discovery.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -36,6 +37,12 @@ static airplay_config_t s_config;
  * not live on app_main's stack. */
 static hap_identity_t s_identity;
 static char s_local_ip[16];
+/* The target lives in a writable buffer so /start can aim the session at a
+ * discovered receiver; it is only written while no session is running. */
+static char s_target_host[48];
+/* Replies assembled for /start, including the list of names seen when a
+ * requested receiver is not found. */
+static char s_reply[512];
 
 static void session_task(void *argument)
 {
@@ -61,14 +68,82 @@ static void session_task(void *argument)
     }
 }
 
-static const char *hook_start(void)
+static const char *hook_start(const char *name, const char *host, int port)
 {
     if (airplay_is_running()) {
         return "already mirroring\n";
     }
+
+    if (name != NULL && name[0] != '\0') {
+        airplay_target_t target;
+        if (!discovery_find(name, &target)) {
+            airplay_target_t found[DISCOVERY_MAX_TARGETS];
+            int count = discovery_snapshot(found, DISCOVERY_MAX_TARGETS);
+            size_t used = (size_t)snprintf(s_reply, sizeof(s_reply),
+                                           "no receiver matches \"%s\"", name);
+            if (count > 0) {
+                for (int i = 0; i < count; i++) {
+                    int written = snprintf(s_reply + used, sizeof(s_reply) - used, "%s%s",
+                                           i == 0 ? "; saw " : ", ", found[i].name);
+                    if (written <= 0 || (size_t)written >= sizeof(s_reply) - used) {
+                        break;
+                    }
+                    used += (size_t)written;
+                }
+                snprintf(s_reply + used, sizeof(s_reply) - used, "\n");
+            } else {
+                snprintf(s_reply + used, sizeof(s_reply) - used,
+                         "; GET /targets lists the receivers on the LAN\n");
+            }
+            return s_reply;
+        }
+        strlcpy(s_target_host, target.host, sizeof(s_target_host));
+        s_config.port = target.port;
+        ESP_LOGI(TAG, "\"%s\" resolved to %s:%u", name, s_target_host,
+                 (unsigned)s_config.port);
+    } else if (host != NULL && host[0] != '\0') {
+        strlcpy(s_target_host, host, sizeof(s_target_host));
+        if (port > 0) {
+            s_config.port = (uint16_t)port;
+        }
+    }
+
     s_session_stop = false;
     xTaskNotifyGive(s_session_task);
     return "starting\n";
+}
+
+static const char *hook_targets(char *buf, size_t len)
+{
+    airplay_target_t targets[DISCOVERY_MAX_TARGETS];
+    int count = discovery_snapshot(targets, DISCOVERY_MAX_TARGETS);
+    if (count == 0) {
+        snprintf(buf, len, "no AirPlay receiver on the LAN\n");
+        return buf;
+    }
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        int written = snprintf(buf + used, len - used, "%s - %s:%u%s\n", targets[i].name,
+                               targets[i].host, (unsigned)targets[i].port,
+                               targets[i].legacy ? " [legacy]" : "");
+        if (written <= 0 || (size_t)written >= len - used) {
+            break;
+        }
+        used += (size_t)written;
+    }
+    return buf;
+}
+
+static const char *hook_forget(const char *name)
+{
+    static char reply[96];
+    if (discovery_forget(name)) {
+        ESP_LOGI(TAG, "receiver \"%s\" forgotten", name);
+        snprintf(reply, sizeof(reply), "forgotten %s\n", name);
+    } else {
+        snprintf(reply, sizeof(reply), "no receiver named %s\n", name);
+    }
+    return reply;
 }
 
 static const char *hook_stop(void)
@@ -220,6 +295,10 @@ void app_main(void)
 
     char *local_ip = s_local_ip;
     wifi_net_ip(local_ip, sizeof(s_local_ip));
+    ESP_LOGI(TAG, "local address %s", local_ip);
+    if (discovery_start() != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS discovery unavailable; /targets will not work");
+    }
     if (pin_server_start() != ESP_OK) {
         ESP_LOGW(TAG, "pairing web page unavailable; PIN can still arrive over the bench hook");
     }
@@ -231,11 +310,9 @@ void app_main(void)
             ESP_LOGW(TAG, "cannot start the pairing-code fetch task");
         }
     }
-    ESP_LOGI(TAG, "local address %s, receiver %s:%d", local_ip, APP_AIRPLAY_TARGET_HOST,
-             APP_AIRPLAY_TARGET_PORT);
-
+    strlcpy(s_target_host, APP_AIRPLAY_TARGET_HOST, sizeof(s_target_host));
     airplay_config_t config = {
-        .host = APP_AIRPLAY_TARGET_HOST,
+        .host = s_target_host,
         .port = APP_AIRPLAY_TARGET_PORT,
         .device_name = APP_DEVICE_NAME,
         .local_address = local_ip,
@@ -247,17 +324,21 @@ void app_main(void)
         .identity = identity,
     };
     s_config = config;
+    ESP_LOGI(TAG, "default receiver %s:%d, GET /targets lists what else is on the LAN",
+             s_target_host, APP_AIRPLAY_TARGET_PORT);
 
     static const pin_server_session_hooks_t hooks = {
         .start = hook_start,
         .stop = hook_stop,
         .status = hook_status,
+        .targets = hook_targets,
+        .forget = hook_forget,
     };
     pin_server_set_session_hooks(&hooks);
     if (xTaskCreate(session_task, "session", 8192, NULL, 4, &s_session_task) != pdPASS) {
         ESP_LOGE(TAG, "cannot start the session task; mirroring is unavailable");
         return;
     }
-    ESP_LOGI(TAG, "idle; POST/GET http://%s:%d/start to begin mirroring", local_ip,
-             PIN_SERVER_PORT);
+    ESP_LOGI(TAG, "idle; POST/GET http://%s:%d/start to begin mirroring (optionally with "
+             "?name=<receiver>)", local_ip, PIN_SERVER_PORT);
 }
