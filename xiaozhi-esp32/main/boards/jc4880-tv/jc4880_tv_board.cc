@@ -73,7 +73,8 @@ private:
             "  `legacy`: true for old AirTunes-only receivers (e.g. some projectors); a discovered "
             "  receiver already carries this flag\n"
             "Return:\n"
-            "  Whether the session was started. Use `self.airplay.status` afterwards.",
+            "  \"mirroring\" when the screen is on the receiver, or \"pin required\" with what to do "
+            "next (ask the user for the 4-digit code the receiver shows).",
             PropertyList({
                 Property("host", kPropertyTypeString, std::string("")),
                 Property("legacy", kPropertyTypeBoolean, false),
@@ -81,10 +82,24 @@ private:
             [&airplay](const PropertyList& properties) -> ReturnValue {
                 auto host = properties["host"].value<std::string>();
                 auto legacy = properties["legacy"].value<bool>();
-                if (airplay.Start(host, legacy)) {
-                    return std::string("started");
+                if (!airplay.Start(host, legacy)) {
+                    return std::string("not started: a session is already running, or no receiver by that "
+                                       "name (self.airplay.discover lists them)");
                 }
-                return std::string("already running, or no receiver address configured");
+                /* Wait for the outcome: the user has to be told right away when the
+                 * receiver is showing a code, otherwise nobody reads it off. */
+                switch (airplay.WaitForStart(8000)) {
+                    case AirplayService::StartState::kEstablished:
+                        return std::string("mirroring");
+                    case AirplayService::StartState::kPinRequired:
+                        return std::string("pin required: the receiver is showing a 4-digit code. Ask the "
+                                           "user for it, then call self.airplay.enter_pin with those digits.");
+                    case AirplayService::StartState::kFailed:
+                        return std::string("session failed: ") + airplay.StatusJson();
+                    case AirplayService::StartState::kTimeout:
+                    default:
+                        return std::string("still connecting: ") + airplay.StatusJson();
+                }
             });
 
         mcp_server.AddTool(
@@ -103,13 +118,19 @@ private:
 
         mcp_server.AddTool(
             "self.airplay.enter_pin",
-            "Enter the 4-digit code the TV displays while pairing with this device.",
+            "Enter the 4-digit code a receiver shows while pairing (self.airplay.start reports when one "
+            "is needed). Digits may be spoken in Chinese: \"一二三四\" works as well as \"1234\".\n"
+            "Args:\n"
+            "  `code`: what the user said, the digits are extracted from it\n"
+            "Return:\n"
+            "  Whether four digits were understood.",
             PropertyList({
                 Property("code", kPropertyTypeString),
             }),
             [&airplay](const PropertyList& properties) -> ReturnValue {
                 auto code = properties["code"].value<std::string>();
-                return airplay.EnterPin(code) ? std::string("ok") : std::string("invalid code");
+                return airplay.EnterPin(code) ? std::string("ok")
+                                              : std::string("that does not contain four digits");
             });
 
         mcp_server.AddTool(

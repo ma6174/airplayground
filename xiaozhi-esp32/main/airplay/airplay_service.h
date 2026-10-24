@@ -36,8 +36,17 @@ public:
     /* Puts text on the whole screen; an empty string restores the chat UI. */
     bool ShowText(const std::string& text);
 
-    /* Feeds the 4-digit code a receiver asks for while pairing. */
-    bool EnterPin(const std::string& pin);
+    /* Feeds the 4-digit code a receiver asks for while pairing. Accepts what
+     * speech recognition produces: "1234", "一二三四", or a sentence with the
+     * digits in it. */
+    bool EnterPin(const std::string& spoken);
+
+    /* How a session is doing right after it was started. The assistant needs an
+     * immediate answer, otherwise it cannot tell the user to read the code off
+     * the receiver. */
+    enum class StartState { kEstablished, kPinRequired, kFailed, kTimeout };
+    StartState WaitForStart(int timeout_ms);
+    bool pin_required() const { return pin_pending_.load(); }
 
     std::string StatusJson() const;
     bool running() const { return running_.load(); }
@@ -71,6 +80,8 @@ private:
     /* A session that ended because no pairing code arrived is not going to be
      * fixed by retrying: the code has to come from a person. */
     std::atomic<bool> pin_timeout_{false};
+    /* True while the session is blocked waiting for the user to read a code. */
+    std::atomic<bool> pin_pending_{false};
     std::string host_;
     uint16_t port_ = 7000;
     bool legacy_ = false;

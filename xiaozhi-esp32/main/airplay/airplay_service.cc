@@ -488,6 +488,7 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     Remember(target + ":" + std::to_string(port), legacy);
     stop_requested_ = false;
     pin_timeout_ = false;
+    pin_pending_ = false;
     last_result_ = "starting";
 
     BaseType_t created = xTaskCreate(SessionTask, "airplay", 16 * 1024, this, 3, &task_);
@@ -511,19 +512,56 @@ void AirplayService::Stop() {
     airplay_request_stop();
 }
 
-bool AirplayService::EnterPin(const std::string& pin) {
-    if (pin.size() != 4) {
+/* Speech recognition hands over whatever was said: "1234", "一 二 三 四", or a
+ * whole sentence with the digits in it. Keep the digits, ASCII or Chinese. */
+bool AirplayService::EnterPin(const std::string& spoken) {
+    static const struct {
+        const char* word;
+        char digit;
+    } kDigits[] = {
+        {"零", '0'}, {"〇", '0'}, {"洞", '0'}, {"一", '1'}, {"幺", '1'}, {"二", '2'},
+        {"两", '2'}, {"三", '3'}, {"四", '4'}, {"五", '5'}, {"六", '6'}, {"七", '7'},
+        {"八", '8'}, {"九", '9'},
+    };
+
+    std::string digits;
+    for (size_t i = 0; i < spoken.size() && digits.size() < 4;) {
+        const char c = spoken[i];
+        if (c >= '0' && c <= '9') {
+            digits += c;
+            i++;
+            continue;
+        }
+        bool matched = false;
+        for (const auto& entry : kDigits) {
+            const size_t len = strlen(entry.word);
+            if (spoken.compare(i, len, entry.word) == 0) {
+                digits += entry.digit;
+                i += len;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            i++;
+        }
+    }
+    if (digits.size() != 4) {
+        ESP_LOGW(TAG, "\"%s\" does not contain four digits", spoken.c_str());
         return false;
     }
+
     if (pin_semaphore_ == nullptr) {
         pin_semaphore_ = xSemaphoreCreateBinary();
         if (pin_semaphore_ == nullptr) {
             return false;
         }
     }
-    memcpy(pending_pin_, pin.c_str(), 4);
+    memcpy(pending_pin_, digits.c_str(), 4);
     pending_pin_[4] = '\0';
+    pin_pending_ = false;
     xSemaphoreGive(pin_semaphore_);
+    ESP_LOGI(TAG, "pairing code accepted");
     return true;
 }
 
@@ -534,14 +572,50 @@ bool AirplayService::WaitForPin(char pin[5]) {
             return false;
         }
     }
-    ESP_LOGW(TAG, "receiver asks for a pairing code; call self.airplay.enter_pin");
-    if (xSemaphoreTake(pin_semaphore_, pdMS_TO_TICKS(120000)) != pdTRUE) {
+    pin_pending_ = true;
+    ESP_LOGW(TAG, "receiver shows a pairing code; ask the user for it");
+    /* Poll instead of one long take: a stop request while the code is pending has
+     * to end the session, otherwise the device sits wedged for two minutes and
+     * refuses every new start. */
+    bool arrived = false;
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(120000);
+    while (xTaskGetTickCount() < deadline) {
+        if (xSemaphoreTake(pin_semaphore_, pdMS_TO_TICKS(200)) == pdTRUE) {
+            arrived = true;
+            break;
+        }
+        if (stop_requested_.load()) {
+            ESP_LOGW(TAG, "stop requested while waiting for the pairing code");
+            break;
+        }
+    }
+    pin_pending_ = false;
+    if (!arrived) {
         ESP_LOGE(TAG, "no pairing code arrived, giving up");
         pin_timeout_ = true;
         return false;
     }
     memcpy(pin, pending_pin_, 5);
     return true;
+}
+
+AirplayService::StartState AirplayService::WaitForStart(int timeout_ms) {
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    for (;;) {
+        if (pin_pending_.load()) {
+            return StartState::kPinRequired;
+        }
+        if (airplay_is_running()) {
+            return StartState::kEstablished;
+        }
+        if (!running_.load()) {
+            return StartState::kFailed;
+        }
+        if (xTaskGetTickCount() >= deadline) {
+            return StartState::kTimeout;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 std::string AirplayService::StatusJson() const {
@@ -554,6 +628,7 @@ std::string AirplayService::StatusJson() const {
     cJSON_AddStringToObject(root, "host", host_.c_str());
     cJSON_AddStringToObject(root, "result", last_result_.c_str());
     cJSON_AddBoolToObject(root, "streamed", airplay_last_session_streamed());
+    cJSON_AddBoolToObject(root, "pin_required", pin_pending_.load());
     cJSON_AddNumberToObject(root, "backoff_ms", airplay_backoff_ms());
     if (display_ != nullptr) {
         cJSON_AddNumberToObject(root, "width", display_->width());
