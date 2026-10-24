@@ -1552,6 +1552,17 @@ void airplay_request_stop(void)
     s_stop_requested = true;
 }
 
+void airplay_last_audio_stats(airplay_audio_stats_t *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+    stats->packets = s_session.legacy_audio_packets;
+    stats->gaps = s_session.legacy_audio_gaps;
+    stats->late = s_session.legacy_audio_late_count;
+    stats->late_max_ms = s_session.legacy_audio_late_max;
+}
+
 bool airplay_last_session_streamed(void)
 {
     return s_streamed;

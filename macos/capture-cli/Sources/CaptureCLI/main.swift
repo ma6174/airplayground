@@ -97,7 +97,7 @@ enum CLIError: Error, CustomStringConvertible {
     case usage, invalid(String), message(String)
     var description: String {
         switch self {
-        case .usage: return "用法：\n  capture-cli list\n  capture-cli record (--display INDEX | --window-id ID) (--output PATH | --stdout | --tcp host:port) [选项]\n\n选项：\n  --fps N                 帧率，默认 30\n  --bitrate BPS          平均码率，默认按分辨率估算\n  --width N --height N   输出尺寸（必须为偶数）\n  --duration SECONDS     录制时长\n  --no-cursor            不捕获鼠标指针\n  --audio                 同时采集系统音频（默认关闭，需 macOS 13+）\n  --audio-output PATH     音频单独写成 WAV 文件（裸流/--stdout/--tcp 用；MP4 直接混流）\n\n输出格式：\n  --output *.mp4         MP4 视频文件\n  --output *.h264/*.264  Annex-B H.264 裸流文件（包含 SPS/PPS）\n  --stdout               Annex-B H.264 裸流，二进制数据写 stdout，日志写 stderr\n  --tcp host:port        发给 ESP32 的 AirPlay 发送端（长度前缀的访问单元协议）"
+        case .usage: return "用法：\n  capture-cli list\n  capture-cli record (--display INDEX | --window-id ID) (--output PATH | --stdout | --tcp host:port) [选项]\n\n选项：\n  --fps N                 帧率，默认 30\n  --bitrate BPS          平均码率，默认按分辨率估算\n  --width N --height N   输出尺寸（必须为偶数）\n  --duration SECONDS     录制时长\n  --no-cursor            不捕获鼠标指针\n  --audio                 同时采集系统音频（默认关闭，需 macOS 13+）\n  --audio-output PATH     音频另外写成 WAV 文件（裸流/--stdout 需要；--tcp 时可选；MP4 直接混流）\n\n输出格式：\n  --output *.mp4         MP4 视频文件\n  --output *.h264/*.264  Annex-B H.264 裸流文件（包含 SPS/PPS）\n  --stdout               Annex-B H.264 裸流，二进制数据写 stdout，日志写 stderr\n  --tcp host:port        发给 ESP32 的 AirPlay 发送端（长度前缀的访问单元协议；--audio 时音频走 port+1）"
         case .invalid(let s), .message(let s): return s
         }
     }
@@ -125,6 +125,11 @@ final class NetworkSink {
     static let maxAccessUnit = 512 * 1024
 
     private let fd: Int32
+    /* Audio rides its own connection, on the device's port + 1: a keyframe
+     * sharing the video socket stalls the sound for hundreds of milliseconds,
+     * which is audible. -1 means the device did not take that connection and
+     * the video path carries on alone. */
+    private let audioFD: Int32
     private var configured = false
     private let width: Int
     private let height: Int
@@ -140,26 +145,7 @@ final class NetworkSink {
     private(set) var lastIDR = Date.distantPast
 
     init(host: String, port: UInt16, width: Int, height: Int, fps: Int) throws {
-        var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        hints.ai_socktype = SOCK_STREAM
-        var found: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, String(port), &hints, &found) == 0, let first = found else {
-            throw CLIError.message("无法解析 \(host):\(port)")
-        }
-        defer { freeaddrinfo(found) }
-
-        var sock: Int32 = -1
-        var candidate: UnsafeMutablePointer<addrinfo>? = first
-        while let node = candidate {
-            let fd = socket(node.pointee.ai_family, node.pointee.ai_socktype, node.pointee.ai_protocol)
-            if fd >= 0 && connect(fd, node.pointee.ai_addr, node.pointee.ai_addrlen) == 0 {
-                sock = fd
-                break
-            }
-            if fd >= 0 { close(fd) }
-            candidate = node.pointee.ai_next
-        }
+        let sock = NetworkSink.connectSocket(host: host, port: port)
         guard sock >= 0 else { throw CLIError.message("无法连接 \(host):\(port)") }
         fd = sock
         var on: Int32 = 1
@@ -168,9 +154,53 @@ final class NetworkSink {
         self.height = height
         self.fps = fps
         fputs("streaming to \(host):\(port)\n", stderr)
+
+        /* Audio is optional. A device running an older build, or one whose
+         * audio task is busy, must not take the whole stream down with it. */
+        let audioPort = Int(port) + 1
+        let audio = audioPort <= Int(UInt16.max) ? NetworkSink.connectSocket(host: host, port: UInt16(audioPort)) : -1
+        audioFD = audio
+        if audio >= 0 {
+            setsockopt(audio, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            /* One 1415-byte frame every 8 ms: delaying a frame until the previous
+             * one is acknowledged reaches the device as a gap in the sound. */
+            setsockopt(audio, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
+            fputs("audio connected to \(host):\(audioPort)\n", stderr)
+        } else {
+            fputs("音频连接 \(host):\(audioPort) 失败，本次只发送视频\n", stderr)
+        }
     }
 
-    deinit { close(fd) }
+    deinit {
+        close(fd)
+        if audioFD >= 0 { close(audioFD) }
+    }
+
+    var audioConnected: Bool { audioFD >= 0 }
+
+    /* Resolves and connects, walking the whole address list so an IPv4-only or
+     * IPv6-only answer still works. Returns -1 when nothing answered. */
+    private static func connectSocket(host: String, port: UInt16) -> Int32 {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+        var found: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, String(port), &hints, &found) == 0, let first = found else {
+            return -1
+        }
+        defer { freeaddrinfo(found) }
+
+        var candidate: UnsafeMutablePointer<addrinfo>? = first
+        while let node = candidate {
+            let sock = socket(node.pointee.ai_family, node.pointee.ai_socktype, node.pointee.ai_protocol)
+            if sock >= 0 {
+                if connect(sock, node.pointee.ai_addr, node.pointee.ai_addrlen) == 0 { return sock }
+                close(sock)
+            }
+            candidate = node.pointee.ai_next
+        }
+        return -1
+    }
 
     func send(_ sampleBuffer: CMSampleBuffer, format: CMFormatDescription) -> Bool {
         if !configured {
@@ -178,7 +208,7 @@ final class NetworkSink {
                 report("waiting for parameter sets from the encoder")
                 return true
             }
-            guard writeAll(configurePacket(sps: sets.sps, pps: sets.pps)) else {
+            guard writeVideo(configurePacket(sps: sets.sps, pps: sets.pps)) else {
                 return false
             }
             configured = true
@@ -217,7 +247,7 @@ final class NetworkSink {
         appendBigEndian(&message, UInt32(accessUnit.count))
         appendBigEndian(&message, UInt32(max(0, pts) * 1000))
         message.append(accessUnit)
-        let sent = writeAll(message)
+        let sent = writeVideo(message)
         if sent {
             if idr { lastIDR = Date() }
             framesSent += 1
@@ -278,19 +308,38 @@ final class NetworkSink {
         return (sets[0], sets[1])
     }
 
-    private func writeAll(_ data: Data) -> Bool {
+    /* One ALAC frame per packet; the device reads only frame_len off an audio
+     * header and takes its timing from the samples, so the timestamp is the
+     * audio timeline rather than a wall clock. */
+    func sendAudio(_ frame: [UInt8], ptsMs: Int) -> Bool {
+        guard audioFD >= 0 else { return false }
+        var message = Data([0x41, 0x50, 0x56, 0x4e, 3, 1, 0, 0])
+        appendBigEndian(&message, UInt32(frame.count))
+        appendBigEndian(&message, UInt32(max(0, ptsMs)))
+        message.append(contentsOf: frame)
+        guard writeAll(message, to: audioFD) else { return false }
+        return true
+    }
+
+    private func writeVideo(_ data: Data) -> Bool {
+        guard writeAll(data, to: fd) else {
+            fputs("到 ESP32 的连接已断开\n", stderr)
+            return false
+        }
+        return true
+    }
+
+    private func writeAll(_ data: Data, to socket: Int32) -> Bool {
         var sent = 0
-        let ok = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
             guard let base = raw.baseAddress else { return true }
             while sent < raw.count {
-                let written = Darwin.send(fd, base.advanced(by: sent), raw.count - sent, 0)
+                let written = Darwin.send(socket, base.advanced(by: sent), raw.count - sent, 0)
                 if written <= 0 { return false }
                 sent += written
             }
             return true
         }
-        if !ok { fputs("到 ESP32 的连接已断开\n", stderr) }
-        return ok
     }
 
     private func appendBigEndian(_ data: inout Data, _ value: UInt16) {
@@ -506,21 +555,442 @@ final class WAVWriter {
     }
 }
 
-/* Audio leaves the stream either muxed into the MP4 or, for the outputs that
- * cannot carry it in-band, written to a standalone WAV file. */
+/* Converts the system audio ScreenCaptureKit hands over into ALAC frames and
+ * releases them at the rate the device drains its ring.
+ *
+ * The device declares ALAC with spf=352 / sr=44100 / ss=16 / ch=2 in SETUP and
+ * drops frames that do not match, so the format is fixed here and the captured
+ * PCM is resampled into it.
+ *
+ * Three stages. The capture callback only copies bytes into a queue: resampling
+ * there holds ScreenCaptureKit's audio thread, and a held audio thread does not
+ * deliver slower - it drops buffers, which the receiver hears as gaps. The
+ * converter thread turns the queued buffers into 44100 Hz s16, and the pacing
+ * thread cuts 352-sample ALAC frames out of that, one per 7.98 ms, on an
+ * absolute schedule that runs a lead ahead of the capture clock. */
+final class ALACAudioSender {
+    /* Must match APP_AUDIO_SPF / sr / ss / ch in the device's SETUP reply. */
+    static let sampleRate = 44100
+    static let channels = 2
+    static let samplesPerFrame = 352
+    /* 352 / 44100 s: one frame here, one packet on the wire. */
+    static let frameInterval = Double(samplesPerFrame) / Double(sampleRate)
+
+    private static let frameBytes = samplesPerFrame * channels * 2
+    /* How far ahead of the capture clock the schedule runs. The device's ring
+     * holds 64 frames (511 ms): 200 ms rides out the drift between two clocks
+     * without ever leaving it short of room. */
+    private static let leadSeconds = 0.2
+    /* In whole frames, so what leaves the queue lines up with the ring. */
+    private static let leadFrames = Int((leadSeconds / frameInterval).rounded(.up))
+    private static let leadBytes = leadFrames * frameBytes
+    /* A couple of seconds on both queues: long enough to ride out a stall in one
+     * stage, short enough that neither grows without bound. ScreenCaptureKit
+     * delivers 48 kHz float32 stereo, where 2 MiB is about 2.7 s. */
+    private static let captureLimitBytes = 2 * 1024 * 1024
+    private static let pcmLimitBytes = sampleRate * channels * 2 * 2
+    /* The converter's output side, fixed by the device's SETUP. */
+    private static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                                    sampleRate: Double(sampleRate),
+                                                    channels: AVAudioChannelCount(channels),
+                                                    interleaved: true)!
+
+    /* One capture buffer exactly as it arrived. The capture callback copies the
+     * bytes and stops there; this carries everything the converter thread needs
+     * to rebuild the buffer they came out of. */
+    private struct Chunk {
+        let bytes: Data
+        let frames: Int
+        let format: AudioStreamBasicDescription
+    }
+
+    private let sink: NetworkSink
+    private let condition = NSCondition()
+    private let converterDone = DispatchSemaphore(value: 0)
+    private let pacerDone = DispatchSemaphore(value: 0)
+    private var threads: [Thread] = []
+    /* Raw capture PCM, oldest first, and the converted 44100 Hz s16 stream the
+     * pacer cuts frames out of. Both guarded by `condition`. */
+    private var capture: [Chunk] = []
+    private var capturedBytes = 0
+    private var pcm = Data()
+    private var converter: AVAudioConverter?
+    private var converterFormat: AudioStreamBasicDescription?
+    private var stopped = false
+    private var live = true
+    private var overflowing = false
+    /* What capture delivered, what the converter made of it, and what never made
+     * it out: these are the numbers that place a shortfall on one side or the
+     * other. Guarded by `condition`. */
+    private var buffersTaken = 0
+    private var samplesConverted = 0
+    private var samplesDropped = 0
+    private var framesSent = 0
+    private var framesSentAtLastReport = 0
+    private var lastReport = Date()
+
+    init(sink: NetworkSink) {
+        self.sink = sink
+        /* Both threads wait on their queue, so they can start right away: the
+         * first capture buffer only wakes the converter. */
+        for (name, loop) in [("capture-cli.alac.convert", convertLoop), ("capture-cli.alac.pace", paceLoop)] {
+            let thread = Thread { loop() }
+            thread.name = name
+            thread.start()
+            threads.append(thread)
+        }
+    }
+
+    /* Called on ScreenCaptureKit's audio queue, so it does the least it can:
+     * copy the bytes out and get out of the way. Resampling here is what used to
+     * make ScreenCaptureKit drop buffers and leave the receiver with silence.
+     */
+    func append(_ sampleBuffer: CMSampleBuffer) {
+        guard let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description),
+              let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        let length = CMBlockBufferGetDataLength(block)
+        guard frames > 0, length > 0 else { return }
+        var bytes = Data(count: length)
+        let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return -1 }
+            return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: base)
+        }
+        guard status == noErr else { return }
+
+        condition.lock()
+        defer { condition.unlock() }
+        guard live, !stopped else { return }
+        buffersTaken += 1
+        capture.append(Chunk(bytes: bytes, frames: frames, format: format.pointee))
+        capturedBytes += length
+        /* The newest audio is the one worth keeping, so the queue gives up its
+         * oldest buffers - and says so once per episode, not once per buffer. */
+        while capturedBytes > Self.captureLimitBytes, capture.count > 1 {
+            let dropped = capture.removeFirst()
+            capturedBytes -= dropped.bytes.count
+            samplesDropped += Self.samples(at: dropped.format, frames: dropped.frames)
+        }
+        if capturedBytes > Self.captureLimitBytes, !overflowing {
+            overflowing = true
+            fputs("音频队列已满，丢弃最旧的采集数据\n", stderr)
+        }
+        if capturedBytes <= Self.captureLimitBytes / 2, pcm.count <= Self.pcmLimitBytes / 2 {
+            overflowing = false
+        }
+        condition.broadcast()
+    }
+
+    /* Stops both threads and reports what went out. */
+    func finish() {
+        condition.lock()
+        stopped = true
+        condition.broadcast()
+        condition.unlock()
+        /* Bounded: each thread only ever waits on its queue or sleeps for one
+         * frame interval, and the stop flag releases both. */
+        _ = converterDone.wait(timeout: .now() + 2)
+        _ = pacerDone.wait(timeout: .now() + 2)
+        threads = []
+    }
+
+    /* Raw capture PCM into the device format, one buffer at a time. */
+    private func convertLoop() {
+        defer { converterDone.signal() }
+        while true {
+            condition.lock()
+            while !stopped && live && capture.isEmpty { condition.wait() }
+            let done = stopped || !live
+            let chunk = capture.isEmpty ? nil : capture.removeFirst()
+            if let chunk { capturedBytes -= chunk.bytes.count }
+            condition.unlock()
+            guard !done, let chunk else { break }
+
+            let converted = convert(chunk)
+            condition.lock()
+            if let converted, !converted.isEmpty {
+                pcm.append(converted)
+                samplesConverted += converted.count / (Self.channels * 2)
+                trimLocked()
+            } else {
+                samplesDropped += Self.samples(at: chunk.format, frames: chunk.frames)
+            }
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    /* Frames leave one per frame interval on a schedule anchored to an origin
+     * rather than to the previous send, so a late wakeup is caught up instead
+     * of pushing every frame behind it. */
+    private func paceLoop() {
+        defer { pacerDone.signal() }
+        waitForPreRoll()
+        var origin = Date().addingTimeInterval(-Self.leadSeconds)
+        var index = 0
+        while let step = nextFrame() {
+            if step.waited {
+                /* Capture ran dry, so this frame is late by definition.
+                 * Re-anchor the schedule, or the deadlines it already missed
+                 * all fire at once and overflow the device's ring. */
+                origin = Date().addingTimeInterval(-Self.leadSeconds)
+                index = 0
+            }
+            let due = origin.addingTimeInterval(Double(index) * Self.frameInterval)
+            index += 1
+            let now = Date()
+            if due > now {
+                Thread.sleep(forTimeInterval: due.timeIntervalSince(now))
+                if isStopped { break }
+            }
+            /* The device times its packets from the samples themselves, so the
+             * timestamp only has to advance with the audio: frame n starts at
+             * n * 352 samples. */
+            let ptsMs = framesSent * Self.samplesPerFrame * 1000 / Self.sampleRate
+            guard sink.sendAudio(step.frame, ptsMs: ptsMs) else {
+                fputs("音频发送失败，已停止音频通道（视频继续）\n", stderr)
+                shutDown()
+                break
+            }
+            framesSent += 1
+        }
+        fputs("audio: \(framesSent) frame(s) sent\n", stderr)
+    }
+
+    /* The ring is empty when the stream starts, so the first frames have to
+     * come from audio captured ahead of time. Waiting for them here is what
+     * turns the lead into occupancy on the device instead of latency on this
+     * side. */
+    private func waitForPreRoll() {
+        condition.lock()
+        defer { condition.unlock() }
+        while pcm.count < Self.leadBytes && !stopped && live { condition.wait() }
+    }
+
+    /* One frame's worth of PCM, or nil once the thread should exit. `waited`
+     * reports that the queue, not the schedule, set the pace. */
+    private func nextFrame() -> (frame: [UInt8], waited: Bool)? {
+        condition.lock()
+        defer { condition.unlock() }
+        let waited = pcm.count < Self.frameBytes
+        while pcm.count < Self.frameBytes && !stopped && live {
+            reportLocked()
+            /* Wake up even when nothing arrives: the report has to keep ticking
+             * while the pipeline is stalled, which is when it matters. */
+            condition.wait(until: Date().addingTimeInterval(0.5))
+        }
+        reportLocked()
+        guard !stopped, live else { return nil }
+        let frame = alacFrame(pcm)
+        pcm.removeFirst(Self.frameBytes)
+        return (frame, waited)
+    }
+
+    /* Whole frames, oldest first: the samples after a drop stay where they were,
+     * while dropping part of a frame would garble the bits. Caller holds the
+     * lock. */
+    private func trimLocked() {
+        let excess = pcm.count - Self.pcmLimitBytes
+        guard excess > 0 else { return }
+        let drop = (excess + Self.frameBytes - 1) / Self.frameBytes * Self.frameBytes
+        pcm.removeFirst(drop)
+        samplesDropped += drop / (Self.channels * 2)
+        if !overflowing {
+            overflowing = true
+            fputs("音频发送跟不上采集，丢弃了最旧的音频\n", stderr)
+        }
+    }
+
+    /* One line every 10 s: frames sent since the last line, then what capture
+     * delivered, what the converter made of it and what was dropped. A stalled
+     * buffer count points at capture; a growing sample count with falling frames
+     * points at the socket. Caller holds the lock. */
+    private func reportLocked() {
+        let now = Date()
+        guard now.timeIntervalSince(lastReport) >= 10 else { return }
+        lastReport = now
+        fputs(String(format: "sent %d audio frame(s), %d buffer(s) captured, "
+                            + "%d sample(s) converted, %d sample(s) dropped\n",
+                     framesSent - framesSentAtLastReport, buffersTaken,
+                     samplesConverted, samplesDropped), stderr)
+        framesSentAtLastReport = framesSent
+    }
+
+    /* Dropped audio is counted on the 44100 Hz timeline, so the report compares
+     * like with like whatever the capture rate was. */
+    private static func samples(at format: AudioStreamBasicDescription, frames: Int) -> Int {
+        guard format.mSampleRate > 0 else { return frames }
+        return Int((Double(frames) * Double(sampleRate) / format.mSampleRate).rounded())
+    }
+
+    /* AudioStreamBasicDescription is not Equatable; these are the fields that
+     * decide whether a cached converter still fits. */
+    private static func sameFormat(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription) -> Bool {
+        a.mSampleRate == b.mSampleRate && a.mFormatID == b.mFormatID
+            && a.mFormatFlags == b.mFormatFlags && a.mBytesPerPacket == b.mBytesPerPacket
+            && a.mFramesPerPacket == b.mFramesPerPacket && a.mChannelsPerFrame == b.mChannelsPerFrame
+            && a.mBitsPerChannel == b.mBitsPerChannel
+    }
+
+    private var isStopped: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return stopped
+    }
+
+    /* One audio path only: the first failure ends it and the rest is dropped. */
+    private func shutDown() {
+        condition.lock()
+        live = false
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /* One capture chunk resampled to the device format. */
+    private func convert(_ chunk: Chunk) -> Data? {
+        var asbd = chunk.format
+        guard let source = AVAudioFormat(streamDescription: &asbd),
+              let converter = converter(for: source),
+              let input = AVAudioPCMBuffer(pcmFormat: source, frameCapacity: AVAudioFrameCount(chunk.frames)) else { return nil }
+        input.frameLength = AVAudioFrameCount(chunk.frames)
+        guard fill(input, from: chunk) else { return nil }
+        let capacity = AVAudioFrameCount(Double(chunk.frames) * Double(Self.sampleRate) / source.sampleRate) + 64
+        guard let output = AVAudioPCMBuffer(pcmFormat: Self.targetFormat, frameCapacity: capacity) else { return nil }
+        /* Hand the buffer over once, then report that nothing is left: the
+         * converter emits what it can and keeps its resampler state for the
+         * buffers that follow. */
+        var supplied = false
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, inputStatus in
+            if supplied {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            inputStatus.pointee = .haveData
+            return input
+        }
+        guard status != .error, output.frameLength > 0 else { return nil }
+        let buffers = output.mutableAudioBufferList.pointee
+        let bytes = Int(output.frameLength) * Self.channels * 2
+        guard buffers.mNumberBuffers == 1, let data = buffers.mBuffers.mData,
+              Int(buffers.mBuffers.mDataByteSize) >= bytes else { return nil }
+        return Data(bytes: data, count: bytes)
+    }
+
+    /* Puts the copied bytes back into the layout the format describes: a
+     * non-interleaved buffer stores one plane per channel back to back, which is
+     * the order AVAudioPCMBuffer hands its buffers out in. */
+    private func fill(_ input: AVAudioPCMBuffer, from chunk: Chunk) -> Bool {
+        let buffers = UnsafeMutableAudioBufferListPointer(input.mutableAudioBufferList)
+        var offset = 0
+        return chunk.bytes.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return false }
+            for buffer in buffers {
+                let size = Int(buffer.mDataByteSize)
+                guard let destination = buffer.mData, offset + size <= raw.count else { return false }
+                memcpy(destination, base.advanced(by: offset), size)
+                offset += size
+            }
+            return true
+        }
+    }
+
+    /* Built on the first chunk, and rebuilt if the capture format ever changes:
+     * the device format is fixed, the capture side is whatever ScreenCaptureKit
+     * hands over. */
+    private func converter(for source: AVAudioFormat) -> AVAudioConverter? {
+        if let converter, let current = converterFormat,
+           Self.sameFormat(current, source.streamDescription.pointee) {
+            return converter
+        }
+        guard let made = AVAudioConverter(from: source, to: Self.targetFormat) else {
+            fputs(String(format: "无法把 %.0f Hz %d ch 的音频转成 44100 Hz 16 bit 立体声，关闭音频通道\n",
+                         source.sampleRate, Int(source.channelCount)), stderr)
+            shutDown()
+            return nil
+        }
+        converter = made
+        converterFormat = source.streamDescription.pointee
+        fputs(String(format: "audio: %.0f Hz %d ch -> %d Hz 16-bit stereo, %d samples/frame\n",
+                     source.sampleRate, Int(source.channelCount), Self.sampleRate,
+                     Self.samplesPerFrame), stderr)
+        return made
+    }
+
+    /* One ALAC frame in its uncompressed form, in the bit layout
+     * libavcodec/alac.c decode_element() reads for a stereo element: the 55-bit
+     * header below, then every sample as 16-bit two's complement, interleaved
+     * L,R,L,R, MSB first. 55 bits is not a byte boundary, so the header and the
+     * first sample share a byte. */
+    private func alacFrame(_ pcm: Data) -> [UInt8] {
+        var writer = BitWriter(capacity: 1415)
+        writer.write(1, bits: 3)                        /* stereo element (CPE) */
+        writer.write(0, bits: 4)                        /* element instance */
+        writer.write(0, bits: 12)                       /* unused */
+        writer.write(1, bits: 1)                        /* the sample count follows */
+        writer.write(0, bits: 2)                        /* extra bits field */
+        writer.write(1, bits: 1)                        /* not compressed */
+        writer.write(UInt64(Self.samplesPerFrame), bits: 32)
+        for offset in stride(from: 0, to: Self.frameBytes, by: 2) {
+            /* The queued PCM is native little-endian; ALAC wants the value it
+             * represents, not the bytes it was stored as. */
+            let value = UInt64(pcm[pcm.startIndex + offset]) | UInt64(pcm[pcm.startIndex + offset + 1]) << 8
+            writer.write(value, bits: 16)
+        }
+        return writer.finish()
+    }
+
+    /* MSB-first bit writer. The 55-bit ALAC header leaves the sample data off a
+     * byte boundary, so it cannot be appended to the output as bytes. */
+    private struct BitWriter {
+        private var bytes: [UInt8] = []
+        private var accumulator: UInt64 = 0
+        private var pending = 0
+
+        init(capacity: Int) { bytes.reserveCapacity(capacity) }
+
+        mutating func write(_ value: UInt64, bits: Int) {
+            accumulator = (accumulator << UInt64(bits)) | (value & ((UInt64(1) << UInt64(bits)) - 1))
+            pending += bits
+            while pending >= 8 {
+                pending -= 8
+                bytes.append(UInt8(truncatingIfNeeded: accumulator >> UInt64(pending)))
+            }
+            accumulator &= (UInt64(1) << UInt64(pending)) - 1
+        }
+
+        /* The tail is padded with zeros to the next byte boundary. */
+        mutating func finish() -> [UInt8] {
+            if pending > 0 {
+                bytes.append(UInt8(truncatingIfNeeded: accumulator << UInt64(8 - pending)))
+                pending = 0
+            }
+            return bytes
+        }
+    }
+}
+
+/* Audio leaves the stream muxed into the MP4, written to a standalone WAV file,
+ * or - with --tcp - handed to the device's audio channel as ALAC frames. */
 final class AudioSink {
     private let muxer: MP4Muxer?
     private let wavPath: String?
+    private let sender: ALACAudioSender?
     private var wav: WAVWriter?
     private var broken = false
     private(set) var buffers = 0
 
-    init(muxer: MP4Muxer) { self.muxer = muxer; wavPath = nil }
-    init(wavPath: String) { muxer = nil; self.wavPath = wavPath }
+    init(muxer: MP4Muxer) { self.muxer = muxer; wavPath = nil; sender = nil }
+    init(wavPath: String) { muxer = nil; self.wavPath = wavPath; sender = nil }
+    init(sender: ALACAudioSender, wavPath: String?) { muxer = nil; self.wavPath = wavPath; self.sender = sender }
 
     func append(_ sampleBuffer: CMSampleBuffer) {
         buffers += 1
+        sender?.append(sampleBuffer)
         if let muxer { muxer.appendAudio(sampleBuffer); return }
+        guard wavPath != nil else { return }
         if wav == nil, !broken {
             guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
                   let writer = WAVWriter(format: format, path: wavPath ?? "") else {
@@ -533,7 +1003,10 @@ final class AudioSink {
         wav?.append(sampleBuffer)
     }
 
-    func finish() { wav?.finish() }
+    func finish() {
+        sender?.finish()
+        wav?.finish()
+    }
 }
 
 /* Only instantiated on macOS 13+, where SCStreamOutputType.audio exists. */
@@ -741,14 +1214,19 @@ func makeTarget(_ options: Options, content: SCShareableContent) throws -> Targe
     throw CLIError.invalid("找不到目标窗口；请先运行 list，确认窗口 ID 仍有效")
 }
 
-/* MP4 takes the audio as a second track; every other output needs a standalone
- * WAV file, whose path either comes from --audio-output or is derived from the
- * video file name. */
-func makeAudioSink(_ options: Options, muxer: MP4Muxer?, outputURL: URL?) throws -> AudioSink? {
+/* MP4 takes the audio as a second track, --tcp hands it to the device's audio
+ * channel, and every other output needs a standalone WAV file, whose path
+ * either comes from --audio-output or is derived from the video file name. */
+func makeAudioSink(_ options: Options, muxer: MP4Muxer?, outputURL: URL?,
+                   sender: ALACAudioSender?) throws -> AudioSink? {
     guard options.audio else { return nil }
     if let muxer { return AudioSink(muxer: muxer) }
+    if let sender { return AudioSink(sender: sender, wavPath: options.audioOutput) }
+    /* --tcp with no audio connection: the device takes nothing, so a WAV file is
+     * the only destination left, and there is one only when asked for. */
+    if options.tcpHost != nil { return options.audioOutput.map { AudioSink(wavPath: $0) } }
     if let explicit = options.audioOutput { return AudioSink(wavPath: explicit) }
-    guard let outputURL else { throw CLIError.invalid("--audio 配合 --stdout 或 --tcp 时需要 --audio-output PATH 指定 WAV 文件") }
+    guard let outputURL else { throw CLIError.invalid("--audio 配合 --stdout 时需要 --audio-output PATH 指定 WAV 文件") }
     return AudioSink(wavPath: outputURL.deletingPathExtension().appendingPathExtension("wav").path)
 }
 
@@ -775,7 +1253,14 @@ func record(_ options: Options, content: SCShareableContent) async throws {
                         fps: options.fps)
     }
     let muxer = isMP4 ? MP4Muxer(url: outputURL!, audioExpected: options.audio) : nil
-    let audioSink = try makeAudioSink(options, muxer: muxer, outputURL: outputURL)
+    /* The device's audio channel is the one destination that has to be set up
+     * before capture starts, so a socket that never came up leaves --tcp with
+     * video only rather than an error. */
+    var audioSender: ALACAudioSender?
+    if options.audio, let network, network.audioConnected {
+        audioSender = ALACAudioSender(sink: network)
+    }
+    let audioSink = try makeAudioSink(options, muxer: muxer, outputURL: outputURL, sender: audioSender)
     let encoder = try H264Encoder(width: target.width, height: target.height, fps: options.fps,
                                   bitrate: bitrate, output: output,
                                   muxer: muxer, network: network)

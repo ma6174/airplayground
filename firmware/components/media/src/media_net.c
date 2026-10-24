@@ -425,6 +425,8 @@ void audio_capture_task(void *arg)
         if (client < 0) {
             continue;
         }
+        int window = 64 * 1024;
+        setsockopt(client, SOL_SOCKET, SO_RCVBUF, &window, sizeof(window));
         ESP_LOGI(TAG, "audio client connected");
         for (;;) {
             uint8_t header[NET_HEADER_MAX];
@@ -577,7 +579,10 @@ bool media_net_start(void)
         s_net.started = false;
         return false;
     }
-    if (xTaskCreate(audio_capture_task, "media_net_audio", 4096, NULL, 4, NULL) != pdPASS) {
+    /* The audio reader outranks everything else here: while the session task is
+     * busy pushing a 30 KB keyframe to the receiver, a delayed read backs up into
+     * the client's socket and the sound starves. */
+    if (xTaskCreate(audio_capture_task, "media_net_audio", 4096, NULL, 7, NULL) != pdPASS) {
         ESP_LOGW(TAG, "no audio listener; audio has to share the video connection");
     }
     return true;

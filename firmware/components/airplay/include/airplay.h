@@ -134,6 +134,17 @@ void airplay_request_stop(void);
 /* True between airplay_mirror being requested and it returning. */
 bool airplay_is_running(void);
 
+/* What the audio channel did in the session that just ended: packets it sent,
+ * the ones that had no frame to carry, and how late it ran. */
+typedef struct {
+    uint64_t packets;
+    uint64_t gaps;
+    uint64_t late;
+    uint64_t late_max_ms;
+} airplay_audio_stats_t;
+
+void airplay_last_audio_stats(airplay_audio_stats_t *stats);
+
 /* True when the session that just ended delivered at least one frame, i.e. the
  * receiver completed the handshake and took the stream. */
 bool airplay_last_session_streamed(void);
