@@ -148,7 +148,7 @@ static void derive_labelled(const char *label, const uint8_t mixed[16], uint8_t 
      * carries the connection id as decimal ASCII (RPiPlay lib/mirror_buffer.c:52-66). */
     uint8_t digest[64];
     size_t label_len = strlen(label);
-    uint8_t input[24 + 16];
+    uint8_t input[AP_LEGACY_LABEL_MAX + 16];
     memcpy(input, label, label_len);
     memcpy(input + label_len, mixed, 16);
     hap_sha512(input, label_len + 16, digest);
@@ -178,7 +178,7 @@ void ap_legacy_derive_stream_keys(const uint8_t stream_key[16], const uint8_t ec
         fp_stream_key(stream_key, NULL, 0, false, mixed);
     }
 
-    char label[32];
+    char label[AP_LEGACY_LABEL_MAX];
     snprintf(label, sizeof(label), "AirPlayStreamKey%llu", (unsigned long long)connection_id);
     derive_labelled(label, mixed, skey);
     snprintf(label, sizeof(label), "AirPlayStreamIV%llu", (unsigned long long)connection_id);

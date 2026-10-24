@@ -19,6 +19,10 @@
 
 struct ap_session;
 
+/* "AirPlayStreamKey" plus a 20-digit decimal connection id. Receivers hash the
+ * label in full, so this buffer must never truncate it. */
+#define AP_LEGACY_LABEL_MAX 40
+
 /* Continuous AES-128-CTR keystream: one context per data connection, never
  * reset between records or frames. Block n of the keystream is
  * AES-ECB(key, counter + n) with the counter a big-endian 128-bit value. */

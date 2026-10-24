@@ -86,10 +86,12 @@
 #define APP_LEGACY_STREAM_PORT 0
 #endif
 
-/* Mix the pair-verify shared secret into the mirror stream keys (the standard
- * derivation). Turn off for receivers that always mix in zeros. */
+/* How the mirror stream keys are derived from the FairPlay-unwrapped AES key:
+ * 0 hashes the bare key (Apple's own sender, and the boxes that emulate it),
+ * 1 mixes the pair-verify secret, 2 mixes 32 zero bytes (RPiPlay/UxPlay, which
+ * always run the mixing step even when no pairing happened). */
 #ifndef APP_LEGACY_KEY_MIX
-#define APP_LEGACY_KEY_MIX 1
+#define APP_LEGACY_KEY_MIX 0
 #endif
 
 /* 0 derives the mirror IV, 1 sends eiv through unchanged. */

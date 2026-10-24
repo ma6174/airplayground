@@ -331,6 +331,9 @@ static int read_response(ap_client_t *client, ap_response_t *response)
         return -1;
     }
     response->status = atoi(space + 1);
+    /* Third-party boxes advertise an AirTunes HTTP stub on the port discovery
+     * reports; the session layer uses this to step up to the RTSP service. */
+    response->is_http = strncmp(header, "HTTP/", 5) == 0;
 
     size_t content_length = 0;
     bool has_content_length = false;

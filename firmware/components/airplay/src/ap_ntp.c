@@ -6,9 +6,6 @@
 
 static const char *TAG = "airplay";
 
-/* Difference between the NTP epoch (1900) and the Unix epoch. */
-#define NTP_EPOCH_OFFSET 2208988800ULL
-
 /* Playback lead added to every frame timestamp, in microseconds. */
 #define AP_VIDEO_TIMESTAMP_BIAS_US 75000
 
@@ -106,7 +103,11 @@ static void ntp_task(void *argument)
         reply[1] = 0xd3;
         /* Reference = the receiver's transmit timestamp. */
         memcpy(reply + 8, request + 24, 8);
-        uint64_t now = ap_ntp_boot_timestamp() + (NTP_EPOCH_OFFSET << 32);
+        /* The reply carries the same clock the video timestamps use: the
+         * receiver derives its playback offset from this difference, so a
+         * reply on a different epoch (1900 instead of boot) moves every frame
+         * by decades and it silently drops them all. */
+        uint64_t now = ap_ntp_boot_timestamp();
         put_be64(reply + 16, now);
         put_be64(reply + 24, now);
 

@@ -27,6 +27,9 @@ typedef struct {
 
 typedef struct {
     int status;
+    /* Set when the reply line was HTTP rather than RTSP: some receivers expose an
+     * AirTunes HTTP stub on the port they advertise and keep RTSP one port up. */
+    bool is_http;
     size_t body_len;
     bool has_challenge;
     char realm[64];

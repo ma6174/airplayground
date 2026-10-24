@@ -4149,17 +4149,20 @@ static const uint8_t s_frame_3[] = {
     0x00, 0x00, 0x03, 0x00, 0x30, 0x21,
 };
 
+/* Index 0 has to be a keyframe: a receiver that opens on anything else has
+ * no reference picture and stops reading the stream. s_frame_0 is the
+ * SEI-only record the capture happened to start with, so it plays last. */
 static const uint8_t *const s_frames[] = {
-    s_frame_0,
     s_frame_1,
     s_frame_2,
     s_frame_3,
+    s_frame_0,
 };
 static const size_t s_frame_lens[] = {
-    sizeof(s_frame_0),
     sizeof(s_frame_1),
     sizeof(s_frame_2),
     sizeof(s_frame_3),
+    sizeof(s_frame_0),
 };
 
 static const airplay_frames_t s_source = {

@@ -100,6 +100,16 @@ int main(void)
     expect_hex(skey, SKEY_HEX, "skey derivation");
     expect_hex(siv, SIV_HEX, "siv derivation");
 
+    /* 1b. A 19-digit connection id, as the session ids on the wire are. The
+     *     label is "AirPlayStreamKey" plus that decimal id; hashing a truncated
+     *     label still produces a plausible-looking key, and every frame the
+     *     receiver decrypts then turns into noise. */
+    uint8_t wide_key[16];
+    unhex("7f2e8d12bbe69f897a2a4222aa6ddfe4", wide_key, sizeof(wide_key));
+    ap_legacy_derive_stream_keys(wide_key, NULL, 0, 1442574477961878719ULL, skey, siv);
+    expect_hex(skey, "097e3f428c1ddb38f59fe5690d03150d", "skey derivation with a 19-digit id");
+    expect_hex(siv, "94fa1eff52b45c2a5f4f8a91dd09bd86", "siv derivation with a 19-digit id");
+
     /* 2. The pair-verify signature keys. */
     uint8_t digest[64];
     uint8_t material[19 + 32];

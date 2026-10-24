@@ -80,6 +80,10 @@ typedef struct ap_session {
     char timing_peer_id[37];
     ap_clock_t clock;
 
+    /* Port the control connection actually uses. Receivers that advertise an
+     * AirTunes HTTP stub keep RTSP one port up, so this can differ from
+     * config->port. */
+    uint16_t control_port;
     int timing_fd;
     uint16_t timing_port;
     int audio_control_fd;

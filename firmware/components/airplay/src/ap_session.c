@@ -637,8 +637,10 @@ static esp_err_t setup_video(ap_session_t *session, uint16_t *data_port)
     }
 
     char uri[96];
-    int uri_len = snprintf(uri, sizeof(uri), "rtsp://%s:%u/%llu", session->config->host,
-                           (unsigned)session->config->port,
+    /* Apple leaves the port out of the URI even when the receiver listens on a
+     * non-default one; a receiver that matches the URL strictly rejects the
+     * request as soon as the port is present. */
+    int uri_len = snprintf(uri, sizeof(uri), "rtsp://%s/%llu", session->config->host,
                            (unsigned long long)session->video_stream_id);
     if (uri_len <= 0 || (size_t)uri_len >= sizeof(uri)) {
         AP_LOGE("receiver host name is too long for the video RTSP URI");
@@ -743,11 +745,16 @@ static esp_err_t stream_frames(ap_session_t *session)
             (unsigned)width, (unsigned)height);
 
     uint64_t timeline_id = 0;
+    /* Set by the codec record so the first frame can share its timestamp. */
+    uint64_t legacy_codec_timestamp = 0;
     uint8_t header[AP_FRAME_HEADER_LEN];
     if (legacy) {
         /* The codec record rides unencrypted with the raster dimensions in the
-         * header floats (RPiPlay lib/raop_rtp_mirror.c:350-375). */
-        ap_frame_build_legacy(header, avcc_len, 0x01, 0, width, height, false);
+         * header floats (RPiPlay lib/raop_rtp_mirror.c:350-375). Its timestamp
+         * is the one the first frame will carry: a receiver that anchors the
+         * decoder on the codec record drops the stream when the two disagree. */
+        legacy_codec_timestamp = ap_ntp_boot_timestamp();
+        ap_frame_build_legacy(header, avcc_len, 0x01, legacy_codec_timestamp, width, height, false);
         if (ap_legacy_write_record(session->data.fd,
                                    session->legacy_transport == 1 || session->legacy_transport == 3,
                                    0, header, avcc, avcc_len) != 0) {
@@ -780,7 +787,9 @@ static esp_err_t stream_frames(ap_session_t *session)
     }
 
     size_t index = 0;
-    uint64_t last_timestamp = 0;
+    /* The first video record repeats the codec record's timestamp, as Apple's
+     * sender does, so the comparison has to start one tick below it. */
+    uint64_t last_timestamp = legacy_codec_timestamp != 0 ? legacy_codec_timestamp - 1 : 0;
     uint64_t next_frame = ap_millis();
     uint64_t next_heartbeat = 0;
     uint64_t next_feedback = ap_millis();
@@ -973,6 +982,27 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
         AP_LOGE("legacy OPTIONS failed (status %d)", response.status);
         return ESP_FAIL;
     }
+    if (response.is_http) {
+        /* Boxes of this class advertise an AirTunes HTTP stub (the port mDNS
+         * reports) and keep the real RTSP service on the next port up. Nothing
+         * useful happens on the stub: it answers 200 to everything and never
+         * streams, so step up once and carry on there. */
+        uint16_t port = (uint16_t)(session->control_port + 1);
+        AP_LOGW("port %u answers HTTP; retrying the RTSP service on %u",
+                (unsigned)session->control_port, (unsigned)port);
+        ap_client_close(&session->client);
+        if (ap_client_connect(&session->client, session->config->host, port,
+                              AP_CONTROL_CONNECT_TIMEOUT_MS) != 0) {
+            AP_LOGE("cannot connect to %s:%u", session->config->host, (unsigned)port);
+            return ESP_FAIL;
+        }
+        if (ap_client_request(&session->client, "OPTIONS", "*", NULL, NULL, 0, NULL, &response) != 0 ||
+            response.is_http) {
+            AP_LOGE("no RTSP service on %s:%u either", session->config->host, (unsigned)port);
+            return ESP_FAIL;
+        }
+        session->control_port = port;
+    }
 
     /* Apple's own screen mirroring skips pairing on this class of receiver and
      * lets FairPlay carry the key material, so pairing is optional. */
@@ -1084,11 +1114,12 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
     (void)ap_client_request(&session->client, "GET_PARAMETER", session->uri, "text/parameters",
                             "volume", 6, NULL, &response);
 
-    ap_header_t transport[3] = {
-        /* Ask for the data stream on this connection; receivers that would
-         * rather hand out a port ignore the interleaved part and answer with
-         * a dataPort instead. */
-        { "Transport", "RTP/AVP/TCP;interleaved=0-1" },
+    /* Apple sends no Transport header with the mirror SETUP: the receiver
+     * either hands out a dataPort of its own or keeps the stream on this
+     * connection. Offering "interleaved=0-1" here makes receivers answer
+     * without a dataPort and then expect a framing the sender never agreed
+     * to, so the request matches Apple's byte for byte. */
+    ap_header_t transport[2] = {
         { "X-Apple-ProtocolVersion", "1" },
         { NULL, NULL },
     };
@@ -1113,7 +1144,7 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
      * mirror SETUP on a second port; that port allocates the data channel. */
     ap_client_t *stream_client = &session->client;
     uint16_t stream_port = session->config->legacy_stream_port;
-    if (stream_port != 0 && stream_port != session->config->port) {
+    if (stream_port != 0 && stream_port != session->control_port) {
         if (ap_client_connect(&session->stream_client, session->config->host, stream_port,
                               AP_CONTROL_CONNECT_TIMEOUT_MS) != 0) {
             AP_LOGE("cannot reach the mirror port %u", (unsigned)stream_port);
@@ -1185,9 +1216,10 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
 
 static esp_err_t session_run(ap_session_t *session)
 {
-    if (ap_client_connect(&session->client, session->config->host, session->config->port,
+    session->control_port = session->config->port;
+    if (ap_client_connect(&session->client, session->config->host, session->control_port,
                           AP_CONTROL_CONNECT_TIMEOUT_MS) != 0) {
-        AP_LOGE("cannot connect to %s:%u", session->config->host, (unsigned)session->config->port);
+        AP_LOGE("cannot connect to %s:%u", session->config->host, (unsigned)session->control_port);
         return ESP_FAIL;
     }
     /* Receivers that protect the session with "Require Password" answer with a
@@ -1216,7 +1248,7 @@ static esp_err_t session_run(ap_session_t *session)
             session->data.fd = session->client.fd;
         } else {
             uint16_t connect_port =
-                session->legacy_transport >= 3 ? session->config->port : data_port;
+                session->legacy_transport >= 3 ? session->control_port : data_port;
             session->data.fd =
                 ap_socket_connect(session->config->host, connect_port, AP_DATA_CONNECT_TIMEOUT_MS);
             if (session->data.fd < 0) {
@@ -1400,8 +1432,9 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
     ap_random_bytes(session->audio_key, sizeof(session->audio_key));
     session->audio_stream_id = make_stream_id();
     session->video_stream_id = make_stream_id();
-    int uri_len = snprintf(session->uri, sizeof(session->uri), "rtsp://%s:%u/%llu", config->host,
-                           (unsigned)config->port, (unsigned long long)session->audio_stream_id);
+    /* See the note on the video URI: Apple omits the port here too. */
+    int uri_len = snprintf(session->uri, sizeof(session->uri), "rtsp://%s/%llu", config->host,
+                           (unsigned long long)session->audio_stream_id);
     if (uri_len <= 0 || (size_t)uri_len >= sizeof(session->uri)) {
         AP_LOGE("receiver host name is too long for the RTSP URI");
         return ESP_ERR_INVALID_ARG;

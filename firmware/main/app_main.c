@@ -98,7 +98,17 @@ static const char *hook_start(const pin_start_request_t *request)
         return "already mirroring\n";
     }
 
-    /* Per-session overrides let a receiver be probed without reflashing. */
+    /* Per-session overrides let a receiver be probed without reflashing. Each
+     * session starts from the compiled configuration, so an override from an
+     * earlier /start cannot leak into this one. */
+    s_config.legacy_data_mode = APP_LEGACY_DATA_MODE;
+    s_config.legacy_key_mode = (uint8_t)APP_LEGACY_KEY_MIX;
+    s_config.legacy_iv_source = APP_LEGACY_IV_SOURCE;
+    s_config.legacy_stream_port = APP_LEGACY_STREAM_PORT;
+    s_config.legacy_audio = APP_LEGACY_AUDIO != 0;
+    s_config.legacy_pairing = APP_LEGACY_PAIRING != 0;
+    s_config.legacy_inband_sps = APP_LEGACY_INBAND_SPS != 0;
+    s_config.frame_interval_ms = APP_FRAME_INTERVAL_MS;
     if (request->data_mode >= 0) {
         s_config.legacy_data_mode = (uint8_t)request->data_mode;
     }

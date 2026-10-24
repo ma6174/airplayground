@@ -85,7 +85,7 @@ ekey'   = SHA512(aeskey || ecdh)[0..16]  ←「混入配对密钥」  mirror_buf
 skey    = SHA512("AirPlayStreamKey"+str(connID) || ekey')[0..16]  mirror_buffer.c:52-61
 siv     = SHA512("AirPlayStreamIV"+str(connID) || ekey')[0..16]   mirror_buffer.c:53-66
 ```
-- 「混入」的实现即我方 `fp_stream_key(raw_key, ecdh, 32, mix=true)`（`fpsap.c:478-501`，SHA512(raw||secret) 取前 16）——**legacy 与 HAP 用同一个函数，只换 secret 来源**：HAP 传 HAP pair-verify secret，legacy 传 §2.3 的 X25519 secret。`mix=false` 的裸 key 分支仅用于「接收端不支持 pair-verify」的降级（`fairplay.h` 注释；RPiPlay 系接收端一定做了 pair-verify，必须 mix）。
+   - 「混入」的实现即我方 `fp_stream_key(raw_key, ecdh, 32, mix=true)`（`fpsap.c:478-501`，SHA512(raw||secret) 取前 16）——**legacy 与 HAP 用同一个函数，只换 secret 来源**：HAP 传 HAP pair-verify secret，legacy 传 §2.3 的 X25519 secret。这一级是否执行取决于接收端：RPiPlay 系总是执行（无配对时 secret 为全零），伪装 AppleTV3,2 的贴牌盒子则不混，直接用裸 key（§15.2）；固件用 `legacy_key_mode` 三档覆盖这两种，默认裸 key。
 - `str(connID)` 是 streamConnectionID 的**十进制 ASCII**（`mirror_buffer.c:56-57` sprintf `%PRIu64`）。
 - 第二级 `skey/siv` 派生不在 fairplay 组件内（它只到 ekey'），需在 airplay 组件新写（~40 行）。
 
@@ -294,9 +294,16 @@ codec 记录（type 1）**不参与 keystream**，CTR 只在视频记录之间�
 
 发送端实测 30 帧/秒；音频是独立 UDP 通道，视频走分配到的 TCP 端口，帧为裸记录（无 `$` 交织）。
 
-### 15.4 未解之谜
+### 15.4 出画条件
 
-按上述规格复刻（不配对 + mode0 派生 + 1080p High profile + 双流 + 音频 UDP 喂包），这类盒子仍停在「进入投屏但黑屏」。它接受全部请求、分配 dataPort、接受数据不断连，但不出画。已排除：协议版本、密钥派生、帧头字段、SPS/PPS in-band、分辨率/档次、帧率（10/30 都试过）、音频流存在性。剩下的差异只可能在被加密的载荷内容（真正的 AAC-ELD 音频帧）或厂商私有 gating 上，需要一次 iOS 真实会话的抓包才能定论（`artifacts/mitm_capture.py` 用 ARP 欺骗把手机流量引到 Mac 上抓）。
+按上述规格复刻时，这类盒子会「进入投屏、分配 dataPort、收流不断连」却黑屏。逐项验证后，出画依赖下面四条同时成立：
+
+1. **标签必须完整**：`skey/siv` 的哈希输入是 `"AirPlayStreamKey" + decimal(streamConnectionID)` 再到 16 字节，19 位 id 让标签长 35 字符。用一个装不下的 `char label[32]` 调 `snprintf` 会静默截断成 31 字符，派生出「看着正常」但完全不同的 key，接收端每帧都解出噪声后静默丢弃——界面无任何报错，UxPlay 侧只报 `decryption of video packet failed`。实现里用 `AP_LEGACY_LABEL_MAX`（40）并由 `test_legacy.c` 用 19 位 id 的金标值锁住。
+2. **id 取 SETUP 2 plist 里的 `streamConnectionID`**，不是 RTSP URI 末尾那串数：两者不同（Apple 实测 URI `1145513884605957177`，SETUP 2 里是 `-2456313425954716723`）。Apple 发的是有符号 64 位，标签里用它的无符号十进制形式（20 位）。
+3. **密钥派生不混 secret**（§15.2 的裸 key 形式）。同一发送端连 RPiPlay/UxPlay 时需要先混一次 32 字节全零（它们总是执行混合步骤，无配对时 secret 为全零），所以固件把这件事做成 `legacy_key_mode` 三档。
+4. **每个同步帧带 in-band SPS/PPS**（`legacy_inband_sps`）：这类盒子的解码器不读 codec 记录里的 avcC。
+
+四条齐备后，静态画面在极米投影仪上正常出画，UxPlay 侧的解密错误计数归零。若仍有黑屏，先用 §15.1 的端口拓扑确认会话打的是真 RTSP 端口而不是 stub：stub 对任何请求都回 `HTTP/1.1 200 OK` 且永不流，会话看起来「成功」但没有 dataPort。固件在 legacy 路径上遇到 `HTTP/` 状态行会自动上探一个端口再重来一次。
 
 ### 15.5 严格接收端验证（UxPlay）
 
