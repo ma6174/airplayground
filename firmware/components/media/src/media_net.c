@@ -49,6 +49,11 @@ static const char *TAG = "media_net";
 #define NET_SLOTS (NET_QUEUE_DEPTH + 1)
 #define NET_PUSH_TIMEOUT_MS 300
 #define NET_PUSH_POLL_MS 5
+/* A client that vanishes without closing its socket (killed while the link is
+ * down, or a machine that went to sleep) leaves recv() blocked forever. Without
+ * a deadline the capture task never returns to accept(), and the port stops
+ * listening - no new client can connect until the device is reset. */
+#define NET_CLIENT_IDLE_MS 30000
 
 static struct {
     uint16_t port;
@@ -80,16 +85,37 @@ static void *big_alloc(size_t len)
     return heap_caps_malloc(len, MALLOC_CAP_DEFAULT);
 }
 
+static bool recv_ready(int fd, uint32_t timeout_ms)
+{
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    struct timeval tv = {
+        .tv_sec = (time_t)(timeout_ms / 1000),
+        .tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000),
+    };
+    return select(fd + 1, &set, NULL, NULL, &tv) > 0;
+}
+
 static bool recv_all(int fd, void *buf, size_t len)
 {
     uint8_t *cursor = buf;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(NET_CLIENT_IDLE_MS);
     while (len != 0) {
+        if (!recv_ready(fd, 1000)) {
+            if (xTaskGetTickCount() > deadline) {
+                ESP_LOGW(TAG, "capture client went quiet, dropping it");
+                return false;
+            }
+            continue;
+        }
         int got = recv(fd, cursor, len, 0);
         if (got <= 0) {
             return false;
         }
         cursor += got;
         len -= (size_t)got;
+        deadline = xTaskGetTickCount() + pdMS_TO_TICKS(NET_CLIENT_IDLE_MS);
     }
     return true;
 }
