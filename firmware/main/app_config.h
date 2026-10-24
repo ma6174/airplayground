@@ -89,6 +89,16 @@
 #define APP_USE_LIVE_VIDEO 1
 #endif
 
+/* Accept a macOS capture-cli stream on this TCP port. When a capture client
+ * is connected and configured, it takes precedence over the test pattern. */
+#ifndef APP_USE_NETWORK_VIDEO
+#define APP_USE_NETWORK_VIDEO 1
+#endif
+
+#ifndef APP_VIDEO_INPUT_PORT
+#define APP_VIDEO_INPUT_PORT 8090
+#endif
+
 /* Keep the FairPlay self-test at boot: it re-derives every published test
  * vector on the device and is the only ground truth we have before a receiver
  * is reachable. */

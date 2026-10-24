@@ -216,6 +216,7 @@ static esp_err_t live_next_frame(void *user, const uint8_t **au, size_t *len, bo
 }
 
 static const airplay_live_source_t s_source = {
+    .name = "test pattern",
     .width = MEDIA_PATTERN_WIDTH,
     .height = MEDIA_PATTERN_HEIGHT,
     .interval_ms = 1000 / MEDIA_PATTERN_FPS,

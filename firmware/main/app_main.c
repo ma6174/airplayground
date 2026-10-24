@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "media_frames.h"
 #include "media_live.h"
+#include "media_net.h"
 #include "nvs_flash.h"
 #include "pin_fetch.h"
 #include "pin_server.h"
@@ -45,6 +46,27 @@ static char s_target_host[48];
  * requested receiver is not found. */
 static char s_reply[512];
 
+/* Content source for the session that is about to start. A connected capture
+ * client wins over the on-chip test pattern, which in turn wins over the
+ * flash-resident still images. The choice is made per session because a client
+ * may connect or drop between sessions. */
+static void select_video_source(void)
+{
+    const airplay_live_source_t *live = NULL;
+#if APP_USE_NETWORK_VIDEO
+    live = media_net_source();
+#endif
+#if APP_USE_LIVE_VIDEO
+    if (live == NULL) {
+        live = media_live_source();
+    }
+#endif
+    s_config.live_source = live;
+    s_config.frames = live == NULL ? media_still_frames() : NULL;
+    ESP_LOGI(TAG, "video source: %s",
+             live != NULL ? (live->name != NULL ? live->name : "live source") : "still images");
+}
+
 static void session_task(void *argument)
 {
     (void)argument;
@@ -57,6 +79,7 @@ static void session_task(void *argument)
             snprintf(s_last_result, sizeof(s_last_result), "stopped before it started");
             continue;
         }
+        select_video_source();
         ESP_LOGI(TAG, "starting a mirroring session on request");
         esp_err_t err = airplay_mirror(&s_config);
         snprintf(s_last_result, sizeof(s_last_result),
@@ -278,7 +301,11 @@ void app_main(void)
         ESP_LOGE(TAG, "live video unavailable; mirroring will use the still images");
     }
 #endif
-
+#if APP_USE_NETWORK_VIDEO
+    if (!media_net_init(APP_VIDEO_INPUT_PORT)) {
+        ESP_LOGE(TAG, "capture input unavailable; a macOS capture client cannot connect");
+    }
+#endif
 #if APP_RUN_SELFTEST
     if (fp_selftest() != 0) {
         ESP_LOGE(TAG, "FairPlay self-test FAILED: the handshake cannot work, fix the port first");
@@ -308,6 +335,12 @@ void app_main(void)
     char *local_ip = s_local_ip;
     wifi_net_ip(local_ip, sizeof(s_local_ip));
     ESP_LOGI(TAG, "local address %s", local_ip);
+#if APP_USE_NETWORK_VIDEO
+    /* Sockets need lwIP, which only exists once the network is up. */
+    if (!media_net_start()) {
+        ESP_LOGE(TAG, "cannot start the capture listener");
+    }
+#endif
     if (discovery_start() != ESP_OK) {
         ESP_LOGW(TAG, "mDNS discovery unavailable; /targets will not work");
     }
@@ -331,15 +364,14 @@ void app_main(void)
         .pin = APP_PAIRING_PIN,
         .force_pin = APP_FORCE_PIN_PAIRING != 0,
         .request_pin = prompt_pin,
-        .live_source = live_video ? media_live_source() : NULL,
-        .frames = live_video ? NULL : media_still_frames(),
+        .frames = media_still_frames(),
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
         .identity = identity,
     };
     s_config = config;
     ESP_LOGI(TAG, "default receiver %s:%d, GET /targets lists what else is on the LAN",
              s_target_host, APP_AIRPLAY_TARGET_PORT);
-    ESP_LOGI(TAG, "video source: %s", live_video ? "live encoder (test pattern)" : "still images");
+    select_video_source();
 
     static const pin_server_session_hooks_t hooks = {
         .start = hook_start,

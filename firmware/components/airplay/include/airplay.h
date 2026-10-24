@@ -32,6 +32,8 @@ typedef struct {
  * successive calls continue the stream (frame counter, GOP position). The
  * pointer returned by next_frame() stays valid until the next call. */
 typedef struct {
+    /* Short name for the logs, e.g. "test pattern" or "capture stream". */
+    const char *name;
     uint16_t width;
     uint16_t height;
     /* Target milliseconds between frames. The real pace is this or the time

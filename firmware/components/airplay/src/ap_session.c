@@ -18,7 +18,14 @@ static const char *TAG = "airplay";
 #define AP_HEARTBEAT_INTERVAL_MS 1000
 #define AP_FEEDBACK_INTERVAL_MS 2000
 #define AP_FEEDBACK_FAILURE_LIMIT 3
-#define AP_LOOP_TICK_MS 20
+/* The loop wakes often enough to place a frame within a couple of milliseconds
+ * of its deadline; a 20 ms tick quantised 30 fps into 40 ms. */
+#define AP_LOOP_TICK_MS 5
+/* Feedback and heartbeats ride on the control connection and block while they
+ * wait for the reply, so they only go out when the next frame is far enough
+ * away to absorb the round trip. */
+#define AP_SLACK_FOR_CONTROL_MS 120
+#define AP_FEEDBACK_MAX_DEFERRALS 10
 
 /* One mirroring session at a time; the buffers live in static storage because
  * they do not fit on an ESP-IDF task stack. */
@@ -700,11 +707,12 @@ static esp_err_t stream_frames(ap_session_t *session)
 {
     const airplay_live_source_t *live = session->config->live_source;
     const airplay_frames_t *frames = session->config->frames;
-    uint32_t interval = session->config->frame_interval_ms;
-    if (live != NULL) {
-        interval = live->interval_ms;
-    }
-    if (interval == 0) {
+    /* interval_ms == 0 tells the loop to run at whatever pace the source
+     * delivers, which is what a capture client wants: its own frames already
+     * arrive at the screen's update rate, and adding a nominal interval on top
+     * would only add latency and cap the rate twice. */
+    uint32_t interval = live != NULL ? live->interval_ms : session->config->frame_interval_ms;
+    if (interval == 0 && live == NULL) {
         interval = 1000;
     }
 
@@ -726,6 +734,9 @@ static esp_err_t stream_frames(ap_session_t *session)
         AP_LOGE("content source carries no usable codec record");
         return ESP_FAIL;
     }
+    AP_LOGI("video source selected: %s, %ux%u",
+            live != NULL ? (live->name != NULL ? live->name : "live source") : "still frames",
+            (unsigned)width, (unsigned)height);
 
     uint64_t timeline_id = 0;
     if (ap_data_send_codec(&session->data, avcc, avcc_len, width, height,
@@ -743,12 +754,23 @@ static esp_err_t stream_frames(ap_session_t *session)
     uint64_t next_feedback = ap_millis();
     bool first_frame_sent = false;
     int feedback_failures = 0;
+    int feedback_deferrals = 0;
+    uint32_t frames_sent = 0;
+    uint64_t last_frame_at = 0;
     esp_err_t result = ESP_OK;
 
     while (!session->stop && !s_stop_requested) {
         uint64_t now = ap_millis();
+        uint64_t slack = next_frame > now ? next_frame - now : 0;
+        /* A source with no nominal interval (a capture client) has no future
+         * deadline to look at, so idle time since the last frame serves as the
+         * window for control traffic; otherwise feedback and heartbeats would
+         * never find room and the receiver would consider the channel idle. */
+        bool control_slot = slack >= AP_SLACK_FOR_CONTROL_MS ||
+                            (interval == 0 && now >= last_frame_at + AP_SLACK_FOR_CONTROL_MS);
 
-        if (now >= next_feedback) {
+        if (now >= next_feedback && (control_slot || feedback_deferrals >= AP_FEEDBACK_MAX_DEFERRALS)) {
+            feedback_deferrals = 0;
             if (send_feedback(session) == 0) {
                 feedback_failures = 0;
             } else if (++feedback_failures >= AP_FEEDBACK_FAILURE_LIMIT) {
@@ -757,9 +779,13 @@ static esp_err_t stream_frames(ap_session_t *session)
                 break;
             }
             next_feedback = now + AP_FEEDBACK_INTERVAL_MS;
+            continue;
+        }
+        if (now >= next_feedback) {
+            feedback_deferrals++;
         }
 
-        if (first_frame_sent && now >= next_heartbeat) {
+        if (first_frame_sent && now >= next_heartbeat && control_slot) {
             if (ap_data_send_heartbeat(&session->data) != 0) {
                 AP_LOGE("data channel heartbeat failed");
                 result = ESP_FAIL;
@@ -772,9 +798,16 @@ static esp_err_t stream_frames(ap_session_t *session)
             size_t payload_len = 0;
             const uint8_t *payload = NULL;
             bool idr = false;
+            uint64_t frame_started = ap_millis();
             if (live != NULL) {
-                if (live->next_frame(live->user, &payload, &payload_len, &idr) != ESP_OK ||
-                    payload == NULL || payload_len == 0) {
+                esp_err_t produced = live->next_frame(live->user, &payload, &payload_len, &idr);
+                if (produced == ESP_ERR_TIMEOUT) {
+                    /* A live source may briefly run dry; skip this slot instead
+                     * of tearing down a session that is still healthy. */
+                    next_frame = now + interval;
+                    continue;
+                }
+                if (produced != ESP_OK || payload == NULL || payload_len == 0) {
                     AP_LOGE("live source failed to produce a frame");
                     result = ESP_FAIL;
                     break;
@@ -794,6 +827,7 @@ static esp_err_t stream_frames(ap_session_t *session)
             }
             last_timestamp = timestamp;
 
+            uint64_t wait_ms = ap_millis() - frame_started;
             if (ap_data_send_frame(&session->data, payload, payload_len, idr, timestamp, timeline_id,
                                    session->frame_scratch, session->frame_scratch_len) != 0) {
                 AP_LOGE("video frame write failed");
@@ -804,13 +838,35 @@ static esp_err_t stream_frames(ap_session_t *session)
                 first_frame_sent = true;
                 next_heartbeat = ap_millis() + AP_HEARTBEAT_INTERVAL_MS;
             }
-            AP_LOGI("frame sent: %u bytes, idr=%d, timestamp=%llu", (unsigned)payload_len,
-                    idr ? 1 : 0, (unsigned long long)timestamp);
+            frames_sent++;
+            last_frame_at = ap_millis();
+            /* One line per frame would block on the USB console often enough to
+             * throttle the stream itself, so a live source reports once a second
+             * and still frames (10 s apart) report every frame. */
+            uint32_t log_every = live != NULL ? (interval > 0 ? (1000u / interval) : 10u) : 1u;
+            if (log_every < 1) {
+                log_every = 1;
+            }
+            if (frames_sent == 1 || frames_sent % log_every == 0) {
+                AP_LOGI("frame %u sent: %u bytes, idr=%d, waited=%llums, sent in %llums",
+                        (unsigned)frames_sent, (unsigned)payload_len, idr ? 1 : 0,
+                        (unsigned long long)wait_ms,
+                        (unsigned long long)(ap_millis() - frame_started - wait_ms));
+            }
 
             if (live == NULL) {
                 index = (index + 1) % frames->frame_count;
             }
-            next_frame = now + interval;
+            /* Accumulate instead of restarting from "now": a send that takes a
+             * little longer than the interval would otherwise push every later
+             * frame back and the stream would drift below the target rate. */
+            uint64_t deadline = next_frame + interval;
+            if (deadline <= now) {
+                /* Fell more than one interval behind; drop the backlog rather
+                 * than burst frames at the receiver. */
+                deadline = now + interval;
+            }
+            next_frame = deadline;
         }
 
         vTaskDelay(pdMS_TO_TICKS(AP_LOOP_TICK_MS));
