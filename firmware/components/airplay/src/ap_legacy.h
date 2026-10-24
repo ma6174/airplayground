@@ -23,13 +23,18 @@ struct ap_session;
  * label in full, so this buffer must never truncate it. */
 #define AP_LEGACY_LABEL_MAX 40
 
+/* Keystream is produced a chunk at a time: one AES call encrypts the counters
+ * of a whole chunk, which keeps a keyframe (tens of kilobytes) down to a few
+ * accelerator calls instead of one per 16-byte block. */
+#define AP_LEGACY_CTR_CHUNK_BLOCKS 64
+
 /* Continuous AES-128-CTR keystream: one context per data connection, never
  * reset between records or frames. Block n of the keystream is
  * AES-ECB(key, counter + n) with the counter a big-endian 128-bit value. */
 typedef struct {
     uint8_t key[16];
     uint8_t counter[16];
-    uint8_t keystream[16];
+    uint8_t keystream[16 * AP_LEGACY_CTR_CHUNK_BLOCKS];
     size_t used;
 } ap_legacy_ctr_t;
 

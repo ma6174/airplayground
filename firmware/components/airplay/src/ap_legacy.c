@@ -51,6 +51,68 @@ void ap_legacy_aes_block(const uint8_t key[16], const uint8_t in[16], uint8_t ou
 }
 #endif
 
+#if !defined(AP_HOST_BUILD)
+/* A session uses only a handful of keys (the stream key plus the pair-verify
+ * temporaries), so imported handles are cached: importing costs more than
+ * encrypting a chunk, and every record would pay for it otherwise. A full
+ * cache evicts in round-robin order and the next chunk re-imports that key. */
+#define AP_KEY_CACHE_SLOTS 4
+static struct {
+    uint8_t key[16];
+    psa_key_id_t id;
+} s_key_cache[AP_KEY_CACHE_SLOTS];
+static size_t s_key_cache_next;
+
+static psa_key_id_t key_handle(const uint8_t key[16])
+{
+    for (size_t i = 0; i < AP_KEY_CACHE_SLOTS; i++) {
+        if (s_key_cache[i].id != 0 && memcmp(s_key_cache[i].key, key, 16) == 0) {
+            return s_key_cache[i].id;
+        }
+    }
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECB_NO_PADDING);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 128);
+
+    psa_key_id_t id = 0;
+    if (psa_import_key(&attributes, key, 16, &id) != PSA_SUCCESS) {
+        return 0;
+    }
+    size_t slot = s_key_cache_next;
+    s_key_cache_next = (s_key_cache_next + 1) % AP_KEY_CACHE_SLOTS;
+    if (s_key_cache[slot].id != 0) {
+        psa_destroy_key(s_key_cache[slot].id);
+    }
+    memcpy(s_key_cache[slot].key, key, 16);
+    s_key_cache[slot].id = id;
+    return id;
+}
+#endif
+
+/* Encrypts a batch of independent blocks with a single accelerator call: per
+ * block calls turn a 24 KB keyframe into ~150 ms of pure overhead, which
+ * starves the frame queue and shows up as visible stutter. */
+static void ecb_encrypt_blocks(const uint8_t key[16], const uint8_t *in, uint8_t *out,
+                               size_t blocks)
+{
+#if defined(AP_HOST_BUILD)
+    for (size_t i = 0; i < blocks; i++) {
+        ap_legacy_aes_block(key, in + 16 * i, out + 16 * i);
+    }
+#else
+    psa_key_id_t id = key_handle(key);
+    size_t out_len = 0;
+    if (id == 0 ||
+        psa_cipher_encrypt(id, PSA_ALG_ECB_NO_PADDING, in, blocks * 16, out, blocks * 16,
+                           &out_len) != PSA_SUCCESS ||
+        out_len != blocks * 16) {
+        memset(out, 0, blocks * 16);
+    }
+#endif
+}
+
 /* ---------------------------------------------------------- audio packets */
 
 /* One RAOP audio packet: 12-byte RTP header, then a CBC-encrypted payload.
@@ -120,23 +182,44 @@ static void counter_increment(uint8_t counter[16])
     }
 }
 
+/* Fills keystream[] with the next chunk. The counter blocks are staged in a
+ * static buffer: CTR contexts belong to one task each (the session task owns
+ * the stream context, pair-verify uses a stack context) and are never touched
+ * concurrently. */
+static void keystream_refill(ap_legacy_ctr_t *ctr)
+{
+    static uint8_t counters[sizeof(ctr->keystream)];
+    for (size_t block = 0; block < AP_LEGACY_CTR_CHUNK_BLOCKS; block++) {
+        memcpy(counters + 16 * block, ctr->counter, 16);
+        counter_increment(ctr->counter);
+    }
+    ecb_encrypt_blocks(ctr->key, counters, ctr->keystream, AP_LEGACY_CTR_CHUNK_BLOCKS);
+    ctr->used = 0;
+}
+
 void ap_legacy_ctr_start(ap_legacy_ctr_t *ctr, const uint8_t key[16], const uint8_t iv[16])
 {
     memcpy(ctr->key, key, 16);
     memcpy(ctr->counter, iv, 16);
-    ap_legacy_aes_block(ctr->key, ctr->counter, ctr->keystream);
-    ctr->used = 0;
+    ctr->used = sizeof(ctr->keystream);
 }
 
 void ap_legacy_ctr_xor(ap_legacy_ctr_t *ctr, uint8_t *data, size_t len)
 {
-    for (size_t i = 0; i < len; i++) {
-        if (ctr->used == 16) {
-            counter_increment(ctr->counter);
-            ap_legacy_aes_block(ctr->key, ctr->counter, ctr->keystream);
-            ctr->used = 0;
+    size_t offset = 0;
+    while (offset < len) {
+        if (ctr->used == sizeof(ctr->keystream)) {
+            keystream_refill(ctr);
         }
-        data[i] ^= ctr->keystream[ctr->used++];
+        size_t take = sizeof(ctr->keystream) - ctr->used;
+        if (take > len - offset) {
+            take = len - offset;
+        }
+        for (size_t i = 0; i < take; i++) {
+            data[offset + i] ^= ctr->keystream[ctr->used + i];
+        }
+        ctr->used += take;
+        offset += take;
     }
 }
 
