@@ -772,6 +772,9 @@ static esp_err_t stream_frames(ap_session_t *session)
         } else {
             AP_LOGI("legacy audio channel ready: local %u -> %s:%u", (unsigned)local_port,
                     session->config->host, (unsigned)session->legacy_audio_port);
+            /* Start the audio clock where the video clock already is. */
+            session->legacy_audio_rtp_time =
+                (uint32_t)((ap_ntp_boot_timestamp() >> 32) * AP_LEGACY_AUDIO_SAMPLE_RATE);
             next_audio = ap_millis();
         }
     }
@@ -814,7 +817,7 @@ static esp_err_t stream_frames(ap_session_t *session)
                 session->legacy_audio_fd = -1;
             }
             session->legacy_audio_seq++;
-            session->legacy_audio_rtp_time += AP_LEGACY_AUDIO_CHUNK / 4;
+            session->legacy_audio_rtp_time += AP_LEGACY_AUDIO_SAMPLES_PER_PACKET;
             next_audio = now + AP_LEGACY_AUDIO_INTERVAL_MS;
         }
 
@@ -929,7 +932,10 @@ static esp_err_t stream_frames(ap_session_t *session)
             if (log_every < 1) {
                 log_every = 1;
             }
-            if (frames_sent == 1 || frames_sent % log_every == 0) {
+            /* Every sync frame is worth a line: a receiver that never gets one
+             * mid-stream keeps showing a stale picture, so the IDR line is the
+             * first thing to look for when the screen stays black. */
+            if (frames_sent == 1 || frames_sent % log_every == 0 || idr) {
                 AP_LOGI("frame %u sent: %u bytes, idr=%d, waited=%llums, sent in %llums",
                         (unsigned)frames_sent, (unsigned)payload_len, idr ? 1 : 0,
                         (unsigned long long)wait_ms,

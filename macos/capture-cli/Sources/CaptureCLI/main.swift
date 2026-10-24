@@ -313,7 +313,11 @@ final class H264Encoder {
         session = s
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        /* Baseline keeps CABAC out of the stream. The cheap decoders behind TV
+         * boxes and projectors usually implement Baseline only, and a Main
+         * profile stream leaves them showing nothing at all. */
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
         /* AverageBitRate alone lets a keyframe spike far above it. A screen full
          * of text (a terminal running top, say) then produces keyframes several

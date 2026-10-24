@@ -15,9 +15,17 @@
 #include "airplay.h"
 #include "ap_client.h"
 
-/* Audio is filler that keeps the channel alive: 20 ms per packet, silence. */
+/* Audio is filler that keeps the channel alive: one packet every 20 ms, which
+ * is 882 samples at the 44.1 kHz rate the audio stream is declared with. The
+ * RTP timestamp has to advance by that many samples, and start on the same
+ * clock the video timestamps use: a receiver that schedules video against the
+ * audio playhead holds the picture back forever when the two clocks disagree
+ * by the age of the device. */
 #define AP_LEGACY_AUDIO_CHUNK 96
 #define AP_LEGACY_AUDIO_INTERVAL_MS 20
+#define AP_LEGACY_AUDIO_SAMPLE_RATE 44100u
+#define AP_LEGACY_AUDIO_SAMPLES_PER_PACKET \
+    (AP_LEGACY_AUDIO_SAMPLE_RATE * AP_LEGACY_AUDIO_INTERVAL_MS / 1000u)
 #include "ap_data.h"
 #include "ap_event.h"
 #include "ap_legacy.h"
