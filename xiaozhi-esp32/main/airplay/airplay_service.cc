@@ -550,6 +550,13 @@ bool AirplayService::EnterPin(const std::string& spoken) {
         ESP_LOGW(TAG, "\"%s\" does not contain four digits", spoken.c_str());
         return false;
     }
+    /* Parsing four digits is not the same as delivering them: without a session
+     * parked on a prompt the code goes nowhere, and reporting success would make
+     * the assistant tell the user something that did not happen. */
+    if (!pin_pending_.load()) {
+        ESP_LOGW(TAG, "no session is waiting for a pairing code");
+        return false;
+    }
 
     if (pin_semaphore_ == nullptr) {
         pin_semaphore_ = xSemaphoreCreateBinary();
@@ -571,6 +578,10 @@ bool AirplayService::WaitForPin(char pin[5]) {
         if (pin_semaphore_ == nullptr) {
             return false;
         }
+    }
+    /* A code left over from an earlier prompt must not be consumed as the answer
+     * to this one. */
+    while (xSemaphoreTake(pin_semaphore_, 0) == pdTRUE) {
     }
     pin_pending_ = true;
     ESP_LOGW(TAG, "receiver shows a pairing code; ask the user for it");

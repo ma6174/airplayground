@@ -123,14 +123,31 @@ private:
             "Args:\n"
             "  `code`: what the user said, the digits are extracted from it\n"
             "Return:\n"
-            "  Whether four digits were understood.",
+            "  Whether the receiver accepted it; a rejected code is reported as such, not as success.",
             PropertyList({
                 Property("code", kPropertyTypeString),
             }),
             [&airplay](const PropertyList& properties) -> ReturnValue {
                 auto code = properties["code"].value<std::string>();
-                return airplay.EnterPin(code) ? std::string("ok")
-                                              : std::string("that does not contain four digits");
+                if (!airplay.EnterPin(code)) {
+                    return std::string("not accepted: either the user did not say four digits, or no "
+                                       "session is waiting for a code any more (start mirroring again)");
+                }
+                /* Four digits delivered says nothing about whether the receiver
+                 * liked them; wait for the session to either come up or ask
+                 * again, so the answer is not a guess. */
+                switch (airplay.WaitForStart(8000)) {
+                    case AirplayService::StartState::kEstablished:
+                        return std::string("code accepted, mirroring");
+                    case AirplayService::StartState::kPinRequired:
+                        return std::string("code rejected: the receiver shows a new code, ask the user "
+                                           "for it");
+                    case AirplayService::StartState::kFailed:
+                        return std::string("pairing failed: ") + airplay.StatusJson();
+                    case AirplayService::StartState::kTimeout:
+                    default:
+                        return std::string("code sent, still connecting: ") + airplay.StatusJson();
+                }
             });
 
         mcp_server.AddTool(

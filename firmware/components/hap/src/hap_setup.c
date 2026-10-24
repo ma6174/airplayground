@@ -191,6 +191,7 @@ int hap_setup_m4(hap_setup_t *setup, const uint8_t *in, size_t in_len, uint8_t *
         return -1;
     }
     if (hap_tlv_get(in, in_len, HAP_TLV_PROOF, proof, sizeof proof, &proof_len) != 0) {
+        HAP_LOGE("setup: M4 has no proof TLV");
         return -1;
     }
     if (proof_len == 0) {
@@ -198,13 +199,16 @@ int hap_setup_m4(hap_setup_t *setup, const uint8_t *in, size_t in_len, uint8_t *
          * the reference sender. */
         HAP_LOGW("setup: M4 carried no server proof");
     } else if (hap_srp_verify_server_proof(&setup->srp, proof, proof_len) != 0) {
-        return -1;
+            return -1;
+    } else {
+        HAP_LOGI("setup: server proof verified");
     }
 
     if (hap_hkdf_sha512(setup->srp.k, sizeof setup->srp.k, HAP_HKDF_SALT_SETUP_ENCRYPT,
                         HAP_HKDF_INFO_SETUP_ENCRYPT, session_key, sizeof session_key) != 0 ||
         hap_hkdf_sha512(setup->srp.k, sizeof setup->srp.k, HAP_HKDF_SALT_SETUP_SIGN,
                         HAP_HKDF_INFO_SETUP_SIGN, sign_key, sizeof sign_key) != 0) {
+        HAP_LOGE("setup: cannot derive the setup keys");
         return -1;
     }
 
@@ -233,11 +237,13 @@ int hap_setup_m4(hap_setup_t *setup, const uint8_t *in, size_t in_len, uint8_t *
                     HAP_ACL_SCREEN_CAPTURE_LEN);
     }
     if (sub.overflow || sub.len > sizeof encrypted - 16) {
+        HAP_LOGE("setup: identity sub-TLV does not fit (%u bytes)", (unsigned)sub.len);
         return -1;
     }
 
     if (hap_aead_seal_label(session_key, "PS-Msg05", NULL, 0, sub_tlv_buf, sub.len, encrypted) !=
         0) {
+        HAP_LOGE("setup: cannot seal the identity");
         return -1;
     }
 
@@ -245,6 +251,7 @@ int hap_setup_m4(hap_setup_t *setup, const uint8_t *in, size_t in_len, uint8_t *
     hap_tlv_put(&message, HAP_TLV_ENCRYPTED_DATA, encrypted, sub.len + 16);
     hap_tlv_put_u8(&message, HAP_TLV_STATE, 0x05);
     if (message.overflow) {
+        HAP_LOGE("setup: M5 does not fit the output buffer");
         return -1;
     }
     setup->state = HAP_SETUP_SENT_M5;
