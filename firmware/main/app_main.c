@@ -298,13 +298,14 @@ static const char *hook_status(void)
     }
     /* The audio counters only exist once a session has run; they answer the one
      * question the ears cannot: did the sound arrive on time, or did it starve? */
-    static char line[160];
+    static char line[224];
     airplay_audio_stats_t audio = { 0 };
     airplay_last_audio_stats(&audio);
     if (audio.packets != 0) {
-        snprintf(line, sizeof(line), "%saudio: %llu packet(s), %llu without a frame, "
-                                     "%llu late (max %llu ms)\n",
+        snprintf(line, sizeof(line), "%saudio: %llu packet(s), %llu received, "
+                                     "%llu without a frame, %llu late (max %llu ms)\n",
                  s_last_result, (unsigned long long)audio.packets,
+                 (unsigned long long)media_net_audio_received(),
                  (unsigned long long)audio.gaps, (unsigned long long)audio.late,
                  (unsigned long long)audio.late_max_ms);
         return line;

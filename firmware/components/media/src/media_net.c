@@ -104,6 +104,7 @@ static struct {
     uint8_t audio_head;
     uint8_t audio_count;
     uint32_t audio_dropped;
+    uint32_t audio_received;
     SemaphoreHandle_t queued;
     SemaphoreHandle_t lock;
 } s_net;
@@ -245,6 +246,7 @@ static bool handle_audio(int fd, const uint8_t *header)
     if (!recv_all(fd, s_net.audio_slots[slot], len)) {
         return false;
     }
+    s_net.audio_received++;
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     s_net.audio_len[slot] = len;
     s_net.audio_count++;
@@ -427,6 +429,8 @@ void audio_capture_task(void *arg)
         }
         int window = 64 * 1024;
         setsockopt(client, SOL_SOCKET, SO_RCVBUF, &window, sizeof(window));
+        /* A new audio client means a new run: the counters describe it alone. */
+        s_net.audio_received = 0;
         ESP_LOGI(TAG, "audio client connected");
         for (;;) {
             uint8_t header[NET_HEADER_MAX];
@@ -622,4 +626,9 @@ const airplay_live_source_t *media_net_source(void)
         return NULL;
     }
     return &s_source;
+}
+
+uint32_t media_net_audio_received(void)
+{
+    return s_net.audio_received;
 }

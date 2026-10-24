@@ -40,3 +40,8 @@ const airplay_live_source_t *media_net_source(void);
  * none is queued. Zero copy: the frame stays valid until the slot comes round
  * again, which is long after the caller has put it on the wire. */
 const uint8_t *media_net_audio(size_t *len);
+
+/* How many audio frames the client actually delivered since the stream started.
+ * Comparing this with the packets we managed to send says whether the sound
+ * starved because the client held back or because we did. */
+uint32_t media_net_audio_received(void);
