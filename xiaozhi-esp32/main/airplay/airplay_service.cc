@@ -8,6 +8,7 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <esp_wifi.h>
 #include <nvs.h>
 
 #include "board.h"
@@ -23,12 +24,27 @@
 
 extern "C" {
 #include "airplay.h"
+#include "ap_discovery.h"
 #include "media_avcc.h"
 }
 
 #define TAG "Airplay"
 
 namespace {
+
+/* A receiver is addressed either directly ("192.168.1.35", "192.168.1.35:7001")
+ * or by the name the discovery list shows ("我的Play 5"). */
+bool LooksLikeAddress(const std::string& value) {
+    if (value.empty() || value[0] < '0' || value[0] > '9') {
+        return false;
+    }
+    for (char c : value) {
+        if ((c < '0' || c > '9') && c != '.' && c != ':') {
+            return false;
+        }
+    }
+    return true;
+}
 
 constexpr size_t kAuCap = 128 * 1024;
 constexpr size_t kAvccCap = 64;
@@ -431,6 +447,23 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     if (target.empty()) {
         target = ResolveHost();
     }
+    name_.clear();
+    /* A named receiver resolves through the discovery list, which also decides
+     * the transport: AppleTV3,2-style boxes only speak legacy AirTunes. */
+    if (!target.empty() && !LooksLikeAddress(target)) {
+        airplay_target_t found = {};
+        if (!ap_discovery_find(target.c_str(), &found)) {
+            ESP_LOGE(TAG, "no receiver named \"%s\"; self.airplay.discover lists them",
+                     target.c_str());
+            running_ = false;
+            return false;
+        }
+        name_ = found.name;
+        legacy = legacy || found.legacy;
+        target = std::string(found.host) + ":" + std::to_string(found.port);
+        ESP_LOGI(TAG, "\"%s\" resolved to %s (%s)", found.name, target.c_str(),
+                 found.legacy ? "legacy AirTunes" : "HAP");
+    }
     if (target.empty()) {
         ESP_LOGE(TAG, "no receiver address; pass one in or set CONFIG_AIRPLAY_DEFAULT_HOST");
         running_ = false;
@@ -454,6 +487,7 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     legacy_ = legacy;
     Remember(target + ":" + std::to_string(port), legacy);
     stop_requested_ = false;
+    pin_timeout_ = false;
     last_result_ = "starting";
 
     BaseType_t created = xTaskCreate(SessionTask, "airplay", 16 * 1024, this, 3, &task_);
@@ -503,6 +537,7 @@ bool AirplayService::WaitForPin(char pin[5]) {
     ESP_LOGW(TAG, "receiver asks for a pairing code; call self.airplay.enter_pin");
     if (xSemaphoreTake(pin_semaphore_, pdMS_TO_TICKS(120000)) != pdTRUE) {
         ESP_LOGE(TAG, "no pairing code arrived, giving up");
+        pin_timeout_ = true;
         return false;
     }
     memcpy(pin, pending_pin_, 5);
@@ -531,6 +566,47 @@ std::string AirplayService::StatusJson() const {
     cJSON_free(text);
     cJSON_Delete(root);
     return result;
+}
+
+/* The LAN list the model can pick from. A cold list gets one blocking browse:
+ * answering "nothing here" while receivers that do answer queries are sitting
+ * on the network would be a lie. */
+std::string AirplayService::DiscoverJson() {
+    airplay_target_t targets[AP_DISCOVERY_MAX_TARGETS];
+    int count = ap_discovery_snapshot(targets, AP_DISCOVERY_MAX_TARGETS);
+    if (count == 0) {
+        ap_discovery_browse();
+        count = ap_discovery_snapshot(targets, AP_DISCOVERY_MAX_TARGETS);
+    }
+
+    cJSON* array = cJSON_CreateArray();
+    if (array == nullptr) {
+        return "[]";
+    }
+    for (int i = 0; i < count; i++) {
+        cJSON* item = cJSON_CreateObject();
+        if (item == nullptr) {
+            break;
+        }
+        cJSON_AddStringToObject(item, "name", targets[i].name);
+        cJSON_AddStringToObject(item, "host", targets[i].host);
+        cJSON_AddNumberToObject(item, "port", targets[i].port);
+        cJSON_AddBoolToObject(item, "legacy", targets[i].legacy);
+        cJSON_AddItemToArray(array, item);
+    }
+    char* text = cJSON_PrintUnformatted(array);
+    std::string result = text != nullptr ? text : "[]";
+    cJSON_free(text);
+    cJSON_Delete(array);
+    return result;
+}
+
+bool AirplayService::ShowText(const std::string& text) {
+    if (display_ == nullptr) {
+        return false;
+    }
+    display_->ShowText(text);
+    return true;
 }
 
 size_t AirplayService::ScreenBytes() const {
@@ -640,13 +716,23 @@ void AirplayService::SessionTask(void* arg) {
                  (int)airplay_last_session_streamed());
         /* A refused session is usually the receiver still tearing the previous
          * one down right after this device rebooted; retry with growing gaps.
-         * A clean end (stop request, receiver goodbye) is final. */
-        if (err == ESP_OK || attempt >= 4 || self->stop_requested_.load()) {
+         * A clean end (stop request, receiver goodbye), a pairing prompt nobody
+         * answered, or the last attempt are final. */
+        if (err == ESP_OK || attempt >= 4 || self->stop_requested_.load() ||
+            self->pin_timeout_.load()) {
             break;
         }
         const uint32_t delay_ms = 5000u << attempt;
         ESP_LOGW(TAG, "receiver not ready, retrying in %lu ms", (unsigned long)delay_ms);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+
+    if (airplay_last_session_streamed()) {
+        /* Receivers behind a network that swallows their multicast, or that only
+         * announce once per power cycle, never answer a browse: frames actually
+         * reaching a screen is the only evidence the list will ever get. */
+        ap_discovery_remember(self->name_.empty() ? self->host_.c_str() : self->name_.c_str(),
+                              self->host_.c_str(), self->port_, self->legacy_);
     }
 
     self->task_ = nullptr;
@@ -678,6 +764,13 @@ void AirplayService::AutoStartTask(void* arg) {
     /* The bench HTTP server binds sockets, so it can only come up after the
      * TCP/IP stack; the board constructor runs before that. */
     AirplayHttpStart();
+
+    /* A station that dozes between beacons misses the announcements that
+     * receivers which never answer a query (the projector is one) rely on. */
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ap_discovery_start() != ESP_OK) {
+        ESP_LOGW(TAG, "receiver discovery unavailable; self.airplay.discover stays empty");
+    }
 
     if (self->ResolveHost().empty()) {
         ESP_LOGI(TAG, "no default receiver configured, waiting for self.airplay.start");

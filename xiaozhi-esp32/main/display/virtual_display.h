@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 /**
  * Display backend that renders into memory instead of an LCD panel.
@@ -21,10 +22,16 @@ public:
     ~VirtualDisplay() override;
 
     void SetupUI() override;
+    void SetStatus(const char* status) override;
     void SetEmotion(const char* emotion) override;
     void SetChatMessage(const char* role, const char* content) override;
     void SetTheme(Theme* theme) override;
     void SetPowerSaveMode(bool on) override { (void)on; }
+
+    /* Shows text on the whole screen, hiding the chat UI until an empty string is
+     * passed back. This is how the assistant puts something on the TV that is not
+     * a reply: a note, a title, a list. */
+    void ShowText(const std::string& text);
 
     /* RGB565 frame the sink encodes, and a counter bumped per rendered frame so
      * it can skip re-encoding an unchanged screen. */
@@ -57,6 +64,11 @@ private:
 
     lv_obj_t* emoji_label_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
+    lv_obj_t* content_label_ = nullptr;
+    /* True while the content label owns the screen. State updates keep landing in
+     * their labels, they are just not visible. */
+    bool content_active_ = false;
+    std::string hidden_status_;
 };
 
 #endif  // VIRTUAL_DISPLAY_H

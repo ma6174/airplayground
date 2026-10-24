@@ -1,6 +1,8 @@
 #include "airplay_http.h"
 
+#include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 
 #include <esp_heap_caps.h>
@@ -14,6 +16,29 @@
 namespace {
 
 constexpr int kMaxQuery = 96;
+/* One screen of text; the POST body carries it raw so the model can send any
+ * UTF-8 without percent-encoding games. */
+constexpr size_t kMaxText = 512;
+
+/* esp_http_server hands the query string over verbatim, so percent-escapes and
+ * '+' for space are still in it. Receiver names are UTF-8 here: the projector
+ * this bench targets is "我的Play 5". */
+void PercentDecode(char* value) {
+    char* out = value;
+    for (const char* in = value; *in != '\0'; in++) {
+        if (*in == '+') {
+            *out++ = ' ';
+        } else if (*in == '%' && isxdigit(static_cast<unsigned char>(in[1])) &&
+                   isxdigit(static_cast<unsigned char>(in[2]))) {
+            const char hex[3] = {in[1], in[2], '\0'};
+            *out++ = static_cast<char>(strtol(hex, nullptr, 16));
+            in += 2;
+        } else {
+            *out++ = *in;
+        }
+    }
+    *out = '\0';
+}
 
 bool QueryValue(httpd_req_t* req, const char* key, char* out, size_t out_len) {
     char query[kMaxQuery];
@@ -24,6 +49,7 @@ bool QueryValue(httpd_req_t* req, const char* key, char* out, size_t out_len) {
     if (httpd_query_key_value(query, key, value, sizeof(value)) != ESP_OK) {
         return false;
     }
+    PercentDecode(value);
     if (out_len == 0) {
         return false;
     }
@@ -107,6 +133,34 @@ esp_err_t FrameHandler(httpd_req_t* req) {
     return err;
 }
 
+esp_err_t DiscoverHandler(httpd_req_t* req) {
+    auto list = AirplayService::GetInstance().DiscoverJson();
+    return Reply(req, list.c_str());
+}
+
+/* Body is the text itself; an empty body hands the screen back to the chat UI. */
+esp_err_t TextHandler(httpd_req_t* req) {
+    char body[kMaxText] = {0};
+    size_t total = 0;
+    while (total < sizeof(body) - 1) {
+        const int want = static_cast<int>((sizeof(body) - 1) - total);
+        const int got = httpd_req_recv(req, body + total, want);
+        if (got <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(got);
+        if (static_cast<size_t>(got) < static_cast<size_t>(want)) {
+            break;
+        }
+    }
+    body[total] = '\0';
+    if (!AirplayService::GetInstance().ShowText(body)) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no display\"}");
+    }
+    return Reply(req, total == 0 ? "{\"ok\":true,\"content\":\"chat\"}"
+                                 : "{\"ok\":true,\"content\":\"text\"}");
+}
+
 }  // namespace
 
 void AirplayHttpStart() {
@@ -135,9 +189,13 @@ void AirplayHttpStart() {
         {.uri = "/airplay/pin", .method = HTTP_GET, .handler = PinHandler, .user_ctx = nullptr},
         {.uri = "/airplay/screen.raw", .method = HTTP_GET, .handler = ScreenHandler, .user_ctx = nullptr},
         {.uri = "/airplay/frame.h264", .method = HTTP_GET, .handler = FrameHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/discover", .method = HTTP_GET, .handler = DiscoverHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/text", .method = HTTP_POST, .handler = TextHandler, .user_ctx = nullptr},
     };
     for (const auto& uri : uris) {
         httpd_register_uri_handler(server, &uri);
     }
-    ESP_LOGI(TAG, "bench API on http://<device>:8080/airplay/{status,start,stop,pin,screen.raw,frame.h264}");
+    ESP_LOGI(TAG,
+             "bench API on http://<device>:8080/airplay/"
+             "{status,start,stop,pin,screen.raw,frame.h264,discover,text}");
 }

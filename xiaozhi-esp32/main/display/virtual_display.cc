@@ -164,7 +164,7 @@ void VirtualDisplay::ApplyTheme() {
     if (theme->text_font() != nullptr) {
         lv_obj_set_style_text_font(screen, theme->text_font()->font(), 0);
     }
-    for (auto* label : {status_label_, notification_label_, chat_message_label_}) {
+    for (auto* label : {status_label_, notification_label_, chat_message_label_, content_label_}) {
         if (label == nullptr) {
             continue;
         }
@@ -212,7 +212,59 @@ void VirtualDisplay::SetupUI() {
     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(chat_message_label_, LV_ALIGN_BOTTOM_MID, 0, -16);
 
+    content_label_ = lv_label_create(screen);
+    lv_label_set_text(content_label_, "");
+    lv_obj_set_width(content_label_, width_ - 64);
+    lv_label_set_long_mode(content_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(content_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(content_label_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+
     ApplyTheme();
+}
+
+void VirtualDisplay::ShowText(const std::string& text) {
+    if (!lvgl_ready_ || content_label_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    content_active_ = !text.empty();
+    if (content_active_) {
+        lv_label_set_text(content_label_, text.c_str());
+        lv_obj_remove_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+        for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
+            if (label != nullptr) {
+                lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        return;
+    }
+
+    lv_obj_add_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+    for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
+        if (label != nullptr) {
+            lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    /* The status the state machine kept reporting while the text was up. */
+    if (!hidden_status_.empty() && status_label_ != nullptr) {
+        lv_label_set_text(status_label_, hidden_status_.c_str());
+        hidden_status_.clear();
+    }
+}
+
+void VirtualDisplay::SetStatus(const char* status) {
+    if (status == nullptr) {
+        return;
+    }
+    if (!content_active_) {
+        LvglDisplay::SetStatus(status);
+        return;
+    }
+    /* Text the assistant put on screen owns it: keep the newest state aside
+     * (LvglDisplay::SetStatus would make the status label visible again) and
+     * replay it when the text is cleared. */
+    hidden_status_ = status;
 }
 
 void VirtualDisplay::SetEmotion(const char* emotion) {

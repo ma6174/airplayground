@@ -56,11 +56,22 @@ private:
         auto& airplay = AirplayService::GetInstance();
 
         mcp_server.AddTool(
+            "self.airplay.discover",
+            "List the AirPlay receivers on the local network: TVs, projectors and Macs that this "
+            "device can mirror its screen to.\n"
+            "Return:\n"
+            "  JSON array of {name, host, port, legacy}. Pass `name` to `self.airplay.start`.",
+            PropertyList(),
+            [&airplay](const PropertyList&) -> ReturnValue { return airplay.DiscoverJson(); });
+
+        mcp_server.AddTool(
             "self.airplay.start",
             "Mirror this device's screen to an AirPlay receiver such as a TV.\n"
             "Args:\n"
-            "  `host`: receiver address or name on the local network (empty = the remembered one)\n"
-            "  `legacy`: true for old AirTunes-only receivers (e.g. some projectors)\n"
+            "  `host`: receiver address, or a receiver name from `self.airplay.discover` "
+            "  (empty = the receiver used last time)\n"
+            "  `legacy`: true for old AirTunes-only receivers (e.g. some projectors); a discovered "
+            "  receiver already carries this flag\n"
             "Return:\n"
             "  Whether the session was started. Use `self.airplay.status` afterwards.",
             PropertyList({
@@ -99,6 +110,27 @@ private:
             [&airplay](const PropertyList& properties) -> ReturnValue {
                 auto code = properties["code"].value<std::string>();
                 return airplay.EnterPin(code) ? std::string("ok") : std::string("invalid code");
+            });
+
+        mcp_server.AddTool(
+            "self.display.text",
+            "Show text on the screen people are looking at (the TV this device mirrors to).\n"
+            "The text takes the whole screen and stays until an empty string is passed; the chat "
+            "user interface comes back then.\n"
+            "Args:\n"
+            "  `text`: the text to show, short enough to fit one screen\n"
+            "Return:\n"
+            "  Whether the screen is now showing it.",
+            PropertyList({
+                Property("text", kPropertyTypeString),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto text = properties["text"].value<std::string>();
+                if (display_ == nullptr) {
+                    return std::string("no screen");
+                }
+                display_->ShowText(text);
+                return text.empty() ? std::string("chat user interface restored") : std::string("shown");
             });
     }
 

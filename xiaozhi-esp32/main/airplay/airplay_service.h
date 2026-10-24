@@ -24,9 +24,17 @@ public:
     void AttachDisplay(VirtualDisplay* display);
 
     /* Starts a session in the background. An empty host falls back to the host
-     * remembered in NVS and then to CONFIG_AIRPLAY_DEFAULT_HOST. */
+     * remembered in NVS and then to CONFIG_AIRPLAY_DEFAULT_HOST. A host that is
+     * not an address is looked up in the discovery list by name. */
     bool Start(const std::string& host, bool legacy);
     void Stop();
+
+    /* Receivers this device can see on the LAN, as JSON: name, address, port and
+     * whether the receiver needs the legacy AirTunes path. */
+    std::string DiscoverJson();
+
+    /* Puts text on the whole screen; an empty string restores the chat UI. */
+    bool ShowText(const std::string& text);
 
     /* Feeds the 4-digit code a receiver asks for while pairing. */
     bool EnterPin(const std::string& pin);
@@ -60,9 +68,14 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
+    /* A session that ended because no pairing code arrived is not going to be
+     * fixed by retrying: the code has to come from a person. */
+    std::atomic<bool> pin_timeout_{false};
     std::string host_;
     uint16_t port_ = 7000;
     bool legacy_ = false;
+    /* Name the session was started by, when it came from the discovery list. */
+    std::string name_;
     mutable std::string last_result_ = "idle since boot";
     TaskHandle_t task_ = nullptr;
 
