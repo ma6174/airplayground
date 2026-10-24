@@ -20,7 +20,7 @@ static const char *TAG = "media_net";
  *   FRAME   magic 'APVN' | type 2 | version 1 | flags 1 | reserved 2 |
  *           au_len 4 | pts_ms 4 | AVCC access unit
  *   AUDIO   magic 'APVN' | type 3 | version 1 | flags 0 | reserved 2 |
- *           frame_len 4 | pts_ms 4 | one encoded audio frame (ALAC, 4096 samples)
+ *           frame_len 4 | pts_ms 4 | one encoded audio frame (ALAC, spf samples)
  *
  * flags bit 0 marks an IDR access unit. Every access unit carries its own
  * boundaries, so the receiving side never parses H.264 to split TCP reads. */
@@ -35,9 +35,9 @@ static const char *TAG = "media_net";
  * the encoder went wild; only then is dropping the connection the right move. */
 #define NET_MAX_DRAIN (4u * 1024u * 1024u)
 #define NET_MAX_PARAM 1024u
-/* Audio rides the same connection but in its own ring: a frame is one ALAC
- * packet of 4096 samples (93 ms), and the session drains exactly one per packet
- * it sends. Losing an audio frame is a click, so the ring only turns into
+/* Audio rides the same connection but in its own ring: one frame per audio
+ * packet the session sends, 8 ms of sound each, and the session drains exactly
+ * one per packet. Losing an audio frame is a click, so the ring only turns into
  * "drop the oldest" once the consumer has been idle long enough to mean nobody
  * is listening. */
 /* Audio shares the connection with video, so one 28 KB picture holds the audio
@@ -45,8 +45,9 @@ static const char *TAG = "media_net";
  * connection for a fifth of a second. The ring covers half a second of sound, so
  * the client can stay well ahead and neither starve nor overflow. */
 #define NET_AUDIO_DEPTH 64
-/* A 4096-sample stereo 16-bit frame is 16 KB of PCM and the encoder can exceed
- * that once it adds its own framing, so the slot has to cover the worst case. */
+/* Well over the 1415 bytes of one 8 ms ALAC frame: a client that packs more
+ * samples into a frame still fits, while a stream that lost sync cannot aim a
+ * read at an arbitrary size. */
 #define NET_AUDIO_MAX (8u * 1024u)
 #define NET_AVCC_CAP (NET_MAX_PARAM * 2 + 64)
 #define NET_HEADER_MAX 32u
@@ -105,6 +106,13 @@ static struct {
     uint8_t audio_count;
     uint32_t audio_dropped;
     uint32_t audio_received;
+    /* The frame is copied out of the ring for the session (see
+     * media_net_audio), so the slot is free the moment it is popped. */
+    uint8_t *audio_copy;
+    /* Connection the capture client reads the arm byte from, and whether a
+     * session has started using this ring. */
+    int audio_client;
+    bool audio_armed;
     SemaphoreHandle_t queued;
     SemaphoreHandle_t lock;
 } s_net;
@@ -394,6 +402,25 @@ static void capture_task(void *arg)
     }
 }
 
+/* The capture client paces ALAC frames from its own clock, one frame per
+ * 8 ms, and the ring it fills is emptied the moment a session starts. Its lead
+ * over the device therefore has to be rebuilt then, or the device starts every
+ * session with an empty ring and starves on a third of its slots. One byte on
+ * the audio connection says "the channel is live now": clients that ignore it
+ * lose nothing but the lead.
+ *
+ * Caller holds the lock. */
+static void audio_arm_locked(void)
+{
+    if (!s_net.audio_armed || s_net.audio_client < 0) {
+        return;
+    }
+    uint8_t byte = 1;
+    if (send(s_net.audio_client, &byte, 1, MSG_DONTWAIT) != 1) {
+        ESP_LOGW(TAG, "cannot send the audio arm byte");
+    }
+}
+
 /* Audio gets its own connection: on a shared one, a 28 KB keyframe holds the
  * audio writes back for a fifth of a second, which is long enough to starve the
  * receiver and be heard as a click. */
@@ -431,6 +458,10 @@ void audio_capture_task(void *arg)
         setsockopt(client, SOL_SOCKET, SO_RCVBUF, &window, sizeof(window));
         /* A new audio client means a new run: the counters describe it alone. */
         s_net.audio_received = 0;
+        xSemaphoreTake(s_net.lock, portMAX_DELAY);
+        s_net.audio_client = client;
+        audio_arm_locked();
+        xSemaphoreGive(s_net.lock);
         ESP_LOGI(TAG, "audio client connected");
         for (;;) {
             uint8_t header[NET_HEADER_MAX];
@@ -448,6 +479,7 @@ void audio_capture_task(void *arg)
                  (unsigned)s_net.audio_dropped);
         s_net.audio_dropped = 0;
         xSemaphoreTake(s_net.lock, portMAX_DELAY);
+        s_net.audio_client = -1;
         s_net.audio_head = 0;
         s_net.audio_count = 0;
         xSemaphoreGive(s_net.lock);
@@ -461,10 +493,15 @@ static const uint8_t *net_codec_record(void *user, size_t *len)
         return NULL;
     }
     /* A session starts here. Audio queued before it belongs to nobody's
-     * timeline, and letting that backlog drain would clip the first seconds. */
+     * timeline, and letting that backlog drain would clip the first seconds.
+     * The client that paced those frames believes the ring still holds the lead
+     * it built up, so the arm byte below is what tells it to build that lead
+     * again - an empty ring absorbs no jitter and starves the receiver. */
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     s_net.audio_head = 0;
     s_net.audio_count = 0;
+    s_net.audio_armed = true;
+    audio_arm_locked();
     xSemaphoreGive(s_net.lock);
     /* A session starts here. Whatever is already queued was produced for a
      * previous session - or before the encoder's last IDR - and a P frame it
@@ -548,6 +585,12 @@ bool media_net_init(uint16_t port)
             return false;
         }
     }
+    s_net.audio_copy = big_alloc(NET_AUDIO_MAX);
+    if (s_net.audio_copy == NULL) {
+        ESP_LOGE(TAG, "no memory for the audio handoff buffer");
+        return false;
+    }
+    s_net.audio_client = -1;
     s_net.queued = xSemaphoreCreateCounting(NET_QUEUE_DEPTH, 0);
     s_net.lock = xSemaphoreCreateMutex();
     if (s_net.queued == NULL || s_net.lock == NULL) {
@@ -599,22 +642,26 @@ bool media_net_ready(void)
 
 const uint8_t *media_net_audio(size_t *len)
 {
-    const uint8_t *frame = NULL;
+    if (len != NULL) {
+        *len = 0;
+    }
     if (xSemaphoreTake(s_net.lock, pdMS_TO_TICKS(50)) != pdTRUE) {
-        if (len != NULL) {
-            *len = 0;
-        }
         return NULL;
     }
+    const uint8_t *frame = NULL;
     if (s_net.audio_count != 0) {
-        frame = s_net.audio_slots[s_net.audio_head];
+        size_t taken = s_net.audio_len[s_net.audio_head];
+        /* Popping a frame hands its slot back to the producer, which fills it as
+         * soon as the next frame arrives - usually while the caller is still
+         * encrypting what it holds. Copy it out here, under the lock, and a
+         * half-overwritten ALAC frame can never reach the speaker. */
+        memcpy(s_net.audio_copy, s_net.audio_slots[s_net.audio_head], taken);
+        frame = s_net.audio_copy;
         if (len != NULL) {
-            *len = s_net.audio_len[s_net.audio_head];
+            *len = taken;
         }
         s_net.audio_head = (uint8_t)((s_net.audio_head + 1) % NET_AUDIO_DEPTH);
         s_net.audio_count--;
-    } else if (len != NULL) {
-        *len = 0;
     }
     xSemaphoreGive(s_net.lock);
     return frame;
