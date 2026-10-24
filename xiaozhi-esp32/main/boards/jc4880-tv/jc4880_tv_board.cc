@@ -1,6 +1,5 @@
 #include "wifi_board.h"
 
-#include "airplay/airplay_http.h"
 #include "airplay/airplay_service.h"
 #include "application.h"
 #include "audio/codecs/es8311_audio_codec.h"
@@ -109,7 +108,8 @@ public:
         InitializeDisplay();
         InitializeButtons();
         InitializeTools();
-        AirplayHttpStart();
+        /* 台架 HTTP 口由 AirplayService::AutoStart 的任务在网络就绪后拉起：
+         * 板级构造函数早于 TCP/IP 栈初始化，在这里起 httpd 会断言。 */
         AirplayService::GetInstance().AutoStart();
     }
 

@@ -10,6 +10,7 @@
 #include <nvs.h>
 
 #include "board.h"
+#include "airplay_http.h"
 #include "cJSON.h"
 #include "display/virtual_display.h"
 #include "settings.h"
@@ -553,10 +554,6 @@ void AirplayService::SessionTask(void* arg) {
 }
 
 void AirplayService::AutoStart() {
-    if (ResolveHost().empty()) {
-        ESP_LOGI(TAG, "no default receiver configured, waiting for self.airplay.start");
-        return;
-    }
     xTaskCreate(AutoStartTask, "airplay_auto", 4 * 1024, this, 2, nullptr);
 }
 
@@ -572,11 +569,20 @@ void AirplayService::AutoStartTask(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (strcmp(ip, "0.0.0.0") == 0) {
-        ESP_LOGW(TAG, "no network address, skipping the automatic session");
+        ESP_LOGW(TAG, "no network address, bench API and automatic session stay off");
         vTaskDelete(nullptr);
         return;
     }
 
+    /* The bench HTTP server binds sockets, so it can only come up after the
+     * TCP/IP stack; the board constructor runs before that. */
+    AirplayHttpStart();
+
+    if (self->ResolveHost().empty()) {
+        ESP_LOGI(TAG, "no default receiver configured, waiting for self.airplay.start");
+        vTaskDelete(nullptr);
+        return;
+    }
     ESP_LOGI(TAG, "network is up (%s), connecting to the configured receiver", ip);
     self->Start("", false);
     vTaskDelete(nullptr);
