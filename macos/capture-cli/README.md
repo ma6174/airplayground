@@ -37,8 +37,8 @@ capture-cli record --display 0 --output screen.h264 --duration 10
 # 捕获窗口
 capture-cli record --window-id 1234 --output window.h264
 
-# 导出 MP4
-capture-cli record --display 0 --output screen.mp4 --duration 10
+# 导出 MP4（--audio 同时录系统音频，混成第二条轨）
+capture-cli record --display 0 --output screen.mp4 --audio --duration 10
 
 # 输出到标准输出；日志始终写入 stderr
 capture-cli record --display 0 --stdout | ffplay -f h264 -
@@ -51,9 +51,13 @@ capture-cli record --display 0 --stdout | ffplay -f h264 -
 - `--width N --height N`：输出尺寸，必须为偶数
 - `--duration SECONDS`：自动停止；未指定时使用 Ctrl-C
 - `--no-cursor`：不捕获鼠标指针
+- `--audio`：同时采集系统输出音频（默认关闭；需要 macOS 13+，非窗口专属，
+  录的是整个系统的输出声音）
+- `--audio-output PATH`：音频单独写成 WAV 文件；仅在裸流/`--stdout`/`--tcp`
+  输出时需要（MP4 会直接混流），裸流输出时可省略，默认取视频文件同名 `.wav`
 - `--tcp host:port`：把 H.264 访问单元推给 ESP32 AirPlay 发送端（见下）
 
-`.h264`/`.264` 输出是包含 SPS/PPS 的 Annex-B H.264，便于用 `ffplay`、`ffprobe` 或后续 AirPlay 发送端读取；`.mp4` 输出使用系统 `AVAssetWriter` 封装 H.264。当前版本只处理视频，不处理音频。
+`.h264`/`.264` 输出是包含 SPS/PPS 的 Annex-B H.264，便于用 `ffplay`、`ffprobe` 或后续 AirPlay 发送端读取；`.mp4` 输出使用系统 `AVAssetWriter` 封装 H.264，开启 `--audio` 时额外混入一条 AAC 轨。裸流/stdout/`--tcp` 装不下音频，`--audio` 时音频旁路写成 32-bit float WAV（ScreenCaptureKit 原生 PCM，不经转码，ffmpeg/ffplay/固件侧可直接读）。启动后 stderr 会打印一行 `audio stream connected: ...` 表示音频已接通，结束时打印采集到的 buffer 总数。
 
 ## 推流给 ESP32（`--tcp`）
 
