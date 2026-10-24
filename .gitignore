@@ -12,3 +12,6 @@ firmware/main/app_config_local.h
 .DS_Store
 *.swp
 firmware/.cache/
+
+# Host test build output
+firmware/components/*/test/build/

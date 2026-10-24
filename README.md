@@ -1,20 +1,31 @@
 # AirPlay on ESP32-S3
 
 ESP32-S3（`esp32-s3-wroom-1`，16 MB flash）上的 AirPlay **屏幕镜像发送端**固件：
-设备自己完成 HAP 配对、FairPlay SAP 密钥交换和 SETUP 协商，然后把主机预先编码好的
-H.264 静态帧通过镜像数据通道投到 Apple TV 上。
+设备自己完成 HAP 配对、FairPlay SAP 密钥交换和 SETUP 协商，然后把 H.264 视频流
+通过镜像数据通道投到接收端上。画面可以来自三种源：Mac 屏幕采集（`macos/capture-cli`
+推流）、片上软编码的动态测试图案，或预编码静态帧 —— 按此优先级选择，不可用的就退到
+下一档。
 
-一期目标很明确：**先把 FairPlay 与协议栈跑通，能在电视上看到画面**。
+## 视频源
 
-## 为什么是「静态帧 + 主机预编码」
+ESP32-S3 没有硬件 H.264 编码器，官方 `esp_h264` 软编（OpenH264）在 S3 上能跑
+320x180@10fps 左右，这就是片上编码的现实上限。会话层不关心画面从哪来，只认
+两种字节流形态：
 
-ESP32-S3 没有硬件 H.264 编码器，官方 `esp_h264` 软编在 S3 上的上限是 320×240@11fps
-（依赖 Octal PSRAM 80MHz），做动态桌面根本不够。但 AirPlay 协议本身不限制分辨率：
-宽高由发送端在 SETUP 里自己声明，接收端照单解码。
+- **live 源**（`airplay_live_source_t`）：实现 `codec_record` + `next_frame` 两个回调，
+  会话每次取一帧。已经有两份实现：
+  - `media_net`（网络源）：接收 macOS 侧 `capture-cli` 用 ScreenCaptureKit +
+    VideoToolbox 编好的访问单元，芯片只做加密和转发，因此可以投 960x682 甚至更高的
+    真实屏幕内容；
+  - `media_live`（片上编码）：内置动画测试图案 → OpenH264 → Annex-B → AVCC 重封装。
+- **静态帧源**（`airplay_frames_t`）：回放编译期用 x264 编好、烧在 flash 里的访问单元
+  （`tools/make_frames.py`），720p、字迹清晰，不占运行内存。
 
-所以一期把编码这件事搬回主机：x264 把每张图编成一个 Baseline 的 IDR 帧，设备**只回放字节**。
-设备侧因此完全不碰编码器，剩下的全是协议与密码学 —— 这正是要验证的部分。
-720p 静态帧在电视上是清晰的，而且码流只有 18–28 KB/帧。
+选择顺序：有 `capture-cli` 连上来并发了配置 → 网络源；否则片上编码可用 → 测试图案；
+否则静态帧。每次 `/start` 都重新选，`/status` 前的日志会打印 `video source: ...`。
+
+每个新会话开始时 live 源重建编码器：接收端拿到的第一帧必定是带新 SPS/PPS 的 IDR，
+无论设备之前闲置多久。
 
 ## 目录结构
 
@@ -25,13 +36,14 @@ firmware/
 │   ├── fairplay/          FairPlay SAP 握手（SAP hash、白盒表、ekey 封装）
 │   ├── hap/               HAP 配对（SRP-6a、X25519/Ed25519、ChaCha20-Poly1305 分帧）
 │   ├── airplay/           RTSP 控制通道、binary plist、SETUP、视频数据通道
-│   └── media/             预编码的静态帧（由 tools/make_frames.py 生成）
+│   └── media/             视频源：网络采集流、片上软编码（esp_h264）、预编码静态帧
 ├── media-src/             静态帧的源图
 ├── tools/make_frames.py   源图 → H.264 访问单元 → frames.c
 ├── tools/pin_bridge.py    常驻串口桥：日志落文件（FIFO 写入仅对真实 UART 板有意义）
 ├── partitions.csv         3 MB 应用分区
 └── sdkconfig.defaults     esp32s3 / 16 MB flash / USB-Serial-JTAG 控制台
 docs/                      协议与 FairPlay 规格、C 参考实现、运维手册（见下文「文档」）
+macos/capture-cli/         Mac 采集端：ScreenCaptureKit + VideoToolbox → TCP 推流给设备
 ```
 
 ## 快速开始
@@ -46,7 +58,9 @@ $EDITOR main/app_config_local.h      # Wi-Fi 账号密码；接收端地址是�
 ```
 
 `app_config_local.h` 已在 `.gitignore` 里。可选配置项：`APP_DEVICE_NAME`（电视上显示的名字）、
-`APP_FRAME_INTERVAL_MS`（每张图停留时间，默认 10 s）、`APP_PAIRING_PIN`（电视要求配对码时）。
+`APP_FRAME_INTERVAL_MS`（静态帧每张停留时间，默认 10 s）、`APP_PAIRING_PIN`（电视要求配对码时）、
+`APP_USE_LIVE_VIDEO=0`（关掉片上编码，固定用静态帧）、
+`APP_USE_NETWORK_VIDEO=0`（不接受 Mac 采集流）、`APP_VIDEO_INPUT_PORT`（采集流端口，默认 8090）。
 
 ### 2. 编译与烧写
 
@@ -81,8 +95,33 @@ curl http://<设备IP>:8080/status   # idle / mirroring / 上次会话的结束�
 
 配对码的三条投递通道见 [docs/runbook.md](docs/runbook.md)。
 
-电视上看到的内容：`ESP32-S3 / AirPlay mirroring`、`FairPlay OK`（协议阶段清单）、
-`Still image`（说明画面上是预编码帧），每 10 秒切换一张。
+### 4. 投 Mac 的屏幕或某个窗口
+
+`macos/capture-cli` 用 ScreenCaptureKit 抓画面、VideoToolbox 编 H.264，然后把访问单元
+推给设备（设备只做加密转发，不重新编码，所以能投真实桌面）：
+
+```sh
+cd macos/capture-cli && ./build.sh
+./capture-cli list                          # 找显示器索引和窗口 id
+./capture-cli record --window-id 961 --fps 20 --bitrate 2000000 \
+    --tcp <设备IP>:8090                     # 投单个窗口
+./capture-cli record --display 0 --width 960 --height 600 --fps 20 \
+    --tcp <设备IP>:8090                     # 投整块屏幕
+```
+
+先起采集流，再 `curl http://<设备IP>:8080/start?name=<接收端>`；设备日志会出现
+`capture configured: 960x682 @ 20 fps` 和 `video source: capture stream`。
+采集端每秒打印一行 `sent N frame(s)`，设备端每秒打印一行
+`frame N sent: ... waited=Xms, sent in Yms` —— `sent in` 是加密加发送的耗时
+（实测 4–6 ms/帧），`waited` 是等下一帧的时间。
+
+网络源的协议极其简单（一个配置包 + 每帧一个长度前缀包，帧内仍为 AVCC），
+写在 `firmware/components/media/src/media_net.c` 顶部；客户端实现见
+`macos/capture-cli` 里的 `NetworkSink`。
+
+电视上看到的内容：网络源下就是 Mac 的屏幕/窗口本身；片上编码下是持续变化的彩色条纹动画；
+静态帧源下是 `ESP32-S3 / AirPlay mirroring`、`FairPlay OK` 等预编码画面，每 10 秒切换一张。
+启动日志会打印实际选择了哪个源（`video source: ...`）。
 ## 没有 Wi-Fi 密码时：让设备自己开热点
 
 `APP_WIFI_SSID` 留空时，设备不连外部网络，而是起一个热点
@@ -135,8 +174,18 @@ cd firmware/components/fairplay/test && make && ./fairplay_test
   注意 `X-Apple-HKP: 3` 不是"裸配对"：它仍是 HAP TLV8，只是配对类型不同
   （4/5/3 的区分见 [docs/protocol.md](docs/protocol.md) 的 Pairing types）。
 - **没有音频**：SETUP 里给了音频描述（含 32 字节音频流密钥占位），但不发音频包。
-- **没有 mDNS 发现**：接收端地址写在配置里。
-- **没有编码器**：画面内容在编译期固定；`tools/make_frames.py` 换图即可。
+- **接收端地址靠 mDNS 或手动指定**：`/targets` 列出局域网上的 `_airplay._tcp`，
+  `/start?name=` / `?host=` 选定目标；也可以把地址写进配置当默认值。
+- **真实画面靠 Mac 采集**：片上 OpenH264 只能跑 320x180@10fps 的测试图案，所以投真实
+  桌面/窗口由 `macos/capture-cli` 编码后推给设备（网络源）。设备侧实测加密+发送
+  4–6 ms/普通帧、约 260 ms/满屏文字的关键帧（镜像通道实际带宽约 4 Mbps），所以帧率只受
+  采集端限制：ScreenCaptureKit 对静止画面会主动降帧（静窗口约 12–16 fps，内容持续变化时更高）。
+  采集端需要“屏幕与系统音频录制”授权；重建二进制后该授权会失效，需重新勾选。
+- **单帧上限 512 KB**：文字密集的窗口（终端里跑 top/htop）关键帧能达到一百多 KB，
+  超过上限的帧会被设备丢掉而不是断开连接；采集端同时把关键帧间隔放宽到 5 秒，
+  避免每秒一次的大帧顿挫。投这类窗口建议先降分辨率（`--width 960 --height 664`）。
+- **一次只接一个采集客户端**：8090 端口接受一个连接，断开后固件自动重新监听；
+  没有客户端时回退到片上测试图案。
 - **配对要等**：SRP-6a 的 3072 位模幂在 S3 上一轮约 8 秒（期间 CPU 打满，看门狗超时已调到 30 秒）。
   接收端接受过这台设备后，后续会话走 pair-verify，不再重跑 SRP。
 - **配对码有三条输入路径**：本机 HTTP 页面（`http://<device>:8080/`）、串口（仅对带真实
