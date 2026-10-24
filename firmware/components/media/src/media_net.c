@@ -27,7 +27,10 @@ static const char *TAG = "media_net";
 #define NET_TYPE_CONFIG 1
 #define NET_TYPE_FRAME 2
 #define NET_FLAG_IDR 0x01u
-#define NET_MAX_AU (128u * 1024u)
+#define NET_MAX_AU (512u * 1024u)
+/* A frame pointer that is absurdly large means the stream lost sync, not that
+ * the encoder went wild; only then is dropping the connection the right move. */
+#define NET_MAX_DRAIN (4u * 1024u * 1024u)
 #define NET_MAX_PARAM 1024u
 #define NET_AVCC_CAP (NET_MAX_PARAM * 2 + 64)
 #define NET_HEADER_MAX 32u
@@ -61,6 +64,7 @@ static struct {
     uint8_t head;
     uint8_t count;
     uint32_t dropped;
+    uint32_t oversized;
     SemaphoreHandle_t queued;
     SemaphoreHandle_t lock;
 } s_net;
@@ -143,8 +147,21 @@ static bool handle_config(int fd)
     return true;
 }
 
-/* Copies one access unit into a free slot. Returns false when the client goes
- * away mid-frame. */
+/* Reads an oversized frame off the socket so the stream stays in sync, then
+ * throws it away. */
+static bool drain_frame(int fd, uint32_t len)
+{
+    uint8_t scratch[256];
+    while (len != 0) {
+        size_t chunk = len < sizeof(scratch) ? len : sizeof(scratch);
+        if (!recv_all(fd, scratch, chunk)) {
+            return false;
+        }
+        len -= (uint32_t)chunk;
+    }
+    return true;
+}
+
 static bool handle_frame(int fd)
 {
     uint8_t header[NET_HEADER_MAX];
@@ -154,9 +171,21 @@ static bool handle_frame(int fd)
         return false;
     }
     uint32_t au_len = read_be32(header + 8);
-    if (au_len == 0 || au_len > NET_MAX_AU) {
+    if (au_len == 0 || au_len > NET_MAX_DRAIN) {
         ESP_LOGW(TAG, "access unit of %u bytes is out of range", (unsigned)au_len);
         return false;
+    }
+    /* Text-heavy windows spike their keyframes far above the average bitrate.
+     * Skipping one oversized frame costs at most one keyframe period of
+     * stutter, while closing the connection would take the whole stream down.
+     * The frame still has to be read off the socket to keep it in sync. */
+    if (au_len > NET_MAX_AU) {
+        s_net.oversized++;
+        if (s_net.oversized % 30 == 1) {
+            ESP_LOGW(TAG, "skipping %u-byte frame, over the %u-byte limit (%u skipped)",
+                     (unsigned)au_len, (unsigned)NET_MAX_AU, (unsigned)s_net.oversized);
+        }
+        return drain_frame(fd, au_len);
     }
 
     /* Wait for room, pushing back on the socket by not reading meanwhile. */
@@ -243,9 +272,10 @@ static void capture_task(void *arg)
         xSemaphoreGive(s_net.lock);
         while (xSemaphoreTake(s_net.queued, 0) == pdTRUE) {
         }
-        ESP_LOGW(TAG, "capture client disconnected (%u frame(s) dropped)",
-                 (unsigned)s_net.dropped);
+        ESP_LOGW(TAG, "capture client disconnected (%u frame(s) dropped, %u oversized)",
+                 (unsigned)s_net.dropped, (unsigned)s_net.oversized);
         s_net.dropped = 0;
+        s_net.oversized = 0;
     }
 }
 

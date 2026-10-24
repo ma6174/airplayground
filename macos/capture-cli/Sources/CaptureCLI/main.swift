@@ -112,6 +112,10 @@ struct Target {
  * units are dropped from the frames: they reach the receiver through the codec
  * record, and Apple's senders do the same. */
 final class NetworkSink {
+    /* Mirrors NET_MAX_AU in firmware/components/media/src/media_net.c: the device
+     * drops anything larger, so skip it here rather than burn the link on it. */
+    static let maxAccessUnit = 512 * 1024
+
     private let fd: Int32
     private var configured = false
     private let width: Int
@@ -190,6 +194,10 @@ final class NetworkSink {
             offset = start + size
         }
         guard !accessUnit.isEmpty else { return true }
+        guard accessUnit.count <= NetworkSink.maxAccessUnit else {
+            report("frame of \(accessUnit.count) bytes exceeds the \(NetworkSink.maxAccessUnit)-byte device limit")
+            return true
+        }
 
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         var message = Data([0x41, 0x50, 0x56, 0x4e, 2, 1, idr ? 1 : 0, 0])
@@ -307,12 +315,24 @@ final class H264Encoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps * 2 as CFTypeRef)
-        /* A short keyframe period keeps recovery cheap: if a frame is ever lost
-         * on the way to the receiver, the next IDR arrives within half a second
-         * instead of a couple of seconds of corruption. */
+        /* AverageBitRate alone lets a keyframe spike far above it. A screen full
+         * of text (a terminal running top, say) then produces keyframes several
+         * times the average, and a single keyframe takes longer to encrypt and
+         * send than a whole frame interval. Capping bytes per second keeps
+         * keyframes in the same league as the average. */
+        let limits: [CFTypeRef] = [NSNumber(value: bitrate / 8), NSNumber(value: 1.0)]
+        let limitStatus = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
+                                               value: limits as CFTypeRef)
+        if limitStatus != noErr {
+            fputs("编码器不接受码率上限（\(limitStatus)），关键帧可能远超平均值\n", stderr)
+        }
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps * 5 as CFTypeRef)
+        /* Keyframes are the expensive ones: 1224x846 of text costs a couple of
+         * hundred kilobytes, which takes several frame intervals to send. A
+         * one-second period turns that into visible stutter every second, so
+         * only resynchronise every few seconds. */
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                             value: 1.0 as CFTypeRef)
+                             value: 5.0 as CFTypeRef)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
         guard VTCompressionSessionPrepareToEncodeFrames(s) == noErr else { throw CLIError.message("无法准备 H.264 编码器") }
     }

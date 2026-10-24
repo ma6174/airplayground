@@ -62,7 +62,9 @@ capture-cli record --display 0 --stdout | ffplay -f h264 -
 
 线协议：一个大端配置包（宽高、帧率、SPS、PPS），随后每帧一个头 + AVCC 访问单元；
 非 VCL 的 NAL（SPS/PPS/SEI/AUD）不进帧，参数集只走配置包。
-密钥帧每 1 秒一个，万一中间丢帧也能很快恢复。
+密钥帧每 5 秒一个（文字密集的画面的关键帧上百 KB，设备侧要发 200 ms 以上；
+每秒一个就会每秒顿一下）。投放终端/代码这类文字密集窗口时先降分辨率：
+`--width 960 --height 664`，关键帧大小大约降到三分之一。
 
 运行时每秒往 stderr 打印一行 `sent N frame(s)`，便于与设备日志对账；
 设备端对应的一行是 `frame N sent: ... waited=Xms, sent in Yms`。
