@@ -22,6 +22,8 @@ struct Options {
     var height: Int?
     var duration: Double?
     var showCursor = true
+    var audio = false
+    var audioOutput: String?
 
     static func parse(_ args: [String]) throws -> Options {
         guard let commandName = args.first else { throw CLIError.usage }
@@ -67,6 +69,8 @@ struct Options {
                 guard let duration = Double(try value()), duration >= 0 else { throw CLIError.invalid("duration 必须是非负数字") }
                 o.duration = duration
             case "--no-cursor": o.showCursor = false
+            case "--audio": o.audio = true
+            case "--audio-output": o.audioOutput = try value()
             case "--help", "-h": throw CLIError.usage
             default: throw CLIError.invalid("未知参数：\(arg)")
             }
@@ -76,6 +80,10 @@ struct Options {
         guard o.displayIndex == nil || o.windowID == nil else { throw CLIError.invalid("--display 和 --window-id 不能同时使用") }
         guard o.width == nil || (o.width! >= 2 && o.width! % 2 == 0) else { throw CLIError.invalid("width 必须是正偶数") }
         guard o.height == nil || (o.height! >= 2 && o.height! % 2 == 0) else { throw CLIError.invalid("height 必须是正偶数") }
+        if o.audioOutput != nil && !o.audio { throw CLIError.invalid("--audio-output 需要配合 --audio") }
+        if o.audioOutput != nil, let out = o.output, URL(fileURLWithPath: out).pathExtension.lowercased() == "mp4" {
+            throw CLIError.invalid("MP4 会直接混入音频轨，--audio-output 只用于裸流、--stdout 或 --tcp")
+        }
         if command == .record && !o.stdout && o.output == nil && o.tcpHost == nil {
             throw CLIError.invalid("record 需要 --output PATH、--stdout 或 --tcp host:port")
         }
@@ -89,7 +97,7 @@ enum CLIError: Error, CustomStringConvertible {
     case usage, invalid(String), message(String)
     var description: String {
         switch self {
-        case .usage: return "用法：\n  capture-cli list\n  capture-cli record (--display INDEX | --window-id ID) (--output PATH | --stdout | --tcp host:port) [选项]\n\n选项：\n  --fps N                 帧率，默认 30\n  --bitrate BPS          平均码率，默认按分辨率估算\n  --width N --height N   输出尺寸（必须为偶数）\n  --duration SECONDS     录制时长\n  --no-cursor            不捕获鼠标指针\n\n输出格式：\n  --output *.mp4         MP4 视频文件\n  --output *.h264/*.264  Annex-B H.264 裸流文件（包含 SPS/PPS）\n  --stdout               Annex-B H.264 裸流，二进制数据写 stdout，日志写 stderr\n  --tcp host:port        发给 ESP32 的 AirPlay 发送端（长度前缀的访问单元协议）"
+        case .usage: return "用法：\n  capture-cli list\n  capture-cli record (--display INDEX | --window-id ID) (--output PATH | --stdout | --tcp host:port) [选项]\n\n选项：\n  --fps N                 帧率，默认 30\n  --bitrate BPS          平均码率，默认按分辨率估算\n  --width N --height N   输出尺寸（必须为偶数）\n  --duration SECONDS     录制时长\n  --no-cursor            不捕获鼠标指针\n  --audio                 同时采集系统音频（默认关闭，需 macOS 13+）\n  --audio-output PATH     音频单独写成 WAV 文件（裸流/--stdout/--tcp 用；MP4 直接混流）\n\n输出格式：\n  --output *.mp4         MP4 视频文件\n  --output *.h264/*.264  Annex-B H.264 裸流文件（包含 SPS/PPS）\n  --stdout               Annex-B H.264 裸流，二进制数据写 stdout，日志写 stderr\n  --tcp host:port        发给 ESP32 的 AirPlay 发送端（长度前缀的访问单元协议）"
         case .invalid(let s), .message(let s): return s
         }
     }
@@ -298,12 +306,268 @@ final class NetworkSink {
     }
 }
 
+/* MP4 muxing shared by the video and audio paths. AVAssetWriter inputs must be
+ * registered before writing starts, but each input's format is only known with
+ * its first sample buffer. The first encoded video frame often beats the first
+ * audio buffer out of the encoder pipeline, so when audio is expected the early
+ * video frames are held until the audio format arrives, and the session starts
+ * at whichever first timestamp is earlier. */
+final class MP4Muxer {
+    private let url: URL
+    private let audioExpected: Bool
+    private let lock = NSLock()
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
+    private var audioFormat: CMFormatDescription?
+    private var pendingAudio: [CMSampleBuffer] = []
+    private var pendingVideo: [CMSampleBuffer] = []
+    private var finished = false
+    private var failed: Error?
+
+    init(url: URL, audioExpected: Bool = false) { self.url = url; self.audioExpected = audioExpected }
+
+    var error: Error? { lock.lock(); defer { lock.unlock() }; return failed }
+
+    func appendVideo(_ sampleBuffer: CMSampleBuffer, format: CMFormatDescription) {
+        lock.lock(); defer { lock.unlock() }
+        guard !finished else { return }
+        if writer == nil {
+            /* The audio input can only be registered before startWriting, so
+             * hold frames until the audio format is known; give up waiting
+             * after ~5s so a silent stream still produces a video-only file. */
+            if audioExpected, audioFormat == nil, pendingVideo.count < 100 {
+                pendingVideo.append(sampleBuffer)
+                return
+            }
+            do { try start(sampleBuffer: sampleBuffer, format: format) }
+            catch { failed = failed ?? error; finished = true; return }
+        }
+        appendVideoLocked(sampleBuffer)
+    }
+
+    private func appendVideoLocked(_ sampleBuffer: CMSampleBuffer) {
+        guard let videoInput else { return }
+        if videoInput.isReadyForMoreMediaData, !videoInput.append(sampleBuffer) {
+            failed = failed ?? CLIError.message("MP4 视频帧写入失败：\(writer?.error?.localizedDescription ?? "未知错误")")
+        }
+    }
+
+    func appendAudio(_ sampleBuffer: CMSampleBuffer) {
+        lock.lock(); defer { lock.unlock() }
+        guard !finished else { return }
+        if audioFormat == nil { audioFormat = CMSampleBufferGetFormatDescription(sampleBuffer) }
+        guard audioInput != nil else {
+            /* Only worth holding before writing starts; once the writer is up
+             * without an audio input, the file stays video-only. */
+            if writer == nil, pendingAudio.count < 1000 { pendingAudio.append(sampleBuffer) }
+            return
+        }
+        appendAudioLocked(sampleBuffer)
+    }
+
+    func finish() {
+        lock.lock(); defer { lock.unlock() }
+        guard !finished else { return }
+        finished = true
+        guard let writer else { return }
+        videoInput?.markAsFinished()
+        audioInput?.markAsFinished()
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting { semaphore.signal() }
+        semaphore.wait()
+        if writer.status != .completed {
+            failed = failed ?? CLIError.message("MP4 写入失败：\(writer.error?.localizedDescription ?? "未知错误")")
+        }
+    }
+
+    private func appendAudioLocked(_ sampleBuffer: CMSampleBuffer) {
+        guard let audioInput, audioInput.isReadyForMoreMediaData, !audioInput.append(sampleBuffer) else { return }
+        failed = failed ?? CLIError.message("MP4 音频帧写入失败：\(writer?.error?.localizedDescription ?? "未知错误")")
+    }
+
+    private func start(sampleBuffer: CMSampleBuffer, format: CMFormatDescription) throws {
+        try? FileManager.default.removeItem(at: url)
+        let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let video = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+        video.expectsMediaDataInRealTime = true
+        guard assetWriter.canAdd(video) else { throw CLIError.message("MP4 不支持 H.264 视频输入") }
+        assetWriter.add(video)
+        if let audioFormat {
+            /* MP4 has no place for raw PCM, so the audio track is transcoded to
+             * AAC; sample rate and channel count follow the stream. */
+            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?.pointee
+            var settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC]
+            if let asbd {
+                settings[AVSampleRateKey] = asbd.mSampleRate
+                settings[AVNumberOfChannelsKey] = Int(asbd.mChannelsPerFrame)
+            }
+            let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: settings, sourceFormatHint: audioFormat)
+            audio.expectsMediaDataInRealTime = true
+            if assetWriter.canAdd(audio) {
+                assetWriter.add(audio)
+                audioInput = audio
+            } else {
+                fputs("MP4 不支持音频输入，本文件只包含视频\n", stderr)
+            }
+        }
+        guard assetWriter.startWriting() else { throw CLIError.message("无法创建 MP4：\(assetWriter.error?.localizedDescription ?? "未知错误")") }
+        /* Early frames and audio of both kinds may be held back; the session
+         * must start no later than the earliest appended sample. */
+        var sessionStart = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let candidates = pendingVideo.first.map { CMSampleBufferGetPresentationTimeStamp($0) } ?? .invalid
+        let audioPTS = pendingAudio.first.map { CMSampleBufferGetPresentationTimeStamp($0) } ?? .invalid
+        for candidate in [candidates, audioPTS] where candidate.isValid {
+            if CMTimeCompare(candidate, sessionStart) < 0 { sessionStart = candidate }
+        }
+        assetWriter.startSession(atSourceTime: sessionStart)
+        writer = assetWriter
+        videoInput = video
+        for sample in pendingVideo { appendVideoLocked(sample) }
+        pendingVideo.removeAll()
+        for sample in pendingAudio { appendAudioLocked(sample) }
+        pendingAudio.removeAll()
+    }
+}
+
+/* Minimal RIFF/WAVE writer for the 32-bit float PCM ScreenCaptureKit delivers,
+ * accepting both interleaved and non-interleaved buffers. ffmpeg/ffplay read
+ * IEEE-float WAV natively, which makes it the lowest-friction side format for
+ * the raw-stream outputs that cannot carry audio in-band. */
+final class WAVWriter {
+    private let handle: FileHandle
+    private let channels: Int
+    private let nonInterleaved: Bool
+    private var dataBytes = 0
+    private var scratch = Data()
+    private var closed = false
+
+    init?(format: CMFormatDescription, path: String) {
+        guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              asbd.mBitsPerChannel == 32,
+              asbd.mChannelsPerFrame > 0,
+              asbd.mSampleRate > 0 else { return nil }
+        channels = Int(asbd.mChannelsPerFrame)
+        nonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        FileManager.default.createFile(atPath: path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else { return nil }
+        self.handle = handle
+        let sampleRate = UInt32(asbd.mSampleRate)
+        let blockAlign = UInt32(channels) * 4
+        var header = Data()
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
+        header.append(contentsOf: "RIFF".utf8); le32(0); header.append(contentsOf: "WAVE".utf8)
+        header.append(contentsOf: "fmt ".utf8); le32(16); le16(3) /* IEEE float */
+        le16(UInt16(channels)); le32(sampleRate); le32(sampleRate * blockAlign); le16(UInt16(blockAlign)); le16(32)
+        header.append(contentsOf: "data".utf8); le32(0)
+        handle.write(header)
+    }
+
+    func append(_ sampleBuffer: CMSampleBuffer) {
+        guard !closed, let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
+              CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        var length = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil,
+                                          totalLengthOut: &length, dataPointerOut: &pointer) == noErr,
+              let pointer, length > 0 else { return }
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard length == frames * channels * 4 else { return }
+        scratch.removeAll(keepingCapacity: true)
+        if nonInterleaved {
+            /* The block buffer stores channel planes back to back; WAV wants
+             * interleaved samples. */
+            for frame in 0..<frames {
+                for channel in 0..<channels {
+                    scratch.append(Data(bytes: pointer.advanced(by: (channel * frames + frame) * 4), count: 4))
+                }
+            }
+        } else {
+            scratch.append(Data(bytes: pointer, count: length))
+        }
+        dataBytes += scratch.count
+        handle.write(scratch)
+    }
+
+    func finish() {
+        guard !closed else { return }
+        closed = true
+        /* Patch the two little-endian size fields left as zero in the header. */
+        let cap = UInt32(max(0, min(dataBytes, Int(UInt32.max))))
+        for (offset, value) in [(4, cap &+ 36), (40, cap)] {
+            var little = value.littleEndian
+            try? handle.seek(toOffset: UInt64(offset))
+            handle.write(Data(bytes: &little, count: 4))
+        }
+        try? handle.close()
+    }
+}
+
+/* Audio leaves the stream either muxed into the MP4 or, for the outputs that
+ * cannot carry it in-band, written to a standalone WAV file. */
+final class AudioSink {
+    private let muxer: MP4Muxer?
+    private let wavPath: String?
+    private var wav: WAVWriter?
+    private var broken = false
+    private(set) var buffers = 0
+
+    init(muxer: MP4Muxer) { self.muxer = muxer; wavPath = nil }
+    init(wavPath: String) { muxer = nil; self.wavPath = wavPath }
+
+    func append(_ sampleBuffer: CMSampleBuffer) {
+        buffers += 1
+        if let muxer { muxer.appendAudio(sampleBuffer); return }
+        if wav == nil, !broken {
+            guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+                  let writer = WAVWriter(format: format, path: wavPath ?? "") else {
+                broken = true
+                fputs("无法写入音频文件 \(wavPath ?? "?")：需要 32 位浮点 PCM 输入\n", stderr)
+                return
+            }
+            wav = writer
+        }
+        wav?.append(sampleBuffer)
+    }
+
+    func finish() { wav?.finish() }
+}
+
+/* Only instantiated on macOS 13+, where SCStreamOutputType.audio exists. */
+@available(macOS 13.0, *)
+final class AudioCaptureDelegate: NSObject, SCStreamOutput {
+    private let sink: AudioSink
+    private var lastReport = Date()
+    private var announced = false
+
+    init(sink: AudioSink) { self.sink = sink }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio, CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        if !announced {
+            announced = true
+            if let asbd = CMSampleBufferGetFormatDescription(sampleBuffer).flatMap({ CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }) {
+                fputs(String(format: "audio stream connected: %.0f Hz, %d ch, %@\n",
+                             asbd.mSampleRate, asbd.mChannelsPerFrame,
+                             asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 ? "non-interleaved" : "interleaved"), stderr)
+            }
+        }
+        sink.append(sampleBuffer)
+        let now = Date()
+        if now.timeIntervalSince(lastReport) >= 10 {
+            lastReport = now
+            fputs("captured \(sink.buffers) audio buffer(s)\n", stderr)
+        }
+    }
+}
+
 final class H264Encoder {
     private var session: VTCompressionSession?
     private let output: FileHandle?
-    private let mp4URL: URL?
-    private var writer: AVAssetWriter?
-    private var writerInput: AVAssetWriterInput?
+    private let muxer: MP4Muxer?
     private let lock = NSLock()
     private var failed: Error?
     private var frameCount = 0
@@ -311,12 +575,12 @@ final class H264Encoder {
     private let height: Int
     private let network: NetworkSink?
 
-    init(width: Int, height: Int, fps: Int, bitrate: Int, output: FileHandle?, mp4URL: URL? = nil,
+    init(width: Int, height: Int, fps: Int, bitrate: Int, output: FileHandle?, muxer: MP4Muxer? = nil,
          network: NetworkSink? = nil) throws {
-        let sinks = [output != nil, mp4URL != nil, network != nil].filter { $0 }.count
+        let sinks = [output != nil, muxer != nil, network != nil].filter { $0 }.count
         guard sinks == 1 else { throw CLIError.message("必须选择一种输出格式") }
         self.output = output
-        self.mp4URL = mp4URL
+        self.muxer = muxer
         self.network = network
         self.width = width; self.height = height
         var s: VTCompressionSession?
@@ -370,13 +634,7 @@ final class H264Encoder {
 
     func finish() {
         if let session { VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid); VTCompressionSessionInvalidate(session) }
-        if let writer, let writerInput {
-            writerInput.markAsFinished()
-            let semaphore = DispatchSemaphore(value: 0)
-            writer.finishWriting { semaphore.signal() }
-            semaphore.wait()
-            if writer.status != .completed { setFailure(CLIError.message("MP4 写入失败：\(writer.error?.localizedDescription ?? "未知错误")")) }
-        }
+        muxer?.finish()
         try? output?.close()
     }
 
@@ -399,8 +657,9 @@ final class H264Encoder {
             frameCount += 1
             return
         }
-        if let mp4URL {
-            writeMP4(sampleBuffer, format: format, url: mp4URL)
+        if let muxer {
+            muxer.appendVideo(sampleBuffer, format: format)
+            frameCount += 1
             return
         }
         guard let output, let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
@@ -422,28 +681,6 @@ final class H264Encoder {
             var parameter: UnsafePointer<UInt8>?; var size = 0; var count = 0
             guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &parameter, parameterSetSizeOut: &size, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil) == noErr, let parameter else { continue }
             output?.write(Data([0, 0, 0, 1])); output?.write(Data(bytes: parameter, count: size))
-        }
-    }
-
-    private func writeMP4(_ sampleBuffer: CMSampleBuffer, format: CMFormatDescription, url: URL) {
-        if writer == nil {
-            do {
-                try? FileManager.default.removeItem(at: url)
-                let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mp4)
-                let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
-                input.expectsMediaDataInRealTime = true
-                guard assetWriter.canAdd(input) else { throw CLIError.message("MP4 不支持 H.264 视频输入") }
-                assetWriter.add(input)
-                guard assetWriter.startWriting() else { throw CLIError.message("无法创建 MP4：\(assetWriter.error?.localizedDescription ?? "未知错误")") }
-                assetWriter.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-                writer = assetWriter
-                writerInput = input
-            } catch { setFailure(error); return }
-        }
-        guard let writerInput else { return }
-        if writerInput.isReadyForMoreMediaData {
-            guard writerInput.append(sampleBuffer) else { setFailure(CLIError.message("MP4 视频帧写入失败：\(writer?.error?.localizedDescription ?? "未知错误")")); return }
-            frameCount += 1
         }
     }
 }
@@ -504,6 +741,17 @@ func makeTarget(_ options: Options, content: SCShareableContent) throws -> Targe
     throw CLIError.invalid("找不到目标窗口；请先运行 list，确认窗口 ID 仍有效")
 }
 
+/* MP4 takes the audio as a second track; every other output needs a standalone
+ * WAV file, whose path either comes from --audio-output or is derived from the
+ * video file name. */
+func makeAudioSink(_ options: Options, muxer: MP4Muxer?, outputURL: URL?) throws -> AudioSink? {
+    guard options.audio else { return nil }
+    if let muxer { return AudioSink(muxer: muxer) }
+    if let explicit = options.audioOutput { return AudioSink(wavPath: explicit) }
+    guard let outputURL else { throw CLIError.invalid("--audio 配合 --stdout 或 --tcp 时需要 --audio-output PATH 指定 WAV 文件") }
+    return AudioSink(wavPath: outputURL.deletingPathExtension().appendingPathExtension("wav").path)
+}
+
 func record(_ options: Options, content: SCShareableContent) async throws {
     /* Window filters go through the drawing-system initialisation that an
      * application normally performs at launch; without it ScreenCaptureKit
@@ -526,18 +774,33 @@ func record(_ options: Options, content: SCShareableContent) async throws {
         try NetworkSink(host: $0, port: options.tcpPort!, width: target.width, height: target.height,
                         fps: options.fps)
     }
+    let muxer = isMP4 ? MP4Muxer(url: outputURL!, audioExpected: options.audio) : nil
+    let audioSink = try makeAudioSink(options, muxer: muxer, outputURL: outputURL)
     let encoder = try H264Encoder(width: target.width, height: target.height, fps: options.fps,
                                   bitrate: bitrate, output: output,
-                                  mp4URL: isMP4 ? outputURL : nil, network: network)
+                                  muxer: muxer, network: network)
     let delegate = CaptureDelegate(encoder: encoder)
     let config = SCStreamConfiguration()
     config.width = target.width; config.height = target.height
     config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(options.fps))
     config.queueDepth = 3; config.pixelFormat = kCVPixelFormatType_32BGRA; config.showsCursor = options.showCursor
-    if #available(macOS 13.0, *) { config.capturesAudio = false }
+    if #available(macOS 13.0, *) {
+        config.capturesAudio = options.audio
+        if options.audio { config.sampleRate = 48000; config.channelCount = 2 }
+    }
     let stream = SCStream(filter: target.filter, configuration: config, delegate: StreamDelegate())
     try stream.addStreamOutput(delegate, type: .screen, sampleHandlerQueue: DispatchQueue(label: "capture-cli.encode"))
-    fputs("recording \(target.label) \(target.width)x\(target.height) @ \(options.fps) fps; Ctrl-C to stop\n", stderr)
+    let audioKeepAlive: [SCStreamOutput]
+    if let sink = audioSink {
+        guard #available(macOS 13.0, *) else { throw CLIError.message("--audio 需要 macOS 13 或更高版本") }
+        let delegate = AudioCaptureDelegate(sink: sink)
+        try stream.addStreamOutput(delegate, type: .audio,
+                                   sampleHandlerQueue: DispatchQueue(label: "capture-cli.audio"))
+        audioKeepAlive = [delegate]
+    } else {
+        audioKeepAlive = []
+    }
+    fputs("recording \(target.label) \(target.width)x\(target.height) @ \(options.fps) fps\(audioKeepAlive.isEmpty ? "" : " + audio"); Ctrl-C to stop\n", stderr)
     try await stream.startCapture()
     fputs("capture started\n", stderr)
     if let duration = options.duration {
@@ -551,8 +814,9 @@ func record(_ options: Options, content: SCShareableContent) async throws {
         }
         signalSource.cancel()
     }
-    try? await stream.stopCapture(); encoder.finish()
-    if let error = encoder.error { throw error }
+    try? await stream.stopCapture(); encoder.finish(); audioSink?.finish()
+    if let sink = audioSink { fputs("audio: \(sink.buffers) buffer(s) captured\n", stderr) }
+    if let error = encoder.error ?? muxer?.error { throw error }
 }
 
 @main struct CaptureCLI {
