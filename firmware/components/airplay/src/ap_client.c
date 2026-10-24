@@ -192,6 +192,19 @@ static bool header_name_is(const char *line, size_t name_len, const char *want)
     return true;
 }
 
+/* Bounded string copy that always terminates. The digest headers are shorter
+ * than the parser's scratch buffer, but the boundary belongs here rather than
+ * in a format string the compiler cannot reason about. */
+static void copy_truncated(char *dst, size_t cap, const char *src)
+{
+    if (cap == 0) {
+        return;
+    }
+    size_t len = strnlen(src, cap - 1);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 static bool parse_challenge_params(const char *params, char *realm, size_t realm_cap, char *nonce,
                                    size_t nonce_cap)
 {
@@ -236,10 +249,10 @@ static bool parse_challenge_params(const char *params, char *realm, size_t realm
         value[value_len] = '\0';
 
         if (name_len == 5 && header_name_is(name, name_len, "realm")) {
-            snprintf(realm, realm_cap, "%s", value);
+            copy_truncated(realm, realm_cap, value);
             have_realm = true;
         } else if (name_len == 5 && header_name_is(name, name_len, "nonce")) {
-            snprintf(nonce, nonce_cap, "%s", value);
+            copy_truncated(nonce, nonce_cap, value);
             have_nonce = true;
         }
     }

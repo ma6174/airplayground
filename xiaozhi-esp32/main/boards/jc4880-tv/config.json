@@ -1,0 +1,18 @@
+{
+    "target": "esp32p4",
+    "type": "jc4880-tv",
+    "manufacturer": "jc",
+    "builds": [
+        {
+            "name": "jc4880-tv",
+            "sdkconfig_append": [
+                "CONFIG_SLAVE_IDF_TARGET_ESP32C6=y",
+                "CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y",
+                "CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y",
+                "CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y",
+                "CONFIG_ESP32P4_REV_MIN_100=y",
+                "CONFIG_BOARD_TYPE_JC4880_TV=y"
+            ]
+        }
+    ]
+}

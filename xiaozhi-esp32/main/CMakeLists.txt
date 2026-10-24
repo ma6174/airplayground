@@ -17,6 +17,7 @@ set(SOURCES "audio/audio_codec.cc"
             "display/display.cc"
             "display/text_glyph.cc"
             "display/lcd_display.cc"
+            "display/virtual_display.cc"
             "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
             "display/emote_display.cc"
@@ -40,6 +41,8 @@ set(SOURCES "audio/audio_codec.cc"
             "settings.cc"
             "device_state_machine.cc"
             "assets.cc"
+            "airplay/airplay_service.cc"
+            "airplay/airplay_http.cc"
             "main.cc"
             )
 
@@ -583,6 +586,11 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_TOUCH_LCD_10_1)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
 elseif(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
     set(BOARD_DIR "espressif/esp32-p4-function-ev-board")
+elseif(CONFIG_BOARD_TYPE_JC4880_TV)
+    set(BOARD_DIR "jc4880-tv")
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_30_4)
+    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
 elseif(CONFIG_BOARD_TYPE_ESP32_S31_FUNCTION_COREBOARD_1)
     set(BOARD_DIR "espressif/esp32-s31-function-coreboard-1")
 elseif(CONFIG_BOARD_TYPE_ESP32_S31_KORVO_1)
@@ -1146,6 +1154,10 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         xiaozhi-fonts
+                        airplay
+                        media
+                        espressif__esp_h264
+                        esp_http_server
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

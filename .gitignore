@@ -17,3 +17,6 @@ firmware/.cache/
 firmware/components/*/test/build/
 __pycache__/
 *.pyc
+
+# xiaozhi headless TV build output
+xiaozhi-esp32/build-tv/

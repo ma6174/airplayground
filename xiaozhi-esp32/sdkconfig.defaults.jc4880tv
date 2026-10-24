@@ -1,0 +1,10 @@
+# Board overrides for JC4880P443C_I_W running headless with an AirPlay "TV"
+# display. Build with:
+#   idf.py -B build-tv -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32p4;sdkconfig.defaults.jc4880tv" build
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_BOARD_TYPE_JC4880_TV=y
+CONFIG_AIRPLAY_DEFAULT_HOST=""
