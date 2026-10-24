@@ -87,6 +87,19 @@ typedef struct {
 } ap_legacy_setup1_t;
 
 size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t *setup);
-/* SETUP 2 body: streams[{type:110, streamConnectionID}]. A mirroring session
- * declares the video stream and nothing else, exactly like iOS. */
-size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id);
+/* SETUP 2 body: streams[{type:110, streamConnectionID}] and, when the session
+ * feeds one, the type 96 audio stream that makes the receiver allocate an audio
+ * dataPort. */
+size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, bool with_audio,
+                              uint16_t audio_control_port, uint16_t audio_spf);
+
+/* The two stream-key candidates for the audio channel: as it is, and mixed with
+ * an all-zero secret (what a receiver that never paired derives). */
+void ap_legacy_audio_keys(const uint8_t stream_key[16], uint8_t bare[16], uint8_t mixed[16]);
+
+/* One audio packet: 12-byte RTP header, then the encoded frame with its
+ * 16-byte-aligned head CBC-encrypted. The tail travels in the clear, which is
+ * what the receivers' decoders expect (RPiPlay lib/raop_buffer.c:158-182). */
+int ap_legacy_build_audio(uint8_t *out, size_t cap, uint16_t seq, uint32_t timestamp,
+                          const uint8_t *frame, size_t frame_len, const uint8_t key[16],
+                          const uint8_t iv[16]);

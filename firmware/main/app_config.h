@@ -106,6 +106,13 @@
 #endif
 
 /* Send the SPS/PPS in-band with every legacy sync frame. */
+/* Samples per audio packet: 8 ms of sound, small enough to stay inside one
+ * datagram. The SETUP declares it, because the receiver schedules playback from
+ * the sample count and the RTP timestamps both. */
+#ifndef APP_AUDIO_SPF
+#define APP_AUDIO_SPF 352
+#endif
+
 #ifndef APP_LEGACY_INBAND_SPS
 #define APP_LEGACY_INBAND_SPS 1
 #endif

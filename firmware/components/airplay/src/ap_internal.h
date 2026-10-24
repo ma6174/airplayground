@@ -15,12 +15,16 @@
 #include "airplay.h"
 #include "ap_client.h"
 
-/* Audio is filler that keeps the channel alive: one packet every 20 ms, which
- * is 882 samples at the 44.1 kHz rate the audio stream is declared with. The
- * RTP timestamp has to advance by that many samples, and start on the same
- * clock the video timestamps use: a receiver that schedules video against the
- * audio playhead holds the picture back forever when the two clocks disagree
- * by the age of the device. */
+/* The legacy audio stream is declared at this rate, so one packet of spf
+ * samples is spf/44100 s of playback and the RTP timestamp advances by spf. It
+ * starts on the same clock the video timestamps use: a receiver that schedules
+ * video against the audio playhead holds the picture back forever when the two
+ * clocks disagree by the age of the device. */
+#define AP_LEGACY_AUDIO_RATE 44100u
+/* Room for one audio frame on the stack: a 4096-sample stereo frame can reach
+ * 20 KB once the encoder is done with it. */
+#define AP_AUDIO_FRAME_MAX (24u * 1024u)
+
 #include "ap_data.h"
 #include "ap_event.h"
 #include "ap_legacy.h"
@@ -94,6 +98,18 @@ typedef struct ap_session {
     uint8_t legacy_skey[16];
     uint8_t legacy_siv[16];
     ap_legacy_ctr_t legacy_ctr;
+    /* Audio side of a legacy session: the port the receiver allocated for it,
+     * the two stream-key candidates, and the packet clock. */
+    uint16_t legacy_audio_port;
+    int legacy_audio_fd;
+    uint8_t legacy_audio_keys[2][16];
+    uint16_t legacy_audio_seq;
+    uint32_t legacy_audio_rtp_time;
+    uint64_t legacy_audio_started_ms;
+    uint64_t legacy_audio_packets;
+    uint64_t legacy_audio_late_max;
+    uint64_t legacy_audio_late_count;
+    uint64_t legacy_audio_gaps;
     /* 0: receiver handed out a dataPort; 1-4: see legacy_data_mode. */
     uint8_t legacy_transport;
     /* RECORD already went out in the legacy front half. */

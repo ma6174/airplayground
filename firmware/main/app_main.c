@@ -24,6 +24,7 @@
 #include "nvs_flash.h"
 #include "pin_fetch.h"
 #include "pin_server.h"
+#include "tone.h"
 #include "wifi_net.h"
 
 static const char *TAG = "app";
@@ -100,6 +101,27 @@ static void session_task(void *argument)
     }
 }
 
+/* Which stream-key candidate the audio channel uses: the bare key (what the
+ * video path uses on this class of receiver) or the one mixed with an all-zero
+ * secret. */
+static bool s_audio_mixed;
+
+/* One ALAC frame per call, straight from the capture client. An empty queue
+ * returns nothing, which keeps the timeline moving without inventing audio. */
+static size_t network_audio_frame(void *ctx, ap_audio_frame_t *frame)
+{
+    (void)ctx;
+    size_t len = 0;
+    const uint8_t *data = media_net_audio(&len);
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+    frame->data = data;
+    frame->len = len;
+    frame->mixed_key = s_audio_mixed;
+    return len;
+}
+
 static const char *hook_start(const pin_start_request_t *request)
 {
     if (airplay_is_running()) {
@@ -116,6 +138,10 @@ static const char *hook_start(const pin_start_request_t *request)
     s_config.legacy_pairing = APP_LEGACY_PAIRING != 0;
     s_config.legacy_inband_sps = APP_LEGACY_INBAND_SPS != 0;
     s_config.frame_interval_ms = APP_FRAME_INTERVAL_MS;
+    s_config.legacy_audio = false;
+    s_config.legacy_audio_spf = 0;
+    s_config.legacy_audio_frame = NULL;
+    s_config.legacy_audio_ctx = NULL;
     if (request->data_mode >= 0) {
         s_config.legacy_data_mode = (uint8_t)request->data_mode;
     }
@@ -133,6 +159,19 @@ static const char *hook_start(const pin_start_request_t *request)
     }
     if (request->sps >= 0) {
         s_config.legacy_inband_sps = request->sps != 0;
+    }
+    s_audio_mixed = request->amix > 0;
+    if (request->audio == 1) {
+        /* Real audio: the capture client sends ALAC frames alongside the video. */
+        s_config.legacy_audio = true;
+        s_config.legacy_audio_spf = APP_AUDIO_SPF;
+        s_config.legacy_audio_frame = network_audio_frame;
+    } else if (request->audio == 2) {
+        /* Test tone: tells the two stream-key candidates apart by ear. */
+        legacy_tone_reset();
+        s_config.legacy_audio = true;
+        s_config.legacy_audio_spf = TONE_FRAME_SAMPLES;
+        s_config.legacy_audio_frame = legacy_tone_frame;
     }
     if (request->interval_ms > 0) {
         s_config.frame_interval_ms = (uint32_t)request->interval_ms;

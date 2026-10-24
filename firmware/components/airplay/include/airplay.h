@@ -52,6 +52,17 @@ typedef struct {
     void *user;
 } airplay_live_source_t;
 
+/* One encoded audio frame for the legacy audio channel: the payload of a single
+ * RTP packet, in the codec the SETUP declared (ALAC, spf samples per packet). */
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+    /* Receivers either use the stream key as it is or mix it with a secret
+     * first (all zeros when the session never paired), so the source decides
+     * which candidate this frame goes out under. */
+    bool mixed_key;
+} ap_audio_frame_t;
+
 typedef struct {
     const char *host;
     uint16_t port;
@@ -101,6 +112,14 @@ typedef struct {
      * no pairing at all, and receivers that key the stream off the pairing
      * secret break when one did happen. */
     bool legacy_pairing;
+    /* Audio channel: declare a type 96 stream in SETUP 2 with spf samples per
+     * packet, and feed it one frame per packet from audio_frame. A receiver
+     * that gets no frame plays nothing, which beats a made-up payload: the
+     * payload has to be a real encoded frame or the speaker plays noise. */
+    bool legacy_audio;
+    uint16_t legacy_audio_spf;
+    size_t (*legacy_audio_frame)(void *ctx, ap_audio_frame_t *frame);
+    void *legacy_audio_ctx;
 } airplay_config_t;
 
 /* Runs one mirroring session: pair, FairPlay, SETUP, stream still images until
