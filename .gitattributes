@@ -1,0 +1,3 @@
+# Third-party source snapshots kept verbatim in this repository.
+# Marking them vendored keeps them out of language statistics and diff review noise.
+xiaozhi-esp32/** linguist-vendored=true
