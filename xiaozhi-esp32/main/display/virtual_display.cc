@@ -27,6 +27,8 @@ LV_FONT_DECLARE(font_noto_sans_basic_14_1);
 static constexpr int kContentMarginX = 32;
 static constexpr int kContentMarginY = 20;
 static constexpr int kContentLineSpace = 4;
+/* How long each page of a long text stays up. */
+static constexpr uint32_t kPagePeriodUs = 4000000;
 
 bool ParseHexColor(const char* text, lv_color_t* color) {
     if (text == nullptr || color == nullptr) {
@@ -58,6 +60,67 @@ bool ParseHexColor(const char* text, lv_color_t* color) {
         return false;
     }
     *color = lv_color_hex(value);
+    return true;
+}
+
+/* Decodes one UTF-8 sequence, U+FFFD for anything malformed. */
+static size_t Utf8Next(const char* text, uint32_t* codepoint) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text);
+    *codepoint = 0xfffdu;
+    if (bytes[0] < 0x80) {
+        *codepoint = bytes[0];
+        return bytes[0] == 0 ? 0 : 1;
+    }
+    size_t width = 0;
+    uint32_t value = 0;
+    if (bytes[0] >= 0xc2 && bytes[0] <= 0xdf) {
+        width = 2;
+        value = bytes[0] & 0x1f;
+    } else if (bytes[0] >= 0xe0 && bytes[0] <= 0xef) {
+        width = 3;
+        value = bytes[0] & 0x0f;
+    } else if (bytes[0] >= 0xf0 && bytes[0] <= 0xf4) {
+        width = 4;
+        value = bytes[0] & 0x07;
+    } else {
+        return 1;
+    }
+    for (size_t i = 1; i < width; i++) {
+        if (bytes[i] == 0) {
+            return i;
+        }
+        value = (value << 6) | (bytes[i] & 0x3f);
+    }
+    *codepoint = value;
+    return width;
+}
+
+/* True when this font itself has a glyph for every character of the text.
+ *
+ * The built-in CJK faces carry only the common characters, and a character they
+ * miss is drawn from the fallback chain - which is a different size. That is how
+ * one line ended up with two text sizes, so a face is only usable when it covers
+ * the whole string.
+ */
+static bool FontCoversText(const lv_font_t* font, const char* text) {
+    if (font == nullptr || font->get_glyph_dsc == nullptr) {
+        return false;
+    }
+    for (const char* cursor = text; *cursor != '\0';) {
+        uint32_t codepoint = 0;
+        const size_t width = Utf8Next(cursor, &codepoint);
+        if (width == 0) {
+            break;
+        }
+        cursor += width;
+        if (codepoint == '\n' || codepoint == '\r' || codepoint == ' ') {
+            continue;
+        }
+        lv_font_glyph_dsc_t glyph{};
+        if (!font->get_glyph_dsc(font, &glyph, codepoint, 0) || glyph.is_placeholder) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -98,6 +161,11 @@ VirtualDisplay::VirtualDisplay(int width, int height, int fps) : fps_(fps) {
 }
 
 VirtualDisplay::~VirtualDisplay() {
+    if (page_timer_ != nullptr) {
+        esp_timer_stop(page_timer_);
+        esp_timer_delete(page_timer_);
+        page_timer_ = nullptr;
+    }
     if (framebuffer_ != nullptr) {
         heap_caps_free(framebuffer_);
         framebuffer_ = nullptr;
@@ -309,20 +377,48 @@ const lv_font_t* VirtualDisplay::SelectContentFont(const std::string& text,
     if (large == nullptr) {
         large = &medium_font_;
     }
+    const lv_font_t* requested = nullptr;
     switch (size) {
         case DisplayTextStyle::kLarge:
-            return large;
+            requested = large;
+            break;
         case DisplayTextStyle::kMedium:
-            return &medium_font_;
+            requested = &medium_font_;
+            break;
         case DisplayTextStyle::kSmall:
-            return &small_font_;
+            requested = &small_font_;
+            break;
         case DisplayTextStyle::kAuto:
         default:
             break;
     }
-    /* Auto: the largest face whose wrapped text still fits the screen. */
+    if (requested != nullptr) {
+        /* An explicit size is a preference: keep the one-size-per-screen rule
+         * and take the closest face that can actually draw the whole text. */
+        if (FontCoversText(requested, text.c_str())) {
+            return requested;
+        }
+        const lv_font_t* const faces[] = {large, &medium_font_, &small_font_};
+        for (const lv_font_t* candidate : faces) {
+            if (FontCoversText(candidate, text.c_str())) {
+                return candidate;
+            }
+        }
+        return large;
+    }
+    /* Auto: shrink only to a face that can draw every character at one size. A
+     * character outside the built-in charset comes from the fallback chain at the
+     * UI font's size, so mixing faces inside one label shows up as two text sizes
+     * on one line. Text too long for the chosen face is paged, not clipped. */
     const lv_font_t* candidates[] = {large, &medium_font_, &small_font_};
+    const lv_font_t* largest_covering = nullptr;
     for (const lv_font_t* candidate : candidates) {
+        if (!FontCoversText(candidate, text.c_str())) {
+            continue;
+        }
+        if (largest_covering == nullptr) {
+            largest_covering = candidate;
+        }
         lv_point_t measured{};
         lv_txt_get_size(&measured, text.c_str(), candidate, 0, kContentLineSpace,
                         width_ - 2 * kContentMarginX, LV_TEXT_FLAG_NONE);
@@ -330,7 +426,132 @@ const lv_font_t* VirtualDisplay::SelectContentFont(const std::string& text,
             return candidate;
         }
     }
-    return &small_font_;
+    if (largest_covering != nullptr) {
+        return largest_covering;
+    }
+    /* Nothing covers it: the UI face renders those characters itself (the display
+     * can fetch missing glyphs), and every glyph then has the same size. */
+    return large;
+}
+
+/* A page break is taken after a character it is natural to pause at. */
+static bool IsBreakCharacter(const std::string& text, size_t end) {
+    if (end == 0 || end > text.size()) {
+        return false;
+    }
+    const char last = text[end - 1];
+    if (last == '\n' || last == ' ' || last == ',' || last == '.' || last == ';' ||
+        last == ':' || last == '!') {
+        return true;
+    }
+    /* The third byte of \u3002 \u3001 \uff0c \uff1b \uff1a \uff01 \uff1f \uff1f */
+    if (end < 3) {
+        return false;
+    }
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text.c_str() + end - 3);
+    if (bytes[0] == 0xe3 && bytes[1] == 0x80 && (bytes[2] == 0x82 || bytes[2] == 0x81)) {
+        return true;
+    }
+    return bytes[0] == 0xef && bytes[1] == 0xbc &&
+           (bytes[2] == 0x8c || bytes[2] == 0x9b || bytes[2] == 0x9a || bytes[2] == 0x81 ||
+            bytes[2] == 0x9f);
+}
+
+void VirtualDisplay::SplitPages(const std::string& text, const lv_font_t* font) {
+    constexpr size_t kMaxPages = 8;
+    const int32_t width = width_ - 2 * kContentMarginX;
+    const int32_t height = height_ - 2 * kContentMarginY;
+
+    size_t start = 0;
+    while (start < text.size() && pages_.size() < kMaxPages) {
+        const std::string rest = text.substr(start);
+        lv_point_t measured{};
+        lv_txt_get_size(&measured, rest.c_str(), font, 0, kContentLineSpace, width,
+                        LV_TEXT_FLAG_NONE);
+        if (measured.y <= height) {
+            pages_.push_back(rest);
+            return;
+        }
+        /* Longest prefix that still fits, then back off to a natural break. */
+        size_t low = 1;
+        size_t high = rest.size();
+        while (low < high) {
+            const size_t middle = low + (high - low + 1) / 2;
+            const std::string candidate = rest.substr(0, middle);
+            lv_txt_get_size(&measured, candidate.c_str(), font, 0, kContentLineSpace, width,
+                            LV_TEXT_FLAG_NONE);
+            if (measured.y <= height) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        size_t cut = low;
+        /* Never split a UTF-8 sequence. */
+        while (cut > 1 && (static_cast<unsigned char>(rest[cut]) & 0xc0) == 0x80) {
+            cut--;
+        }
+        for (size_t i = cut; i > cut / 2; i--) {
+            if (IsBreakCharacter(rest, i)) {
+                cut = i;
+                break;
+            }
+        }
+        if (cut == 0) {
+            cut = low;
+        }
+        pages_.push_back(rest.substr(0, cut));
+        start += cut;
+    }
+    if (start < text.size()) {
+        ESP_LOGW(TAG, "text is longer than %u pages, the rest is dropped",
+                 (unsigned)kMaxPages);
+    }
+}
+
+void VirtualDisplay::ShowPage() {
+    if (content_label_ == nullptr || pages_.empty() || page_index_ >= pages_.size()) {
+        return;
+    }
+    lv_label_set_text(content_label_, pages_[page_index_].c_str());
+}
+
+void VirtualDisplay::UpdatePageTimer() {
+    const bool wanted = pages_.size() > 1;
+    if (!wanted) {
+        if (page_timer_ != nullptr) {
+            esp_timer_stop(page_timer_);
+        }
+        page_index_ = 0;
+        return;
+    }
+    if (page_timer_ == nullptr) {
+        const esp_timer_create_args_t args = {
+            .callback = VirtualDisplay::PageTimer,
+            .arg = this,
+            .name = "text_pages",
+        };
+        if (esp_timer_create(&args, &page_timer_) != ESP_OK) {
+            page_timer_ = nullptr;
+            return;
+        }
+    }
+    esp_timer_stop(page_timer_);
+    esp_timer_start_periodic(page_timer_, kPagePeriodUs);
+}
+
+/* Runs on the timer task: holds the render lock while touching LVGL. */
+void VirtualDisplay::PageTimer(void* arg) {
+    auto* self = static_cast<VirtualDisplay*>(arg);
+    if (self == nullptr || self->pages_.size() < 2) {
+        return;
+    }
+    self->LockRender();
+    self->page_index_ = (self->page_index_ + 1) % self->pages_.size();
+    if (self->content_active_) {
+        self->ShowPage();
+    }
+    self->UnlockRender();
 }
 
 void VirtualDisplay::ApplyContentStyle() {
@@ -363,8 +584,22 @@ void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& s
     content_active_ = !text.empty();
     if (content_active_) {
         content_font_ = SelectContentFont(text, style.size);
-        lv_label_set_text(content_label_, text.c_str());
+        pages_.clear();
+        page_index_ = 0;
+        const int32_t width = width_ - 2 * kContentMarginX;
+        const int32_t height = height_ - 2 * kContentMarginY;
+        lv_point_t measured{};
+        lv_txt_get_size(&measured, text.c_str(), content_font_, 0, kContentLineSpace, width,
+                        LV_TEXT_FLAG_NONE);
+        if (measured.y > height) {
+            SplitPages(text, content_font_);
+        }
+        if (pages_.empty()) {
+            pages_.push_back(text);
+        }
+        ShowPage();
         ApplyContentStyle();
+        UpdatePageTimer();
         lv_obj_remove_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
         for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
             if (label != nullptr) {
@@ -374,6 +609,9 @@ void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& s
         return;
     }
 
+    pages_.clear();
+    page_index_ = 0;
+    UpdatePageTimer();
     lv_obj_add_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
     for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
         if (label != nullptr) {
