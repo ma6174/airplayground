@@ -11,6 +11,6 @@ CFLAGS="-std=c99 -Wall -Wextra -Werror -I../include"
 
 mkdir -p build
 
-$CC $CFLAGS -o build/test_media test_media.c ../src/media_avcc.c ../src/media_pattern.c
+$CC $CFLAGS -o build/test_media test_media.c ../src/media_avcc.c ../src/media_pattern.c ../src/media_text.c
 
 ./build/test_media

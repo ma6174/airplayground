@@ -252,6 +252,37 @@ static esp_err_t handle_forget(httpd_req_t *request)
     return httpd_resp_send(request, s_hooks.forget(name), HTTPD_RESP_USE_STRLEN);
 }
 
+/* /text: with ?msg= the live source shows that string (UTF-8, percent-encoded
+ * values expand 3x, so the raw buffer fits a full media_text_set payload);
+ * without it the endpoint reports the current text. */
+static esp_err_t handle_text(httpd_req_t *request)
+{
+    httpd_resp_set_type(request, "text/plain");
+    if (s_hooks.text == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "text source not wired up\n");
+    }
+
+    char query[512];
+    char value[384];
+    bool has_msg = false;
+    esp_err_t err = httpd_req_get_url_query_str(request, query, sizeof(query));
+    if (err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "text is too long\n");
+    }
+    if (err == ESP_OK) {
+        err = httpd_query_key_value(query, "msg", value, sizeof(value));
+        if (err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "text is too long\n");
+        }
+        if (err == ESP_OK) {
+            url_decode(value);
+            has_msg = true;
+        }
+    }
+    return httpd_resp_send(request, s_hooks.text(has_msg ? value : NULL), HTTPD_RESP_USE_STRLEN);
+}
+
  esp_err_t pin_server_start(void)
 {
     if (s_server != NULL) {
@@ -269,6 +300,9 @@ static esp_err_t handle_forget(httpd_req_t *request)
     config.max_open_sockets = 2;
     /* /start and /targets run the receiver browse on this task. */
     config.stack_size = 6144;
+    /* Nine endpoints are registered below (the /text pair counts twice, once
+     * per method); the default limit is 8 and the overflow fails silently. */
+    config.max_uri_handlers = 10;
 
     esp_err_t err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
@@ -282,6 +316,8 @@ static esp_err_t handle_forget(httpd_req_t *request)
     httpd_uri_t start = {.uri = "/start", .method = HTTP_GET, .handler = handle_start};
     httpd_uri_t targets = {.uri = "/targets", .method = HTTP_GET, .handler = handle_targets};
     httpd_uri_t forget = {.uri = "/forget", .method = HTTP_GET, .handler = handle_forget};
+    httpd_uri_t text_get = {.uri = "/text", .method = HTTP_GET, .handler = handle_text};
+    httpd_uri_t text_post = {.uri = "/text", .method = HTTP_POST, .handler = handle_text};
     httpd_uri_t stop = {.uri = "/stop", .method = HTTP_GET,
                         .handler = handle_session, .user_ctx = "stop"};
     httpd_uri_t status = {.uri = "/status", .method = HTTP_GET,
@@ -291,9 +327,11 @@ static esp_err_t handle_forget(httpd_req_t *request)
     httpd_register_uri_handler(s_server, &start);
     httpd_register_uri_handler(s_server, &targets);
     httpd_register_uri_handler(s_server, &forget);
+    httpd_register_uri_handler(s_server, &text_get);
+    httpd_register_uri_handler(s_server, &text_post);
     httpd_register_uri_handler(s_server, &stop);
     httpd_register_uri_handler(s_server, &status);
-    ESP_LOGI(TAG, "pairing page on http://<device>:%d/ (also /targets /start /stop /status)",
+    ESP_LOGI(TAG, "pairing page on http://<device>:%d/ (also /targets /start /stop /status /text)",
              PIN_SERVER_PORT);
     return ESP_OK;
 }

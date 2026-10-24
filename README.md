@@ -25,12 +25,14 @@ ESP32-S3 没有硬件 H.264 编码器，官方 `esp_h264` 软编（OpenH264）�
   - `media_net`（网络源）：接收 macOS 侧 `capture-cli` 用 ScreenCaptureKit +
     VideoToolbox 编好的访问单元，芯片只做加密和转发，因此可以投 960x682 甚至更高的
     真实屏幕内容；
-  - `media_live`（片上编码）：内置动画测试图案 → OpenH264 → Annex-B → AVCC 重封装。
+  - `media_live`（片上编码）：内置动画测试图案或纯文字画面 → OpenH264 → Annex-B →
+    AVCC 重封装。文字画面见下面的「文字显示」。
 - **静态帧源**（`airplay_frames_t`）：回放编译期用 x264 编好、烧在 flash 里的访问单元
   （`tools/make_frames.py`），720p、字迹清晰，不占运行内存。
 
-选择顺序：有 `capture-cli` 连上来并发了配置 → 网络源；否则片上编码可用 → 测试图案；
-否则静态帧。每次 `/start` 都重新选，`/status` 前的日志会打印 `video source: ...`。
+选择顺序：有 `capture-cli` 连上来并发了配置 → 网络源；否则片上编码可用 → 测试图案（设置
+了文字则是文字画面）；否则静态帧。每次 `/start` 都重新选，`/status` 前的日志会打印
+`video source: ...`。
 
 每个新会话开始时 live 源重建编码器：接收端拿到的第一帧必定是带新 SPS/PPS 的 IDR，
 无论设备之前闲置多久。网络源没有自己的编码器，它在会话开始时跳过队列直到下一个 IDR
@@ -115,9 +117,29 @@ curl 'http://<设备IP>:8080/start?name=Living%20Room'  # 按名字连（大小�
 curl http://<设备IP>:8080/start?host=192.168.1.35     # 按地址连，临时覆盖默认目标
 curl http://<设备IP>:8080/stop     # 礼貌断开（向接收端发 TEARDOWN）
 curl http://<设备IP>:8080/status   # idle / mirroring / 上次会话的结束原因
+curl 'http://<设备IP>:8080/text?msg=你好世界'  # 纯文字画面（UTF-8；超宽自动跑马灯滚动）
+curl http://<设备IP>:8080/text     # 查看当前文字（无文字则显示测试图案）
+curl 'http://<设备IP>:8080/text?msg='  # 清空文字，回到测试图案
 ```
 
 配对码的三条投递通道见 [docs/runbook.md](docs/runbook.md)。
+
+### 3.1 文字显示
+
+`/text` 设置的文字会替代测试图案成为 live 源的画面：黑底白字、单行、
+`POST`/`GET` 均可，运行时随时改，投屏中也能改。规则：
+
+- **字符集**：可打印 ASCII + GB2312 一级常用字（~3500 汉字）+ 全角标点，共 3944 字形，
+  18x20 点阵、4bpp 覆盖率抗锯齿、比例字宽（Latin 不再等宽），字重 500，编译自
+  Noto Sans SC（OFL 许可）。字库 `font16.bin`（~720 KB）已提交进仓库，固件映射 flash
+  零 RAM 成本；要换字体/字重/字符集用 `tools/make_font.py`（`--font --out --weight`）
+  重新生成。
+- **排版**：能放进画面（320 宽，约 17 个汉字）就居中静止；放不下就从右往左
+  跑马灯滚动（20 px/s），循环之间隔一个画面宽的空档。只支持单行。
+- **越界字符**：字库没有的码点（如 emoji）直接跳过不占位；非法 UTF-8 字节安全跳过；
+  最长 127 字节，超长返回 `text does not fit`。
+- **已知限制**：改字不会强制收端刷 IDR，若恰在会话中途改字，旧画面的残影最长
+  随一个 GOP（6 s）才完全消散；投屏前先 `/text` 再 `/start` 则无此问题。
 
 ### 4. 投 Mac 的屏幕或某个窗口
 

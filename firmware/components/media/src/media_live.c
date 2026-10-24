@@ -12,6 +12,7 @@
 #include "airplay.h"
 #include "media_avcc.h"
 #include "media_pattern.h"
+#include "media_text.h"
 
 static const char *TAG = "media";
 
@@ -92,11 +93,14 @@ static void close_encoder(void)
     s_live.enc = NULL;
 }
 
-/* Renders and encodes the next pattern frame. Output lands in s_live.annexb
- * (Annex-B framing, SPS/PPS prepended on IDR frames). */
+/* Renders and encodes the next frame. The picture is the on-screen text
+ * whenever one is set (media_text_generate reports the miss), and the test
+ * pattern otherwise; both feed the encoder the same I420 geometry. */
 static esp_err_t encode_one(size_t *annexb_len, bool *idr)
 {
-    media_pattern_generate(s_live.yuv, yuv_len(), s_live.frame_index);
+    if (!media_text_generate(s_live.yuv, yuv_len(), s_live.frame_index)) {
+        media_pattern_generate(s_live.yuv, yuv_len(), s_live.frame_index);
+    }
 
     esp_h264_enc_in_frame_t in = {
         .raw_data = { .buffer = s_live.yuv, .len = (uint32_t)yuv_len() },
@@ -216,7 +220,7 @@ static esp_err_t live_next_frame(void *user, const uint8_t **au, size_t *len, bo
 }
 
 static const airplay_live_source_t s_source = {
-    .name = "test pattern",
+    .name = "live encoder",
     .width = MEDIA_PATTERN_WIDTH,
     .height = MEDIA_PATTERN_HEIGHT,
     .interval_ms = 1000 / MEDIA_PATTERN_FPS,

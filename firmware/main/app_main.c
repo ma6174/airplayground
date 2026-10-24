@@ -21,6 +21,7 @@
 #include "media_frames.h"
 #include "media_live.h"
 #include "media_net.h"
+#include "media_text.h"
 #include "nvs_flash.h"
 #include "pin_fetch.h"
 #include "pin_server.h"
@@ -257,6 +258,29 @@ static const char *hook_forget(const char *name)
     return reply;
 }
 
+/* Sets the live source's on-screen text; an empty msg hands the canvas back
+ * to the test pattern. Runs on the HTTP task, and media_text_set() is built
+ * for exactly that: it flips buffers instead of taking a lock. */
+static const char *hook_text(const char *msg)
+{
+    static char reply[MEDIA_TEXT_MAX_BYTES + 16];
+
+    if (msg == NULL) {
+        char current[MEDIA_TEXT_MAX_BYTES];
+        media_text_get(current, sizeof(current));
+        if (current[0] == '\0') {
+            return "text: (test pattern)\n";
+        }
+        snprintf(reply, sizeof(reply), "text: %s\n", current);
+        return reply;
+    }
+    if (!media_text_set(msg)) {
+        return "text does not fit (max 127 bytes of UTF-8)\n";
+    }
+    ESP_LOGI(TAG, "on-screen text %s: \"%s\"", msg[0] != '\0' ? "set" : "cleared", msg);
+    return msg[0] != '\0' ? "text set\n" : "text cleared; the test pattern is back\n";
+}
+
 static const char *hook_stop(void)
 {
     if (!airplay_is_running()) {
@@ -477,6 +501,7 @@ void app_main(void)
         .status = hook_status,
         .targets = hook_targets,
         .forget = hook_forget,
+        .text = hook_text,
     };
     pin_server_set_session_hooks(&hooks);
     /* The session task runs the encoder itself, and openh264's slice and
