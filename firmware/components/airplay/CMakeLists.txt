@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "src/ap_client.c"
         "src/ap_data.c"
+        "src/ap_discovery.c"
         "src/ap_event.c"
         "src/ap_frame.c"
         "src/ap_md5.c"
@@ -13,5 +14,5 @@ idf_component_register(
         "src/ap_setup.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
-    REQUIRES fairplay hap lwip mbedtls esp_timer
+    REQUIRES fairplay hap lwip mbedtls esp_timer nvs_flash esp_netif espressif__mdns
 )

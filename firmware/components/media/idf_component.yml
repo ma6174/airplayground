@@ -1,3 +1,5 @@
-## Runtime H.264 encoder for the live video source.
+## Runtime H.264 encoder for the live video source. The range is wide on
+## purpose: the xiaozhi firmware this stack is also built into pins esp_h264
+## itself (1.0.4 via esp_video), and the APIs used here exist in both.
 dependencies:
-  espressif/esp_h264: "1.4.1"
+  espressif/esp_h264: ">=1.0.0"

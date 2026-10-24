@@ -73,13 +73,46 @@ static void format_device_id(const uint8_t bytes[16], char out[18])
     snprintf(out, 18, "02:%02X:%02X:%02X:%02X:%02X", bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
 }
 
+/* Receivers show this name in their own UI, so UTF-8 has to survive: replacing
+ * every byte outside printable ASCII with '?' turned "小智 TV" into "??? TV" on
+ * the receiver. Control bytes still become '?', and the string is cut on a
+ * character boundary so a multi-byte sequence is never split. */
 static void sanitize_name(const char *source, char out[64])
 {
     const char *text = (source != NULL && source[0] != '\0') ? source : "ESP32-S3 AirPlay";
     size_t len = 0;
-    while (*text != '\0' && len + 1 < 64) {
-        unsigned char c = (unsigned char)*text++;
-        out[len++] = (c >= 0x20 && c <= 0x7e) ? (char)c : '?';
+    while (*text != '\0') {
+        unsigned char c = (unsigned char)text[0];
+        size_t width = 1;
+        bool replace = (c < 0x20 || c == 0x7f);
+        if (!replace) {
+            if (c >= 0xc2 && c <= 0xdf) {
+                width = 2;
+            } else if (c >= 0xe0 && c <= 0xef) {
+                width = 3;
+            } else if (c >= 0xf0 && c <= 0xf4) {
+                width = 4;
+            } else if (c >= 0x80) {
+                /* Stray continuation byte or an overlong lead byte. */
+                replace = true;
+            }
+            for (size_t i = 1; i < width && !replace; i++) {
+                if (text[i] == '\0' || ((unsigned char)text[i] & 0xc0) != 0x80) {
+                    replace = true;
+                }
+            }
+        }
+        if (len + (replace ? 1 : width) + 1 > 64) {
+            break;
+        }
+        if (replace) {
+            out[len++] = '?';
+            text += 1;
+        } else {
+            memcpy(out + len, text, width);
+            len += width;
+            text += width;
+        }
     }
     while (len > 0 && out[len - 1] == ' ') {
         len--;

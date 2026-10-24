@@ -1,4 +1,4 @@
-#include "discovery.h"
+#include "ap_discovery.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -10,7 +10,7 @@
 #include "mdns.h"
 #include "nvs.h"
 
-static const char *TAG = "discovery";
+static const char *TAG = "ap_discovery";
 
 /* Long enough for sleepy responders, short enough not to stall an HTTP
  * handler; both queries run back to back. */
@@ -23,7 +23,7 @@ static const char *TAG = "discovery";
 
 #define NVS_NAMESPACE "discovery"
 #define NVS_KEY "legacy"
-#define ENTRY_BYTES (DISCOVERY_NAME_LEN + 16 + 2)
+#define ENTRY_BYTES (AP_DISCOVERY_NAME_LEN + 16 + 2)
 
 typedef struct {
     airplay_target_t target;
@@ -34,7 +34,7 @@ typedef struct {
 /* Shared with the mDNS service task (browse callbacks); every access holds
  * this mutex. One entry per receiver name, so DHCP address changes and the
  * airplay/raop record pairs of one device stay merged. */
-static entry_t s_entries[DISCOVERY_MAX_TARGETS];
+static entry_t s_entries[AP_DISCOVERY_MAX_TARGETS];
 static int s_entry_count;
 static SemaphoreHandle_t s_lock;
 
@@ -76,7 +76,7 @@ static void record_entry(const mdns_result_t *result, const char *host, const ch
         return;
     }
 
-    if (s_entry_count >= DISCOVERY_MAX_TARGETS || name[0] == '\0') {
+    if (s_entry_count >= AP_DISCOVERY_MAX_TARGETS || name[0] == '\0') {
         return;
     }
     entry_t *entry = &s_entries[s_entry_count++];
@@ -138,7 +138,7 @@ static void entry_name(const mdns_result_t *result, char *out, size_t out_len)
 static void browse_notify(mdns_result_t *result)
 {
     char host[16];
-    char name[DISCOVERY_NAME_LEN];
+    char name[AP_DISCOVERY_NAME_LEN];
 
     if (result->instance_name == NULL) {
         return;
@@ -189,21 +189,21 @@ static void prune_expired(void)
  * announcement storms must not wear the flash. Lock must be held. */
 static void persist_legacy_locked(void)
 {
-    static uint8_t last[1 + DISCOVERY_MAX_TARGETS * ENTRY_BYTES];
+    static uint8_t last[1 + AP_DISCOVERY_MAX_TARGETS * ENTRY_BYTES];
     static size_t last_len;
 
     uint8_t blob[sizeof(last)];
     memset(blob, 0, sizeof(blob));
     uint8_t count = 0;
-    for (int i = 0; i < s_entry_count && count < DISCOVERY_MAX_TARGETS; i++) {
+    for (int i = 0; i < s_entry_count && count < AP_DISCOVERY_MAX_TARGETS; i++) {
         if (!s_entries[i].target.legacy) {
             continue;
         }
         uint8_t *slot = blob + 1 + (size_t)count * ENTRY_BYTES;
-        memcpy(slot, s_entries[i].target.name, DISCOVERY_NAME_LEN);
-        memcpy(slot + DISCOVERY_NAME_LEN, s_entries[i].target.host, 16);
-        slot[DISCOVERY_NAME_LEN + 16] = (uint8_t)(s_entries[i].target.port & 0xff);
-        slot[DISCOVERY_NAME_LEN + 17] = (uint8_t)(s_entries[i].target.port >> 8);
+        memcpy(slot, s_entries[i].target.name, AP_DISCOVERY_NAME_LEN);
+        memcpy(slot + AP_DISCOVERY_NAME_LEN, s_entries[i].target.host, 16);
+        slot[AP_DISCOVERY_NAME_LEN + 16] = (uint8_t)(s_entries[i].target.port & 0xff);
+        slot[AP_DISCOVERY_NAME_LEN + 17] = (uint8_t)(s_entries[i].target.port >> 8);
         count++;
     }
     blob[0] = count;
@@ -238,7 +238,7 @@ static void load_persisted(void)
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
         return;
     }
-    uint8_t blob[1 + DISCOVERY_MAX_TARGETS * ENTRY_BYTES];
+    uint8_t blob[1 + AP_DISCOVERY_MAX_TARGETS * ENTRY_BYTES];
     size_t len = sizeof(blob);
     if (nvs_get_blob(handle, NVS_KEY, blob, &len) != ESP_OK || len < 1) {
         nvs_close(handle);
@@ -246,18 +246,18 @@ static void load_persisted(void)
     }
     nvs_close(handle);
 
-    uint8_t count = blob[0] > DISCOVERY_MAX_TARGETS ? DISCOVERY_MAX_TARGETS : blob[0];
+    uint8_t count = blob[0] > AP_DISCOVERY_MAX_TARGETS ? AP_DISCOVERY_MAX_TARGETS : blob[0];
     TickType_t now = xTaskGetTickCount();
     for (uint8_t i = 0; i < count; i++) {
         const uint8_t *slot = blob + 1 + (size_t)i * ENTRY_BYTES;
         entry_t *entry = &s_entries[s_entry_count++];
         memset(entry, 0, sizeof(*entry));
-        memcpy(entry->target.name, slot, DISCOVERY_NAME_LEN);
-        entry->target.name[DISCOVERY_NAME_LEN - 1] = '\0';
-        memcpy(entry->target.host, slot + DISCOVERY_NAME_LEN, 15);
+        memcpy(entry->target.name, slot, AP_DISCOVERY_NAME_LEN);
+        entry->target.name[AP_DISCOVERY_NAME_LEN - 1] = '\0';
+        memcpy(entry->target.host, slot + AP_DISCOVERY_NAME_LEN, 15);
         entry->target.host[15] = '\0';
-        entry->target.port = (uint16_t)(slot[DISCOVERY_NAME_LEN + 16] |
-                                        slot[DISCOVERY_NAME_LEN + 17] << 8);
+        entry->target.port = (uint16_t)(slot[AP_DISCOVERY_NAME_LEN + 16] |
+                                        slot[AP_DISCOVERY_NAME_LEN + 17] << 8);
         entry->target.legacy = true;
         entry->via_airplay = true;
         entry->seen = now;
@@ -272,12 +272,12 @@ static void refresh_task(void *argument)
 {
     (void)argument;
     for (;;) {
-        discovery_browse();
+        ap_discovery_browse();
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 
-esp_err_t discovery_start(void)
+esp_err_t ap_discovery_start(void)
 {
     s_lock = xSemaphoreCreateMutex();
     if (s_lock == NULL) {
@@ -301,7 +301,7 @@ esp_err_t discovery_start(void)
     return ESP_OK;
 }
 
-int discovery_browse(void)
+int ap_discovery_browse(void)
 {
     static const char *services[] = {"_airplay", "_raop"};
 
@@ -309,7 +309,7 @@ int discovery_browse(void)
     for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
         mdns_result_t *results = NULL;
         esp_err_t err = mdns_query_ptr(services[i], "_tcp", BROWSE_TIMEOUT_MS,
-                                       DISCOVERY_MAX_TARGETS, &results);
+                                       AP_DISCOVERY_MAX_TARGETS, &results);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "mDNS query for %s._tcp failed: %s", services[i],
                      esp_err_to_name(err));
@@ -327,7 +327,7 @@ int discovery_browse(void)
     return failures == 2 ? -1 : s_entry_count;
 }
 
-int discovery_snapshot(airplay_target_t *out, int max)
+int ap_discovery_snapshot(airplay_target_t *out, int max)
 {
     int count = 0;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -340,7 +340,7 @@ int discovery_snapshot(airplay_target_t *out, int max)
     return count;
 }
 
-void discovery_remember(const char *name, const char *host, uint16_t port, bool legacy)
+void ap_discovery_remember(const char *name, const char *host, uint16_t port, bool legacy)
 {
     if (name == NULL || name[0] == '\0' || host == NULL || host[0] == '\0' || port == 0) {
         return;
@@ -366,7 +366,7 @@ void discovery_remember(const char *name, const char *host, uint16_t port, bool 
         xSemaphoreGive(s_lock);
         return;
     }
-    if (s_entry_count < DISCOVERY_MAX_TARGETS) {
+    if (s_entry_count < AP_DISCOVERY_MAX_TARGETS) {
         entry_t *entry = &s_entries[s_entry_count++];
         memset(entry, 0, sizeof(*entry));
         strlcpy(entry->target.name, name, sizeof(entry->target.name));
@@ -384,7 +384,7 @@ void discovery_remember(const char *name, const char *host, uint16_t port, bool 
     xSemaphoreGive(s_lock);
 }
 
-bool discovery_forget(const char *name)
+bool ap_discovery_forget(const char *name)
 {
     if (name == NULL || name[0] == '\0') {
         return false;
@@ -409,13 +409,13 @@ bool discovery_forget(const char *name)
     return false;
 }
 
-bool discovery_find(const char *name, airplay_target_t *out)
+bool ap_discovery_find(const char *name, airplay_target_t *out)
 {
     if (name == NULL || name[0] == '\0') {
         return false;
     }
     if (s_entry_count == 0) {
-        discovery_browse();
+        ap_discovery_browse();
     }
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return false;
@@ -430,7 +430,7 @@ bool discovery_find(const char *name, airplay_target_t *out)
         }
     }
 
-    char wanted[DISCOVERY_NAME_LEN];
+    char wanted[AP_DISCOVERY_NAME_LEN];
     strlcpy(wanted, name, sizeof(wanted));
     for (char *cursor = wanted; *cursor != '\0'; cursor++) {
         *cursor = (char)tolower((unsigned char)*cursor);
@@ -438,7 +438,7 @@ bool discovery_find(const char *name, airplay_target_t *out)
 
     const entry_t *match = NULL;
     for (int i = 0; i < s_entry_count; i++) {
-        char lower[DISCOVERY_NAME_LEN];
+        char lower[AP_DISCOVERY_NAME_LEN];
         strlcpy(lower, s_entries[i].target.name, sizeof(lower));
         for (char *cursor = lower; *cursor != '\0'; cursor++) {
             *cursor = (char)tolower((unsigned char)*cursor);

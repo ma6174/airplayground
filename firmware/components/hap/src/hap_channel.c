@@ -45,7 +45,13 @@ static int import_aead_key(const uint8_t key[HAP_KEY_LEN], psa_key_usage_t usage
     status = psa_import_key(&attributes, key, HAP_KEY_LEN, key_id);
     psa_reset_key_attributes(&attributes);
     if (status != PSA_SUCCESS) {
-        HAP_LOGE("aead: key import failed (%ld)", (long)status);
+        if (status == PSA_ERROR_NOT_SUPPORTED) {
+            /* The one sdkconfig mistake that looks like a protocol bug. */
+            HAP_LOGE("aead: ChaCha20 is missing from mbedtls; enable "
+                     "CONFIG_MBEDTLS_CHACHA20_C and CONFIG_MBEDTLS_CHACHAPOLY_C");
+        } else {
+            HAP_LOGE("aead: key import failed (%ld)", (long)status);
+        }
         return -1;
     }
     return 0;

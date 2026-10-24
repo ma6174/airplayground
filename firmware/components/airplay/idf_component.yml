@@ -1,0 +1,5 @@
+## Receiver discovery uses mDNS, so every project that links this component
+## resolves the managed driver on its own.
+dependencies:
+  idf: ">=5.0"
+  espressif/mdns: "^1.8.0"

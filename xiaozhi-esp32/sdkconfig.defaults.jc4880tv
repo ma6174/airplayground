@@ -1,0 +1,24 @@
+# Board overrides for JC4880P443C_I_W running headless with an AirPlay "TV"
+# display. Build with:
+#   idf.py -B build-tv -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32p4;sdkconfig.defaults.jc4880tv" build
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+# esp_hosted 2.13 的 SDIO mempool 默认从内部 DMA 堆分配，这块板的内部堆不够，
+# 会在 app_main 之前的 constructor 里断言循环复位；改从 PSRAM 取即可。
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_BOARD_TYPE_JC4880_TV=y
+CONFIG_AIRPLAY_DEFAULT_HOST=""
+
+# HAP 配对与镜像数据流靠 PSA 提供 HKDF / ChaCha20-Poly1305 / X25519。这几个
+# 算法在 mbedtls 里不是默认开着的，缺了配对会在 M5 以 PSA_ERROR_NOT_SUPPORTED
+# 失败（日志 "aead: key import failed (-134)"）。
+CONFIG_MBEDTLS_PSA_CRYPTO_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_ECP_DP_CURVE25519_ENABLED=y
+# 台架期打开调试日志（esp_hosted 的报错走 INFO/ERROR，默认级别看不到上下文）
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

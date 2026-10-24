@@ -203,6 +203,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD
         bool "Espressif ESP32-P4/P4X-Function-EV-Board"
         depends on IDF_TARGET_ESP32P4
+    config BOARD_TYPE_JC4880_TV
+        bool "JC4880P443C_I_W headless (AirPlay TV display)"
+        depends on IDF_TARGET_ESP32P4
     config BOARD_TYPE_ESP32_S3_BOX
         bool "Espressif ESP32-S3-BOX"
         depends on IDF_TARGET_ESP32S3
@@ -1172,4 +1175,21 @@ menu "TAIJIPAI_S3_CONFIG"
         启动双声道
 endmenu
 
+endmenu
+
+menu "AirPlay display"
+    depends on BOARD_TYPE_JC4880_TV
+
+    config AIRPLAY_DEFAULT_HOST
+        string "Default AirPlay receiver address"
+        default ""
+        help
+            开机后自动连接的接收端地址（电视或盒子的 IP）。
+            留空则只在调用 MCP 工具 self.airplay.start 时才开会话。
+
+    config AIRPLAY_DEVICE_NAME
+        string "Device name shown on the receiver"
+        default "小智 TV"
+        help
+            接收端上显示的设备名称。
 endmenu

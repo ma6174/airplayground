@@ -13,9 +13,10 @@ AirPlay 发送端（`firmware/`）和小智固件（本目录）。
 | 导入方式 | `git archive v2.5.2 \| tar -x -C xiaozhi-esp32`（不含 `.git`，未含任何 submodule） |
 | 导入日期 | 2026-10-24 |
 
-除本文件外，目录内容与上游 v2.5.2 一致。**不要在本目录里改代码**：需要改动的地方
-（板级、Kconfig、工具注册）都在 `firmware/` 侧或通过后续补丁进行，这样升级上游时
-不会产生冲突。
+除下述补丁层与本文件外，目录内容与上游 v2.5.2 一致。**补丁层以外的代码不要改**：
+小智侧的功能扩展放在 `main/airplay/`、`main/display/virtual_display.*` 和板级目录里，
+对上游文件的改动集中在三个接线点（根 CMakeLists、main/CMakeLists、Kconfig），
+这样升级上游时冲突面最小。
 
 ## 与 `firmware/` 的关系
 
@@ -29,6 +30,19 @@ set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../firmware/components")
 ```
 
 这样协议层的修复、测试、host 测试用例都只有一处。
+
+除 VENDOR.md 外，本目录在上游基础上带有一层本地补丁（虚拟显示器 + AirPlay 发送端接入），改动文件：
+
+- `CMakeLists.txt`：`EXTRA_COMPONENT_DIRS` 指向 `../firmware/components`；新版 GCC 对某个 vendored LCD 组件的 use-after-free 误报不再当作错误
+- `main/CMakeLists.txt`：接入 `display/virtual_display.cc`、`airplay/airplay_service.cc`、`airplay/airplay_http.cc`；新增板型 `jc4880-tv`；`main` 依赖 `airplay` / `media` / `espressif__esp_h264` / `esp_http_server`
+- `main/Kconfig.projbuild`：新增板型选项与 `AirPlay display` 菜单（`AIRPLAY_DEFAULT_HOST`、`AIRPLAY_DEVICE_NAME`）
+- `main/display/virtual_display.{h,cc}`：无面板的 LVGL 后端，渲染进 PSRAM 全帧缓冲，供 AirPlay 编码
+- `main/airplay/airplay_service.{h,cc}`：会话任务、HAP 身份持久化（NVS）、屏幕 → H.264 源（RGB565→I420→软编→AVCC）、MCP 工具
+- `main/airplay/airplay_http.{h,cc}`：台架用 HTTP 调试口（8080：status/start/stop/pin）
+- `main/boards/jc4880-tv/`：无屏板（JC4880P443C_I_W，ES8311 音频 + 虚拟显示器）
+- `sdkconfig.defaults.jc4880tv`：该板的 sdkconfig 覆盖（C6 hosted、pre-rev3 P4）
+
+协议栈本体不在本目录；升级上游前先确认这层补丁仍适用。
 
 ## 升级步骤
 
