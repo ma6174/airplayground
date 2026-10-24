@@ -772,23 +772,6 @@ static esp_err_t stream_frames(ap_session_t *session)
     AP_LOGI("codec packet sent: avcC %u bytes, %ux%u", (unsigned)avcc_len, (unsigned)width,
             (unsigned)height);
 
-    uint64_t next_audio = 0;
-    if (legacy && session->config->legacy_audio && session->legacy_audio_port != 0) {
-        /* Audio rides UDP, unlike the TCP mirror channel. */
-        uint16_t local_port = 0;
-        session->legacy_audio_fd = ap_socket_udp_open(&local_port);
-        if (session->legacy_audio_fd < 0) {
-            AP_LOGW("cannot open the audio socket");
-        } else {
-            AP_LOGI("legacy audio channel ready: local %u -> %s:%u", (unsigned)local_port,
-                    session->config->host, (unsigned)session->legacy_audio_port);
-            /* Start the audio clock where the video clock already is. */
-            session->legacy_audio_rtp_time =
-                (uint32_t)((ap_ntp_boot_timestamp() >> 32) * AP_LEGACY_AUDIO_SAMPLE_RATE);
-            next_audio = ap_millis();
-        }
-    }
-
     size_t index = 0;
     /* The first video record repeats the codec record's timestamp, as Apple's
      * sender does, so the comparison has to start one tick below it. */
@@ -812,26 +795,6 @@ static esp_err_t stream_frames(ap_session_t *session)
          * never find room and the receiver would consider the channel idle. */
         bool control_slot = slack >= AP_SLACK_FOR_CONTROL_MS ||
                             (interval == 0 && now >= last_frame_at + AP_SLACK_FOR_CONTROL_MS);
-
-        if (session->legacy_audio_fd >= 0 && now >= next_audio) {
-            /* Feed the audio channel so receivers that gate video on it see a
-             * live stream. The payload is silence; the codec never runs. */
-            uint8_t packet[12 + AP_LEGACY_AUDIO_CHUNK];
-            int len = ap_legacy_audio_packet(packet, sizeof(packet), session->legacy_audio_seq,
-                                             session->legacy_audio_rtp_time,
-                                             session->legacy_skey, session->aesiv,
-                                             AP_LEGACY_AUDIO_CHUNK);
-            if (len > 0 && ap_socket_send_to(session->legacy_audio_fd, session->config->host,
-                                             session->legacy_audio_port, packet,
-                                             (size_t)len) != 0) {
-                AP_LOGW("legacy audio write failed");
-                ap_socket_close(session->legacy_audio_fd);
-                session->legacy_audio_fd = -1;
-            }
-            session->legacy_audio_seq++;
-            session->legacy_audio_rtp_time += AP_LEGACY_AUDIO_SAMPLES_PER_PACKET;
-            next_audio = now + AP_LEGACY_AUDIO_INTERVAL_MS;
-        }
 
         if (now >= next_feedback && (control_slot || feedback_deferrals >= AP_FEEDBACK_MAX_DEFERRALS)) {
             feedback_deferrals = 0;
@@ -1158,9 +1121,7 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
         stream_client = &session->stream_client;
         AP_LOGI("legacy SETUP 2 goes to port %u", (unsigned)stream_port);
     }
-    plist_len = ap_legacy_build_setup2(plist, sizeof(plist), session->video_stream_id,
-                                       session->config->legacy_audio,
-                                       session->legacy_audio_control_port);
+    plist_len = ap_legacy_build_setup2(plist, sizeof(plist), session->video_stream_id);
     if (plist_len == 0 ||
         ap_client_request(stream_client, "SETUP", session->uri, AP_CONTENT_TYPE_PLIST, plist,
                           plist_len, transport, &response) != 0) {
@@ -1179,16 +1140,6 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
                     ap_plist_array_get(&reader, streams, 0, &stream) &&
                     ap_plist_dict_uint(&reader, stream, "dataPort", &port) && port != 0 &&
                     port <= 65535;
-    if (has_port && session->config->legacy_audio) {
-        uint64_t audio_stream = 0;
-        uint64_t audio_port = 0;
-        if (ap_plist_array_get(&reader, streams, 1, &audio_stream) &&
-            ap_plist_dict_uint(&reader, audio_stream, "dataPort", &audio_port) && audio_port != 0 &&
-            audio_port <= 65535) {
-            session->legacy_audio_port = (uint16_t)audio_port;
-            AP_LOGI("legacy SETUP 2: audio dataPort=%u", (unsigned)session->legacy_audio_port);
-        }
-    }
     if (has_port) {
         *data_port = (uint16_t)port;
         session->legacy_transport = 0;
@@ -1242,7 +1193,6 @@ static esp_err_t session_run(ap_session_t *session)
     }
 
     uint16_t data_port = 0;
-    session->legacy_audio_fd = -1;
     if (session->config->legacy) {
         if (legacy_front_half(session, &data_port) != ESP_OK) {
             return ESP_FAIL;
@@ -1262,22 +1212,6 @@ static esp_err_t session_run(ap_session_t *session)
         }
         ap_legacy_ctr_start(&session->legacy_ctr, session->legacy_skey, session->legacy_siv);
         AP_LOGI("legacy data channel ready on fd %d", session->data.fd);
-
-        /* Receivers that asked for audio expect the sender to connect that port
-         * too; iOS keeps it open for the whole session. */
-        session->legacy_audio_fd = -1;
-        if (session->config->legacy_audio && session->legacy_audio_port != 0) {
-            session->legacy_audio_fd =
-                ap_socket_connect(session->config->host, session->legacy_audio_port,
-                                  AP_DATA_CONNECT_TIMEOUT_MS);
-            if (session->legacy_audio_fd < 0) {
-                AP_LOGW("cannot reach the legacy audio port %u",
-                        (unsigned)session->legacy_audio_port);
-            } else {
-                ap_legacy_ctr_start(&session->legacy_audio_ctr, session->aeskey, session->aesiv);
-                AP_LOGI("legacy audio channel ready on fd %d", session->legacy_audio_fd);
-            }
-        }
     } else {
     if (discover(session) != ESP_OK) {
         return ESP_FAIL;

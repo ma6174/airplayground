@@ -115,11 +115,6 @@
 #define APP_LEGACY_PAIRING 0
 #endif
 
-/* Ask for the audio stream as well (iOS sends one when it mirrors). */
-#ifndef APP_LEGACY_AUDIO
-#define APP_LEGACY_AUDIO 1
-#endif
-
 /* Fallback access point, used when APP_WIFI_SSID is empty. */
 #ifndef APP_FALLBACK_AP_SSID
 #define APP_FALLBACK_AP_SSID "airplay-esp32"

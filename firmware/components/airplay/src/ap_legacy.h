@@ -64,9 +64,6 @@ int ap_legacy_pair_setup(ap_client_t *client, const hap_identity_t *identity,
 int ap_legacy_pair_verify(ap_client_t *client, const hap_identity_t *identity,
                           const uint8_t receiver_ed[32], uint8_t ecdh_out[32]);
 
-/* Builds one audio packet (RTP header + CBC payload). */
-int ap_legacy_audio_packet(uint8_t *out, size_t cap, uint16_t seq, uint32_t rtp_time,
-                           const uint8_t key[16], const uint8_t iv[16], size_t payload_len);
 
 /* Writes one mirror record: [128-byte header][payload]. In interleaved mode the
  * record is wrapped in the RTSP `$`+channel+length framing, all on data_fd. */
@@ -90,9 +87,6 @@ typedef struct {
 } ap_legacy_setup1_t;
 
 size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t *setup);
-/* SETUP 2 body: streams[{type:110, streamConnectionID}]. */
-/* Mirror SETUP. With audio the request also asks for the type 96 stream; iOS
- * sends both, and receivers of this class wait for the audio stream before
- * they start rendering. */
-size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, bool audio,
-                              uint16_t audio_control_port);
+/* SETUP 2 body: streams[{type:110, streamConnectionID}]. A mirroring session
+ * declares the video stream and nothing else, exactly like iOS. */
+size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id);

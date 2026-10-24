@@ -101,9 +101,6 @@ typedef struct {
      * no pairing at all, and receivers that key the stream off the pairing
      * secret break when one did happen. */
     bool legacy_pairing;
-    /* Ask for the type 96 audio stream next to the video one and keep it fed
-     * with silence; some receivers never start rendering video without it. */
-    bool legacy_audio;
 } airplay_config_t;
 
 /* Runs one mirroring session: pair, FairPlay, SETUP, stream still images until

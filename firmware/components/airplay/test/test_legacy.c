@@ -201,7 +201,7 @@ int main(void)
     expect(ap_plist_dict_get(&reader, ap_plist_root(&reader), "eiv", &field), "setup1 has eiv");
     expect(ap_plist_dict_get(&reader, ap_plist_root(&reader), "ekey", &field), "setup1 has ekey");
 
-    body_len = ap_legacy_build_setup2(body, sizeof(body), 0x0123456789ULL, false, 0);
+    body_len = ap_legacy_build_setup2(body, sizeof(body), 0x0123456789ULL);
     expect(body_len > 0, "setup2 encodes");
     expect(ap_plist_decode(&reader, body, body_len), "setup2 decodes");
     uint64_t streams = 0;

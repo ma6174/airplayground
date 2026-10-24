@@ -21,11 +21,6 @@
  * clock the video timestamps use: a receiver that schedules video against the
  * audio playhead holds the picture back forever when the two clocks disagree
  * by the age of the device. */
-#define AP_LEGACY_AUDIO_CHUNK 96
-#define AP_LEGACY_AUDIO_INTERVAL_MS 20
-#define AP_LEGACY_AUDIO_SAMPLE_RATE 44100u
-#define AP_LEGACY_AUDIO_SAMPLES_PER_PACKET \
-    (AP_LEGACY_AUDIO_SAMPLE_RATE * AP_LEGACY_AUDIO_INTERVAL_MS / 1000u)
 #include "ap_data.h"
 #include "ap_event.h"
 #include "ap_legacy.h"
@@ -101,13 +96,6 @@ typedef struct ap_session {
     ap_legacy_ctr_t legacy_ctr;
     /* 0: receiver handed out a dataPort; 1-4: see legacy_data_mode. */
     uint8_t legacy_transport;
-    /* Audio side of a legacy session (receivers that gate video on it). */
-    uint16_t legacy_audio_port;
-    int legacy_audio_fd;
-    uint16_t legacy_audio_control_port;
-    uint16_t legacy_audio_seq;
-    uint32_t legacy_audio_rtp_time;
-    ap_legacy_ctr_t legacy_audio_ctr;
     /* RECORD already went out in the legacy front half. */
     bool legacy_recorded;
     /* Receivers that answer the mirror SETUP on a second RTSP port keep that
