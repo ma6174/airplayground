@@ -110,6 +110,74 @@ static void write_container_header(uint8_t **cursor, uint8_t base, uint32_t coun
     write_int_object(cursor, count);
 }
 
+/* A binary plist string is either ASCII (marker 0x5n, one byte per character)
+ * or UTF-16BE (marker 0x6n, two bytes per code unit). Our sender name travels
+ * to the receiver inside one of these tables, so UTF-8 has to be transcoded:
+ * written as "ASCII" bytes a Chinese name arrives as mojibake (the receiver
+ * decodes the raw bytes as single-byte characters, "小智 TV" -> "å°æ° TV"). */
+static bool string_needs_utf16(const slot_t *slot)
+{
+    for (size_t i = 0; i < slot->bytes_len; i++) {
+        if (slot->bytes[i] >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Decodes one UTF-8 sequence; returns the bytes consumed and writes the code
+ * point, or U+FFFD for anything malformed. */
+static size_t utf8_decode(const uint8_t *text, size_t len, uint32_t *codepoint)
+{
+    unsigned char c = text[0];
+    *codepoint = 0xfffdu;
+    if (c < 0x80) {
+        *codepoint = c;
+        return 1;
+    }
+    size_t width = 0;
+    uint32_t value = 0;
+    if (c >= 0xc2 && c <= 0xdf) {
+        width = 2;
+        value = c & 0x1fu;
+    } else if (c >= 0xe0 && c <= 0xef) {
+        width = 3;
+        value = c & 0x0fu;
+    } else if (c >= 0xf0 && c <= 0xf4) {
+        width = 4;
+        value = c & 0x07u;
+    } else {
+        return 1;
+    }
+    if (len < width) {
+        return 1;
+    }
+    for (size_t i = 1; i < width; i++) {
+        if ((text[i] & 0xc0) != 0x80) {
+            return 1;
+        }
+        value = (value << 6) | (text[i] & 0x3fu);
+    }
+    if ((width == 3 && value < 0x800u) || (width == 4 && (value < 0x10000u || value > 0x10ffffu))) {
+        return width;
+    }
+    *codepoint = value;
+    return width;
+}
+
+/* UTF-16 code unit count; astral code points take a surrogate pair, so this is
+ * not the same as the number of UTF-8 sequences. */
+static uint32_t utf16_units(const uint8_t *text, size_t len)
+{
+    uint32_t units = 0;
+    for (size_t i = 0; i < len;) {
+        uint32_t codepoint = 0;
+        i += utf8_decode(text + i, len - i, &codepoint);
+        units += codepoint > 0xffffu ? 2 : 1;
+    }
+    return units;
+}
+
 static int intern_slot(encoder_t *enc)
 {
     if (enc->count >= AP_PLIST_MAX_OBJECTS) {
@@ -216,8 +284,11 @@ static uint32_t slot_length(const slot_t *slot, unsigned ref_size)
         return 9;
     case AP_PLIST_STRING:
     case AP_PLIST_DATA: {
-        uint32_t header = slot->bytes_len < 15 ? 1u : 1u + int_object_len(slot->bytes_len);
-        return header + (uint32_t)slot->bytes_len;
+        bool utf16 = slot->type == AP_PLIST_STRING && string_needs_utf16(slot);
+        uint32_t count = utf16 ? utf16_units(slot->bytes, slot->bytes_len)
+                               : (uint32_t)slot->bytes_len;
+        uint32_t header = count < 15 ? 1u : 1u + int_object_len(count);
+        return header + (utf16 ? count * 2 : count);
     }
     case AP_PLIST_ARRAY:
         return container_header_len(slot->child_count) + slot->child_count * ref_size;
@@ -250,16 +321,37 @@ static void write_slot(const slot_t *slot, uint32_t ref_size, uint8_t **cursor)
         break;
     case AP_PLIST_STRING:
     case AP_PLIST_DATA: {
-        uint8_t base = slot->type == AP_PLIST_STRING ? 0x50 : 0x40;
-        if (slot->bytes_len < 15) {
-            *(*cursor)++ = (uint8_t)(base | slot->bytes_len);
+        /* ASCII strings stay one byte per character; anything else has to be
+         * transcoded to UTF-16BE code units. */
+        bool utf16 = slot->type == AP_PLIST_STRING && string_needs_utf16(slot);
+        uint32_t count = utf16 ? utf16_units(slot->bytes, slot->bytes_len)
+                               : (uint32_t)slot->bytes_len;
+        uint8_t base = utf16 ? 0x60 : (slot->type == AP_PLIST_STRING ? 0x50 : 0x40);
+        if (count < 15) {
+            *(*cursor)++ = (uint8_t)(base | count);
         } else {
             *(*cursor)++ = (uint8_t)(base | 0x0f);
-            write_int_object(cursor, slot->bytes_len);
+            write_int_object(cursor, count);
         }
-        if (slot->bytes_len > 0) {
-            memcpy(*cursor, slot->bytes, slot->bytes_len);
-            *cursor += slot->bytes_len;
+        if (!utf16) {
+            if (slot->bytes_len > 0) {
+                memcpy(*cursor, slot->bytes, slot->bytes_len);
+                *cursor += slot->bytes_len;
+            }
+            break;
+        }
+        for (size_t i = 0; i < slot->bytes_len;) {
+            uint32_t codepoint = 0;
+            i += utf8_decode(slot->bytes + i, slot->bytes_len - i, &codepoint);
+            if (codepoint > 0xffffu) {
+                codepoint -= 0x10000u;
+                put_be(*cursor, 0xd800u + (codepoint >> 10), 2);
+                put_be(*cursor + 2, 0xdc00u + (codepoint & 0x3ffu), 2);
+                *cursor += 4;
+            } else {
+                put_be(*cursor, codepoint, 2);
+                *cursor += 2;
+            }
         }
         break;
     }
