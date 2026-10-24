@@ -19,7 +19,9 @@
 
 /* mDNS instance names are limited to 63 bytes + NUL. */
 #define DISCOVERY_NAME_LEN 64
-#define DISCOVERY_MAX_TARGETS 8
+/* One bench network already runs several receivers per machine (each UxPlay
+ * instance is its own device), so the list has to hold more than a handful. */
+#define DISCOVERY_MAX_TARGETS 16
 
 typedef struct {
     char name[DISCOVERY_NAME_LEN]; /* the name shown in the receiver list */
@@ -57,3 +59,9 @@ bool discovery_find(const char *name, airplay_target_t *out);
  * including its persisted record for legacy receivers. Returns false when no
  * receiver carries that name. */
 bool discovery_forget(const char *name);
+
+/* Records a receiver this device has just mirrored to. Receivers behind a
+ * network that swallows their multicast (or that only announce once per power
+ * cycle) never answer a browse, so a working session is the only evidence the
+ * list will ever get. */
+void discovery_remember(const char *name, const char *host, uint16_t port, bool legacy);

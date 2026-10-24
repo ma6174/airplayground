@@ -29,6 +29,12 @@
 #define APP_AIRPLAY_TARGET_HOST "192.168.1.10"
 #endif
 
+/* Name the default receiver is listed under once a session with it succeeds.
+ * Receivers that never answer an mDNS browse would otherwise stay invisible. */
+#ifndef APP_AIRPLAY_TARGET_NAME
+#define APP_AIRPLAY_TARGET_NAME APP_AIRPLAY_TARGET_HOST
+#endif
+
 #ifndef APP_AIRPLAY_TARGET_PORT
 #define APP_AIRPLAY_TARGET_PORT 7000
 #endif

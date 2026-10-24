@@ -42,6 +42,9 @@ static char s_local_ip[16];
 /* The target lives in a writable buffer so /start can aim the session at a
  * discovered receiver; it is only written while no session is running. */
 static char s_target_host[48];
+/* Name this receiver is known by in the list: the mDNS name when one was used,
+ * otherwise the address the session was aimed at. */
+static char s_target_name[DISCOVERY_NAME_LEN];
 /* Replies assembled for /start, including the list of names seen when a
  * requested receiver is not found. */
 static char s_reply[512];
@@ -85,6 +88,11 @@ static void session_task(void *argument)
         snprintf(s_last_result, sizeof(s_last_result),
                  err == ESP_OK ? "last session: ok" : "last session: %s",
                  err == ESP_OK ? "" : esp_err_to_name(err));
+        if (err == ESP_OK || airplay_last_session_streamed()) {
+            /* A receiver that never answers a browse announcement is only ever
+             * seen through a working session. */
+            discovery_remember(s_target_name, s_target_host, s_config.port, s_config.legacy);
+        }
         /* The session ends on failure, on /stop, or when the receiver goes
          * away. Nothing restarts it automatically: /start does that. */
         s_session_stop = false;
@@ -161,6 +169,7 @@ static const char *hook_start(const pin_start_request_t *request)
             return s_reply;
         }
         strlcpy(s_target_host, target.host, sizeof(s_target_host));
+        strlcpy(s_target_name, target.name, sizeof(s_target_name));
         s_config.port = target.port;
         /* The advertised model/version decides the protocol generation: an
          * AppleTV3,2-style box only speaks legacy AirTunes. */
@@ -169,6 +178,7 @@ static const char *hook_start(const pin_start_request_t *request)
                  (unsigned)s_config.port, target.legacy ? "legacy AirTunes" : "HAP");
     } else if (host != NULL && host[0] != '\0') {
         strlcpy(s_target_host, host, sizeof(s_target_host));
+        strlcpy(s_target_name, host, sizeof(s_target_name));
         if (port > 0) {
             s_config.port = (uint16_t)port;
         }
@@ -401,6 +411,7 @@ void app_main(void)
         }
     }
     strlcpy(s_target_host, APP_AIRPLAY_TARGET_HOST, sizeof(s_target_host));
+    strlcpy(s_target_name, APP_AIRPLAY_TARGET_NAME, sizeof(s_target_name));
     airplay_config_t config = {
         .host = s_target_host,
         .port = APP_AIRPLAY_TARGET_PORT,

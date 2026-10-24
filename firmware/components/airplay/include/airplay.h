@@ -118,6 +118,10 @@ void airplay_request_stop(void);
 /* True between airplay_mirror being requested and it returning. */
 bool airplay_is_running(void);
 
+/* True when the session that just ended delivered at least one frame, i.e. the
+ * receiver completed the handshake and took the stream. */
+bool airplay_last_session_streamed(void);
+
 /* After a failed session: how long the receiver asked us to stay away. Pairing
  * failures are throttled with a HomeKit backoff, and retrying early only
  * extends it. Zero when the failure carried no backoff. */

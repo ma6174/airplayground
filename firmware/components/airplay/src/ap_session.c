@@ -43,6 +43,9 @@ static bool s_receiver_wants_pin;
  * only needs to see the value eventually. */
 static volatile bool s_mirroring;
 static volatile bool s_stop_requested;
+/* Set once the session delivers a frame: proof the receiver is a working one
+ * and not an HTTP stub that answers everything with an empty body. */
+static volatile bool s_streamed;
 
 static uint64_t random_u64(void)
 {
@@ -933,6 +936,7 @@ static esp_err_t stream_frames(ap_session_t *session)
                 next_heartbeat = ap_millis() + AP_HEARTBEAT_INTERVAL_MS;
             }
             frames_sent++;
+            s_streamed = true;
             last_frame_at = ap_millis();
             /* One line per frame would block on the USB console often enough to
              * throttle the stream itself, so a live source reports once a second
@@ -1404,6 +1408,7 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
 
     s_mirroring = true;
     s_stop_requested = false;
+    s_streamed = false;
 
     ap_session_t *session = &s_session;
     memset(session, 0, sizeof(*session));
@@ -1486,6 +1491,11 @@ esp_err_t airplay_mirror(const airplay_config_t *config)
 void airplay_request_stop(void)
 {
     s_stop_requested = true;
+}
+
+bool airplay_last_session_streamed(void)
+{
+    return s_streamed;
 }
 
 bool airplay_is_running(void)
