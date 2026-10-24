@@ -194,9 +194,12 @@ static void log_banner(void)
     esp_flash_get_size(NULL, &flash_size);
 
     uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    /* The base MAC exists on every chip; the Wi-Fi STA MAC only exists where
+     * the radio is local (on the P4 the radio is the ESP32-C6 behind
+     * ESP-Hosted). */
+    esp_read_mac(mac, ESP_MAC_BASE);
 
-    ESP_LOGI(TAG, "==== AirPlay sender on ESP32-S3 ====");
+    ESP_LOGI(TAG, "==== AirPlay sender on %s ====", CONFIG_IDF_TARGET);
     ESP_LOGI(TAG, "cores=%d revision=%d.%d flash=%" PRIu32 " MB",
              chip.cores, chip.revision / 100, chip.revision % 100, flash_size / (1024 * 1024));
     ESP_LOGI(TAG, "mac=" MACSTR " free heap=%" PRIu32 " B",
@@ -381,7 +384,9 @@ void app_main(void)
         .forget = hook_forget,
     };
     pin_server_set_session_hooks(&hooks);
-    if (xTaskCreate(session_task, "session", 8192, NULL, 4, &s_session_task) != pdPASS) {
+    /* The session task runs the encoder itself, and openh264's slice and
+     * rate-control paths nest deeply; 8 KB is not enough for that on RISC-V. */
+    if (xTaskCreate(session_task, "session", 16384, NULL, 4, &s_session_task) != pdPASS) {
         ESP_LOGE(TAG, "cannot start the session task; mirroring is unavailable");
         return;
     }

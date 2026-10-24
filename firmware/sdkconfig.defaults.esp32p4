@@ -1,0 +1,27 @@
+# ESP32-P4 module JC-ESP32P4-M3 on the JC4880P443C_I_W board. The P4 has no
+# radio: every Wi-Fi frame travels over SDIO to the on-board ESP32-C6, which
+# runs the ESP-Hosted slave firmware. esp_wifi_remote (part of esp_wifi on this
+# target) keeps the esp_wifi_* API unchanged, so the application code does not
+# know the radio is external.
+CONFIG_IDF_TARGET="esp32p4"
+
+# The module on this board is a pre-rev3 part (chip revision v1.3).
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# 32 MB of 16-line PSRAM, at the fastest rate a pre-rev3 part runs.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Co-processor and transport. The SDIO pins are the ESP-Hosted defaults for
+# slot 1 (CLK 18, CMD 19, D0-D3 14-17), which is what this board wires up.
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+
+# Wi-Fi driver buffers live in the remote namespace on this target.
+CONFIG_WIFI_RMT_STATIC_RX_BUFFER_NUM=8
+CONFIG_WIFI_RMT_DYNAMIC_RX_BUFFER_NUM=16

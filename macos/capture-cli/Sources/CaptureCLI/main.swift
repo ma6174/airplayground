@@ -125,6 +125,11 @@ final class NetworkSink {
     private var bytesSent = 0
     private var lastReport = Date()
     private var lastProblem: String?
+    /* An access unit only decodes once the receiver has seen an IDR, and
+     * VideoToolbox only emits one when its keyframe interval expires on a
+     * timeline that a still screen barely advances. Tracking the IDs that do
+     * arrive lets the encoder step in when that gap grows too wide. */
+    private(set) var lastIDR = Date.distantPast
 
     init(host: String, port: UInt16, width: Int, height: Int, fps: Int) throws {
         var hints = addrinfo()
@@ -206,11 +211,18 @@ final class NetworkSink {
         message.append(accessUnit)
         let sent = writeAll(message)
         if sent {
+            if idr { lastIDR = Date() }
             framesSent += 1
             bytesSent += message.count
         }
         report(nil)
         return sent
+    }
+
+    /* True when the stream has gone long enough without an IDR that a receiver
+     * joining now would sit on an undecodable frame. */
+    var needsKeyFrame: Bool {
+        Date().timeIntervalSince(lastIDR) > 5.0
     }
 
     /* One line a second: enough to tell an idle capture from a stalled socket
@@ -341,8 +353,14 @@ final class H264Encoder {
         guard let session, let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let duration = CMSampleBufferGetDuration(sampleBuffer)
+        /* VTCompressionPropertyKey_ForceKeyFrame only exists as a per-frame
+         * option on this SDK, so force it through frameProperties. */
+        var properties: CFDictionary?
+        if network?.needsKeyFrame == true {
+            properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        }
         var flags = VTEncodeInfoFlags()
-        let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+        let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: pts, duration: duration, frameProperties: properties, sourceFrameRefcon: nil, infoFlagsOut: &flags)
         if status != noErr { setFailure(CLIError.message("H.264 编码失败：\(status)")) }
     }
 
