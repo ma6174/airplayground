@@ -24,11 +24,58 @@
 两块板共用同一个仓库，但**上板操作要分开排队**：`ESP32_BOARD=board`（默认，S3）与
 `ESP32_BOARD=p4` 是两把独立的锁（`tools/esp32lock`）。
 
+两块板可以同时插在一台机器上，所以每次刷写前先确定目标（见下一节）。
+
 - **控制台只能读不能写**：USB-Serial/JTAG 口上主机写入的字节到不了固件的 `STDIN`
   （设备侧 `read()` 一直 `EAGAIN`；UART0 口同理）。所以配对码不要走串口输入，
   用下面的 HTTP 投递通道。
 - 烧写时会独占串口：常驻的日志桥接要先停掉，烧完再起新的（见下文）。
 - 烧写/日志/配对是三种不同的线序需求，换线前先看本文对应小节，不要凭感觉插拔。
+
+## 刷写前：确认刷的是哪块板
+
+两块板的串口描述符一模一样（都是 `USB JTAG/serial debug unit`，VID 都是 `0x303a`），
+`/dev/cu.usbmodem*` 的名字也会漂移（见过 `1101` / `11101` / `11201`），所以**不能看口名、
+也不能看 USB 产品名**。唯一稳定的标识是 **USB 序列号 = 芯片 MAC**：
+
+| 板子 | 芯片 | USB 序列号（= 芯片 MAC） | 目标名 |
+|---|---|---|---|
+| JC4880P443C_I_W | ESP32-P4 | `80:F1:B2:D3:54:66` | `p4` |
+| ESP32-S3-WROOM-1 | ESP32-S3 | `24:58:7C:CE:38:7C` | `s3` |
+
+按序列号解析端口（非破坏性，不打开串口、不复位）：
+
+```sh
+tools/boardport list     # 列出当前插着的全部 Espressif 设备：板名 / 端口 / 序列号
+tools/boardport p4       # 只打印 P4 的端口；没插就退出码 1，方便脚本直接 abort
+tools/boardport s3
+```
+
+刷写时把端口求值给 `idf.py`，不要写死：
+
+```sh
+PORT=$(tools/boardport p4) && idf.py -p "$PORT" flash
+```
+
+### 如果 firmware 还是未知的（刚拿到的板、烧坏了的板）
+
+上面的序列号表是本仓库两块板的映射；遇到陌生设备，用下面两条交叉确认，**都在板锁里做**
+（`chip-id` 会复位板子，抢占正在跑的任务）：
+
+```sh
+# 1) 它是哪颗芯片（最硬的证据）
+ESP32_BOARD=p4 tools/esp32lock exec 120 -- \
+  python -m esptool --port "$(tools/boardport p4)" --before default-reset chip-id
+
+# 2) 烧完的启动横幅也会自报型号与 MAC
+#    I app: ==== AirPlay sender on esp32p4 ====
+#    I app: mac=80:f1:b2:d3:54:66
+```
+
+注意 `--before no-reset chip-id` 对**正在跑 app** 的板子是连不上的（不是故障，是 app 占了
+USB-JTAG）；要读芯片就得允许它复位。日志里的 `==== AirPlay sender on <目标> ====`
+与 `mac=` 一行是判断“刚才刷的是哪块板”的最后一道核对。
+
 
 ## 编译
 

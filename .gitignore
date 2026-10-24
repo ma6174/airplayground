@@ -15,3 +15,5 @@ firmware/.cache/
 
 # Host test build output
 firmware/components/*/test/build/
+__pycache__/
+*.pyc

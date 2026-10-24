@@ -79,8 +79,14 @@ $EDITOR main/app_config_local.h      # Wi-Fi 账号密码；接收端地址是�
 cd firmware
 idf.py set-target esp32s3      # 或 esp32p4
 idf.py build
-idf.py -p /dev/cu.usbmodem… flash
+PORT=$(../tools/boardport p4)      # 按芯片 MAC 解析端口，口名漂移也不怕
+idf.py -p "$PORT" flash
 ```
+
+**端口不要写死**：两块板可以同时插在一台机器上，USB 描述符一模一样，`/dev/cu.usbmodem*`
+名字也会漂。`tools/boardport` 按 USB 序列号（= 芯片 MAC）定位：`tools/boardport list` 看
+当前插着哪几块、各自是什么型号，`tools/boardport p4|s3` 只输出对应端口（没插则退出码 1）。
+识别规则与交叉核对方式见 [docs/runbook.md](docs/runbook.md#刷写前确认刷的是哪块板)。
 
 S3 用原生 USB 口烧完会停在 download 模式，要借一条 esptool 命令发复位（不用换线、
 不用拔插）；P4 烧完自己复位跑起来：

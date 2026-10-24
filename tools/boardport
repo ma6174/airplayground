@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Resolve which USB port belongs to which board.
+
+The ESP32 USB-Serial/JTAG descriptor carries the chip's MAC as its USB serial
+number, and that serial does not move between reboots, replugs or host ports.
+The /dev/cu.usbmodem* name does move, so flashing must pick the port from the
+serial number and never from the name.
+
+Usage:
+    tools/boardport list          # every Espressif port: serial, port, board
+    tools/boardport p4            # port for the ESP32-P4 board
+    tools/boardport s3            # port for the ESP32-S3 board
+
+`esp32p4` / `esp32s3` (the idf.py target names) are accepted as aliases.
+
+Exits 1 when the requested board is not plugged in, so a flash script aborts
+instead of writing firmware to whatever port happens to exist.
+"""
+
+from __future__ import annotations
+
+import glob
+import plistlib
+import subprocess
+import sys
+
+# USB serial number (= chip MAC) -> board. The serial is the identity that
+# survives replugging; everything else here is derived from it.
+BOARDS = {
+    "p4": {"serial": "80:F1:B2:D3:54:66", "model": "ESP32-P4 (JC4880P443C_I_W)"},
+    "s3": {"serial": "24:58:7C:CE:38:7C", "model": "ESP32-S3-WROOM-1"},
+}
+
+
+def is_espressif(node: dict) -> bool:
+    vendor_id = node.get("USB Vendor ID", node.get("idVendor"))
+    if isinstance(vendor_id, str):
+        try:
+            vendor_id = int(vendor_id, 0)
+        except ValueError:
+            vendor_id = None
+    return vendor_id == 0x303A or node.get("USB Vendor Name") == "Espressif"
+
+
+def usb_devices() -> list[dict]:
+    """Espressif USB devices with their serial number and USB location id."""
+    raw = subprocess.run(
+        ["ioreg", "-a", "-p", "IOUSB", "-l", "-w", "0"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    found: list[dict] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if is_espressif(node):
+                found.append(
+                    {
+                        "serial": node.get("USB Serial Number"),
+                        "location": node.get("locationID"),
+                        "name": node.get("USB Product Name"),
+                    }
+                )
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(plistlib.loads(raw))
+    return found
+
+
+def normalize(target: str) -> str:
+    """Accept both the short board name and the idf.py target name."""
+    return target[5:] if target.startswith("esp32") else target
+
+
+def port_for_location(location: int) -> str | None:
+    """macOS names the callout device after the USB location id.
+
+    locationID 0x01110000 -> /dev/cu.usbmodem11101. The low bits encode the
+    interface, so the name is rebuilt from the id and then checked against the
+    device nodes that actually exist."""
+    candidates = [f"/dev/cu.usbmodem{(location >> 16):x}0{interface}" for interface in (1, 0, 2)]
+    for candidate in candidates:
+        if glob.glob(candidate):
+            return candidate
+    return None
+
+
+def collect() -> list[dict]:
+    devices = []
+    for device in usb_devices():
+        serial = (device["serial"] or "").upper()
+        location = device["location"]
+        port = port_for_location(location) if location is not None else None
+        board = next((name for name, info in BOARDS.items() if info["serial"] == serial), None)
+        devices.append(
+            {
+                "serial": serial or "?",
+                "port": port,
+                "board": board,
+                "model": BOARDS[board]["model"] if board else "unknown board",
+                "product": device["name"],
+            }
+        )
+    return devices
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("usage: tools/boardport list|p4|s3", file=sys.stderr)
+        return 2
+    target = normalize(argv[1].lower())
+
+    if target in ("list", "--list", "-l"):
+        devices = collect()
+        if not devices:
+            print("no Espressif USB device found", file=sys.stderr)
+            return 1
+        for device in devices:
+            print(
+                f"{device['board'] or '?':2}  {device['port'] or '(no port)':24}"
+                f"  serial={device['serial']}  {device['model']}"
+            )
+        return 0
+
+    if target not in BOARDS:
+        print(
+            f"unknown board \"{target}\", expected one of: {', '.join(BOARDS)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    wanted = BOARDS[target]["serial"]
+    for device in collect():
+        if device["serial"] == wanted:
+            if device["port"] is None:
+                print(
+                    f"board {target} ({wanted}) is on USB but has no /dev/cu.usbmodem node yet",
+                    file=sys.stderr,
+                )
+                return 1
+            print(device["port"])
+            return 0
+
+    seen = ", ".join(f"{d['serial']}@{d['port']}" for d in collect()) or "nothing"
+    print(f"board {target} ({wanted}) is not plugged in; found: {seen}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
