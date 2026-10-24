@@ -8,7 +8,7 @@
 #include "airplay.h"
 #include "app_config.h"
 #include "app_identity.h"
-#include "discovery.h"
+#include "ap_discovery.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -46,7 +46,7 @@ static char s_local_ip[16];
 static char s_target_host[48];
 /* Name this receiver is known by in the list: the mDNS name when one was used,
  * otherwise the address the session was aimed at. */
-static char s_target_name[DISCOVERY_NAME_LEN];
+static char s_target_name[AP_DISCOVERY_NAME_LEN];
 /* Replies assembled for /start, including the list of names seen when a
  * requested receiver is not found. */
 static char s_reply[512];
@@ -93,7 +93,7 @@ static void session_task(void *argument)
         if (err == ESP_OK || airplay_last_session_streamed()) {
             /* A receiver that never answers a browse announcement is only ever
              * seen through a working session. */
-            discovery_remember(s_target_name, s_target_host, s_config.port, s_config.legacy);
+            ap_discovery_remember(s_target_name, s_target_host, s_config.port, s_config.legacy);
         }
         /* The session ends on failure, on /stop, or when the receiver goes
          * away. Nothing restarts it automatically: /start does that. */
@@ -183,9 +183,9 @@ static const char *hook_start(const pin_start_request_t *request)
 
     if (name != NULL && name[0] != '\0') {
         airplay_target_t target;
-        if (!discovery_find(name, &target)) {
-            airplay_target_t found[DISCOVERY_MAX_TARGETS];
-            int count = discovery_snapshot(found, DISCOVERY_MAX_TARGETS);
+        if (!ap_discovery_find(name, &target)) {
+            airplay_target_t found[AP_DISCOVERY_MAX_TARGETS];
+            int count = ap_discovery_snapshot(found, AP_DISCOVERY_MAX_TARGETS);
             size_t used = (size_t)snprintf(s_reply, sizeof(s_reply),
                                            "no receiver matches \"%s\"", name);
             if (count > 0) {
@@ -227,8 +227,8 @@ static const char *hook_start(const pin_start_request_t *request)
 
 static const char *hook_targets(char *buf, size_t len)
 {
-    airplay_target_t targets[DISCOVERY_MAX_TARGETS];
-    int count = discovery_snapshot(targets, DISCOVERY_MAX_TARGETS);
+    airplay_target_t targets[AP_DISCOVERY_MAX_TARGETS];
+    int count = ap_discovery_snapshot(targets, AP_DISCOVERY_MAX_TARGETS);
     if (count == 0) {
         snprintf(buf, len, "no AirPlay receiver on the LAN\n");
         return buf;
@@ -249,7 +249,7 @@ static const char *hook_targets(char *buf, size_t len)
 static const char *hook_forget(const char *name)
 {
     static char reply[96];
-    if (discovery_forget(name)) {
+    if (ap_discovery_forget(name)) {
         ESP_LOGI(TAG, "receiver \"%s\" forgotten", name);
         snprintf(reply, sizeof(reply), "forgotten %s\n", name);
     } else {
@@ -471,7 +471,7 @@ void app_main(void)
         ESP_LOGE(TAG, "cannot start the capture listener");
     }
 #endif
-    if (discovery_start() != ESP_OK) {
+    if (ap_discovery_start() != ESP_OK) {
         ESP_LOGW(TAG, "mDNS discovery unavailable; /targets will not work");
     }
     if (pin_server_start() != ESP_OK) {
