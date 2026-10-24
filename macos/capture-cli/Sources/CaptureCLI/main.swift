@@ -4,6 +4,7 @@ import VideoToolbox
 import CoreMedia
 import CoreVideo
 import CoreGraphics
+import AVFoundation
 import Darwin
 
 struct Options {
@@ -90,15 +91,21 @@ struct Target {
 
 final class H264Encoder {
     private var session: VTCompressionSession?
-    private let output: FileHandle
+    private let output: FileHandle?
+    private let mp4URL: URL?
+    private var writer: AVAssetWriter?
+    private var writerInput: AVAssetWriterInput?
     private let lock = NSLock()
     private var failed: Error?
     private var frameCount = 0
     private let width: Int
     private let height: Int
 
-    init(width: Int, height: Int, fps: Int, bitrate: Int, output: FileHandle) throws {
-        self.width = width; self.height = height; self.output = output
+    init(width: Int, height: Int, fps: Int, bitrate: Int, output: FileHandle?, mp4URL: URL? = nil) throws {
+        guard (output != nil) != (mp4URL != nil) else { throw CLIError.message("必须选择一种输出格式") }
+        self.output = output
+        self.mp4URL = mp4URL
+        self.width = width; self.height = height
         var s: VTCompressionSession?
         let status = VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: H264Encoder.callback, refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &s)
         guard status == noErr, let s else { throw CLIError.message("无法创建 H.264 编码器：\(status)") }
@@ -123,7 +130,14 @@ final class H264Encoder {
 
     func finish() {
         if let session { VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid); VTCompressionSessionInvalidate(session) }
-        try? output.close()
+        if let writer, let writerInput {
+            writerInput.markAsFinished()
+            let semaphore = DispatchSemaphore(value: 0)
+            writer.finishWriting { semaphore.signal() }
+            semaphore.wait()
+            if writer.status != .completed { setFailure(CLIError.message("MP4 写入失败：\(writer.error?.localizedDescription ?? "未知错误")")) }
+        }
+        try? output?.close()
     }
 
     var error: Error? { lock.lock(); defer { lock.unlock() }; return failed }
@@ -137,7 +151,12 @@ final class H264Encoder {
     }
 
     private func write(_ sampleBuffer: CMSampleBuffer) {
-        guard let format = CMSampleBufferGetFormatDescription(sampleBuffer), let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        guard let format = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        if let mp4URL {
+            writeMP4(sampleBuffer, format: format, url: mp4URL)
+            return
+        }
+        guard let output, let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
         if frameCount == 0 { writeParameterSets(format) }
         var length = 0; var pointer: UnsafeMutablePointer<Int8>?
         guard CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == noErr, let pointer else { return }
@@ -155,7 +174,29 @@ final class H264Encoder {
         for index in 0..<2 {
             var parameter: UnsafePointer<UInt8>?; var size = 0; var count = 0
             guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &parameter, parameterSetSizeOut: &size, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil) == noErr, let parameter else { continue }
-            output.write(Data([0, 0, 0, 1])); output.write(Data(bytes: parameter, count: size))
+            output?.write(Data([0, 0, 0, 1])); output?.write(Data(bytes: parameter, count: size))
+        }
+    }
+
+    private func writeMP4(_ sampleBuffer: CMSampleBuffer, format: CMFormatDescription, url: URL) {
+        if writer == nil {
+            do {
+                try? FileManager.default.removeItem(at: url)
+                let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mp4)
+                let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+                input.expectsMediaDataInRealTime = true
+                guard assetWriter.canAdd(input) else { throw CLIError.message("MP4 不支持 H.264 视频输入") }
+                assetWriter.add(input)
+                guard assetWriter.startWriting() else { throw CLIError.message("无法创建 MP4：\(assetWriter.error?.localizedDescription ?? "未知错误")") }
+                assetWriter.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+                writer = assetWriter
+                writerInput = input
+            } catch { setFailure(error); return }
+        }
+        guard let writerInput else { return }
+        if writerInput.isReadyForMoreMediaData {
+            guard writerInput.append(sampleBuffer) else { setFailure(CLIError.message("MP4 视频帧写入失败：\(writer?.error?.localizedDescription ?? "未知错误")")); return }
+            frameCount += 1
         }
     }
 }
@@ -201,16 +242,20 @@ func makeTarget(_ options: Options, content: SCShareableContent) throws -> Targe
 
 func record(_ options: Options, content: SCShareableContent) async throws {
     let target = try makeTarget(options, content: content)
-    let output: FileHandle
+    let outputURL = options.output.map { URL(fileURLWithPath: $0) }
+    let isMP4 = outputURL?.pathExtension.lowercased() == "mp4"
+    let output: FileHandle?
     if options.stdout {
         output = FileHandle.standardOutput
+    } else if isMP4 {
+        output = nil
     } else {
-        let url = URL(fileURLWithPath: options.output!)
+        let url = outputURL!
         FileManager.default.createFile(atPath: url.path, contents: nil)
         output = try FileHandle(forWritingTo: url)
     }
     let bitrate = options.bitrate ?? max(1_000_000, target.width * target.height * options.fps / 8)
-    let encoder = try H264Encoder(width: target.width, height: target.height, fps: options.fps, bitrate: bitrate, output: output)
+    let encoder = try H264Encoder(width: target.width, height: target.height, fps: options.fps, bitrate: bitrate, output: output, mp4URL: isMP4 ? outputURL : nil)
     let delegate = CaptureDelegate(encoder: encoder)
     let config = SCStreamConfiguration()
     config.width = target.width; config.height = target.height

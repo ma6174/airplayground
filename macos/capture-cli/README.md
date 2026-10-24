@@ -1,6 +1,6 @@
 # capture-cli
 
-macOS 屏幕/窗口捕获命令行工具。使用 `ScreenCaptureKit` 捕获内容，使用 `VideoToolbox` 编码为 H.264 Annex-B 视频流。
+macOS 屏幕/窗口捕获命令行工具。使用 `ScreenCaptureKit` 捕获内容，使用 `VideoToolbox` 编码为 H.264；支持 Annex-B 裸流和 MP4 文件。
 
 ## 构建
 
@@ -33,6 +33,9 @@ capture-cli record --display 0 --output screen.h264 --duration 10
 # 捕获窗口
 capture-cli record --window-id 1234 --output window.h264
 
+# 导出 MP4
+capture-cli record --display 0 --output screen.mp4 --duration 10
+
 # 输出到标准输出；日志始终写入 stderr
 capture-cli record --display 0 --stdout | ffplay -f h264 -
 ```
@@ -45,4 +48,4 @@ capture-cli record --display 0 --stdout | ffplay -f h264 -
 - `--duration SECONDS`：自动停止；未指定时使用 Ctrl-C
 - `--no-cursor`：不捕获鼠标指针
 
-输出是 Annex-B H.264，包含 SPS/PPS，便于用 `ffplay`、`ffprobe` 或后续 AirPlay 发送端读取。当前版本只处理视频，不处理音频，也不接触 ESP32 固件。
+`.h264`/`.264` 输出是包含 SPS/PPS 的 Annex-B H.264，便于用 `ffplay`、`ffprobe` 或后续 AirPlay 发送端读取；`.mp4` 输出使用系统 `AVAssetWriter` 封装 H.264。当前版本只处理视频，不处理音频，也不接触 ESP32 固件。

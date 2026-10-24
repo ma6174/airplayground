@@ -15,16 +15,16 @@ if [ "${2:-}" = "--universal" ]; then
     trap 'rm -rf "$TMP"' EXIT INT TERM
     swiftc $COMMON_FLAGS -o "$TMP/capture-cli-arm64" "$SRC" \
         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
-        -framework CoreVideo -framework CoreGraphics
+        -framework CoreVideo -framework CoreGraphics -framework AVFoundation
     swiftc -parse-as-library -O -target x86_64-apple-macos12.3 -sdk "$SDK" \
         -o "$TMP/capture-cli-x86_64" "$SRC" \
         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
-        -framework CoreVideo -framework CoreGraphics
+        -framework CoreVideo -framework CoreGraphics -framework AVFoundation
     lipo -create "$TMP/capture-cli-arm64" "$TMP/capture-cli-x86_64" -output "$OUT"
 else
     swiftc $COMMON_FLAGS -o "$OUT" "$SRC" \
         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
-        -framework CoreVideo -framework CoreGraphics
+        -framework CoreVideo -framework CoreGraphics -framework AVFoundation
 fi
 
 printf 'built %s\n' "$OUT"
