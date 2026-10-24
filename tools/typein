@@ -1,0 +1,161 @@
+#!/bin/bash
+# typein — 把文字输入到指定 macOS 应用当前聚焦的输入框，可选按回车（仅 macOS）
+#
+# 键盘事件由 osascript（System Events）发送。macOS 规定键盘注入必须由持
+# 「辅助功能」授权的进程执行，没有免权限的实现方式：需要给运行本命令的
+# 宿主 App（终端等）授权一次（系统设置 → 隐私与安全性 → 辅助功能），
+# 授权后立即可用。
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+typein — 把文字输入到指定 macOS 应用当前聚焦的输入框，可选按回车
+
+用法:
+  typein --app <应用名> [--text <文字>] [--enter] [选项]
+  typein --apps          # 列出正在运行的应用名（用来确定 --app 怎么写）
+
+选项:
+  --app <名>      目标应用（应用名，大小写不敏感，支持唯一子串匹配）
+  --text <文>     要输入的文字（默认经剪贴板粘贴：支持中文/多行，不受输入法影响）
+  --enter         输入完成后按一次 Return
+  --delay <秒>    聚焦后等待秒数，默认 0.6（应用聚焦慢就调大）
+  --mode type     逐键模拟真实打字（默认 paste；type 会受当前输入法状态影响）
+  -h, --help      显示本帮助
+
+说明:
+  输入打的是目标应用获得焦点后的那个输入框（多数聊天/编辑类应用聚焦后
+  光标自动落在输入框）。聚焦确认失败时拒绝输入，不会把文字打到别的应用。
+  paste 模式会临时占用剪贴板并在结束后尽量还原（非文本剪贴板内容无法还原）。
+
+权限:
+  需要给运行本命令的宿主 App 授「辅助功能」权限：
+  系统设置 → 隐私与安全性 → 辅助功能 → 添加并勾选对应 App。
+
+示例:
+  typein --app WeChat --text "晚上吃饭吗" --enter
+  typein --app TextEdit --text $'第一行\n第二行'
+EOF
+}
+
+APP=""; TEXT=""; ENTER=0; DELAY="0.6"; MODE="paste"; LIST=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app)     APP="$2"; shift 2 ;;
+    --text)    TEXT="$2"; shift 2 ;;
+    --enter)   ENTER=1; shift ;;
+    --delay)   DELAY="$2"; shift 2 ;;
+    --mode)    MODE="${2-}"; shift 2 ;;
+    --apps)    LIST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "typein: 未知参数: $1（--help 查看用法）" >&2; exit 2 ;;
+  esac
+done
+
+grant_help() {
+  cat >&2 <<'EOF'
+typein: 当前环境没有发送按键的「辅助功能」授权：
+  系统设置 → 隐私与安全性 → 辅助功能 → 添加并勾选运行本命令的 App
+  （如 kitty、Terminal、iTerm），授权后无需重启即可重试。
+EOF
+}
+
+if [[ $LIST -eq 1 ]]; then
+  osascript -e 'tell application "System Events" to get name of every process whose background only is false' \
+    | tr ',' '\n' | sed 's/^ *//'
+  exit 0
+fi
+
+[[ -z "$APP" ]] && { echo "typein: --app 必填（--apps 可列出应用名）" >&2; exit 2; }
+[[ -z "$TEXT" && $ENTER -eq 0 ]] && { echo "typein: --text 与 --enter 至少要给一个" >&2; exit 2; }
+[[ "$MODE" != "paste" && "$MODE" != "type" ]] && { echo "typein: --mode 只支持 paste|type" >&2; exit 2; }
+
+# app/text 走临时文件而不是命令行内嵌：AppleScript 直接 read 文件，
+# 任何字符（引号、反斜杠、换行）都无需转义。
+APPF=$(mktemp) || exit 1
+TEXTF=$(mktemp) || exit 1
+trap 'rm -f "$APPF" "$TEXTF"' EXIT
+printf '%s' "$APP" > "$APPF"
+printf '%s' "$TEXT" > "$TEXTF"
+
+# 找应用（精确优先、唯一子串兜底）→ 聚焦并确认前台 → 输入 → 回车。
+# 聚焦确认失败绝不输入，避免文字落到别的应用里。
+run_engine() {
+  osascript - "$APPF" "$TEXTF" "$ENTER" "$DELAY" "$MODE" <<'AS'
+on run argv
+	set appPat to (read POSIX file (item 1 of argv) as «class utf8»)
+	set textToType to ""
+	try
+		set textToType to (read POSIX file (item 2 of argv) as «class utf8»)
+	end try
+	set wantEnter to (item 3 of argv) as integer
+	set waitSec to (item 4 of argv) as real
+	set pasteMode to (item 5 of argv is "paste")
+
+	tell application "System Events"
+		set exacts to (name of every process whose name is appPat and background only is false)
+	end tell
+	set procName to ""
+	if (count of exacts) > 0 then
+		set procName to item 1 of exacts
+	else
+		tell application "System Events" to ¬
+			set partials to (name of every process whose name contains appPat and background only is false)
+		if (count of partials) is 0 then
+			error "应用未运行: " & appPat & "（typein --apps 可列出应用名）"
+		else if (count of partials) > 1 then
+			set AppleScript's text item delimiters to ", "
+			error "匹配到多个应用: " & (partials as text) & "，请写更精确的名字"
+		end if
+		set procName to item 1 of partials
+	end if
+
+	tell application "System Events" to set frontmost of process procName to true
+	delay waitSec
+	tell application "System Events" to set frontOK to (frontmost of process procName)
+	if not frontOK then
+		activate application procName
+		delay waitSec
+		tell application "System Events" to set frontOK to (frontmost of process procName)
+		if not frontOK then
+			error "无法把焦点交给 " & procName & "，为安全起见本次不输入"
+		end if
+	end if
+
+	if (length of textToType) > 0 then
+		if pasteMode then
+			set savedClip to missing value
+			try
+				set savedClip to the clipboard
+			end try
+			set the clipboard to textToType
+			delay 0.05
+			tell application "System Events" to keystroke "v" using command down
+			delay 0.15
+			if savedClip is not missing value then set the clipboard to savedClip
+		else
+			tell application "System Events" to keystroke textToType
+		end if
+	end if
+
+	if wantEnter is 1 then
+		delay 0.1
+		tell application "System Events" to key code 36
+	end if
+	return "ok → " & procName
+end run
+AS
+}
+
+set +e
+OUT=$(run_engine 2>&1)
+RC=$?
+set -e
+if [[ $RC -eq 0 ]]; then
+  printf '%s\n' "$OUT"
+  exit 0
+fi
+printf '%s\n' "$OUT" >&2
+grep -qE 'not allowed to send keystrokes|not allowed assistive access|\(1002\)|error -25211|error -1719' <<<"$OUT" && grant_help || true
+exit "$RC"
