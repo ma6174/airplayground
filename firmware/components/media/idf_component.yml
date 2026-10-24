@@ -1,0 +1,3 @@
+## Runtime H.264 encoder for the live video source.
+dependencies:
+  espressif/esp_h264: "1.4.1"
