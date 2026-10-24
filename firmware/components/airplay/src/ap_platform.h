@@ -70,6 +70,9 @@ int ap_socket_connect(const char *host, uint16_t port, uint32_t timeout_ms);
 /* Binds a UDP socket to an ephemeral port and reports which one. Returns fd or -1. */
 int ap_socket_udp_open(uint16_t *port_out);
 
+/* Sends one datagram to host:port over fd. 0 on success. */
+int ap_socket_send_to(int fd, const char *host, uint16_t port, const void *data, size_t len);
+
 /* Waits until fd is readable (writable == false) or writable.
  * Returns 1 when ready, 0 on timeout, -1 on error. */
 int ap_socket_wait(int fd, bool writable, uint32_t timeout_ms);

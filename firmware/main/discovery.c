@@ -340,6 +340,50 @@ int discovery_snapshot(airplay_target_t *out, int max)
     return count;
 }
 
+void discovery_remember(const char *name, const char *host, uint16_t port, bool legacy)
+{
+    if (name == NULL || name[0] == '\0' || host == NULL || host[0] == '\0' || port == 0) {
+        return;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return;
+    }
+    for (int i = 0; i < s_entry_count; i++) {
+        entry_t *entry = &s_entries[i];
+        if (strcasecmp(entry->target.name, name) != 0) {
+            continue;
+        }
+        bool changed = strcmp(entry->target.host, host) != 0 || entry->target.port != port ||
+                       entry->target.legacy != legacy;
+        strlcpy(entry->target.host, host, sizeof(entry->target.host));
+        entry->target.port = port;
+        entry->target.legacy = legacy;
+        entry->via_airplay = true;
+        entry->seen = xTaskGetTickCount();
+        if (changed && legacy) {
+            persist_legacy_locked();
+        }
+        xSemaphoreGive(s_lock);
+        return;
+    }
+    if (s_entry_count < DISCOVERY_MAX_TARGETS) {
+        entry_t *entry = &s_entries[s_entry_count++];
+        memset(entry, 0, sizeof(*entry));
+        strlcpy(entry->target.name, name, sizeof(entry->target.name));
+        strlcpy(entry->target.host, host, sizeof(entry->target.host));
+        entry->target.port = port;
+        entry->target.legacy = legacy;
+        entry->via_airplay = true;
+        entry->seen = xTaskGetTickCount();
+        if (legacy) {
+            persist_legacy_locked();
+        }
+        ESP_LOGI(TAG, "receiver \"%s\" at %s:%u remembered from a session", name, host,
+                 (unsigned)port);
+    }
+    xSemaphoreGive(s_lock);
+}
+
 bool discovery_forget(const char *name)
 {
     if (name == NULL || name[0] == '\0') {

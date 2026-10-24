@@ -139,6 +139,25 @@ int ap_socket_connect(const char *host, uint16_t port, uint32_t timeout_ms)
     return fd;
 }
 
+int ap_socket_send_to(int fd, const char *host, uint16_t port, const void *data, size_t len)
+{
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    char service[8];
+    snprintf(service, sizeof(service), "%u", (unsigned)port);
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, service, &hints, &res) != 0 || res == NULL) {
+        return -1;
+    }
+    int rc = sendto(fd, data, len, 0, res->ai_addr, res->ai_addrlen) == (ssize_t)len ? 0 : -1;
+    freeaddrinfo(res);
+    return rc;
+}
+
 int ap_socket_udp_open(uint16_t *port_out)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);

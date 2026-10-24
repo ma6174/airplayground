@@ -31,7 +31,22 @@ void ap_frame_build_video(uint8_t header[AP_FRAME_HEADER_LEN], size_t payload_le
 
 void ap_frame_build_heartbeat(uint8_t header[AP_FRAME_HEADER_LEN]);
 
+/* Legacy (AirTunes) header: payload length and record type in [4], boot NTP
+ * timestamp at [8:16] for video records, source/display float pairs at
+ * [16:32] and [56:64] for the codec record. No timeline, no Poly1305 tag. */
+/* record_type 0 = video access unit, 1 = codec config. Apple marks sync frames
+ * with 0x10 at offset 5 and the codec record with 0x0116 at offset 6. */
+void ap_frame_build_legacy(uint8_t header[AP_FRAME_HEADER_LEN], size_t payload_len,
+                           uint8_t record_type, uint64_t timestamp, uint16_t width,
+                           uint16_t height, bool keyframe);
+
 /* True when the AVCC access unit contains an IDR slice (NAL type 5). The
  * still-frame source does not label its frames, and the receiver needs the
  * keyframe flag to reset its decoder. */
 bool ap_avcc_has_idr(const uint8_t *avcc, size_t len);
+
+/* Prepends the SPS/PPS carried in an avcC record to an access unit, as
+ * length-prefixed NALUs. Hardware decoders that ignore the out-of-band record
+ * need them in-band. Returns the total length, or 0 when the copy does not fit. */
+size_t ap_frame_add_parameter_sets(uint8_t *out, size_t cap, const uint8_t *avcc,
+                                   size_t avcc_len, const uint8_t *au, size_t au_len);

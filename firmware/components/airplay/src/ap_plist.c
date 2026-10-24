@@ -3,10 +3,10 @@
 #include <string.h>
 
 #define AP_PLIST_MAX_OBJECTS 64
-/* A dictionary stores its keys and values as separate references, so a
- * 13-entry dictionary needs 26 child slots. The PTP session descriptor is the
- * widest thing the sender builds. */
-#define AP_PLIST_MAX_CHILDREN 32
+/* A dictionary stores its keys and values as separate references, so the
+ * widest one the sender builds - the legacy SETUP 1 identity block - needs
+ * two slots per entry. */
+#define AP_PLIST_MAX_CHILDREN 48
 
 typedef struct {
     uint32_t offset;

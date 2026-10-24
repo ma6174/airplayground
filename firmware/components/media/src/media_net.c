@@ -38,16 +38,21 @@ static const char *TAG = "media_net";
 /* Frames are queued instead of overwritten: an H.264 stream breaks the moment a
  * P frame goes missing, and the receiver cannot recover until the next IDR.
  * The consumer holds one slot while it encrypts and sends it, so the depth is
- * one more than the queue: at the slowest rate we support, three queued frames
- * are still several hundred milliseconds of sending.
+ * one more than the queue. The depth has to swallow a keyframe: a 26 KB IDR
+ * costs roughly 150 ms on the mirror channel, during which the encoder keeps
+ * producing frames at the capture rate.
  *
  * The producer pushes back rather than dropping: TCP's own flow control then
  * slows the macOS encoder down, which keeps the reference chain intact. Only a
  * stall longer than NET_PUSH_TIMEOUT_MS drops the oldest frame, and the client
  * sends a fresh IDR soon enough (see its keyframe interval) to resynchronise. */
-#define NET_QUEUE_DEPTH 3
+#define NET_QUEUE_DEPTH 8
 #define NET_SLOTS (NET_QUEUE_DEPTH + 1)
 #define NET_PUSH_TIMEOUT_MS 300
+/* No session drains the queue between /start calls, but the capture client
+ * keeps streaming. Recognising that quiet consumer keeps the queue from being
+ * churned (and logged) frame by frame until the next session begins. */
+#define NET_CONSUMER_IDLE_MS 500
 #define NET_PUSH_POLL_MS 5
 /* A client that vanishes without closing its socket (killed while the link is
  * down, or a machine that went to sleep) leaves recv() blocked forever. Without
@@ -65,6 +70,10 @@ static struct {
     uint8_t *slots[NET_SLOTS];
     size_t slot_len[NET_SLOTS];
     bool slot_idr[NET_SLOTS];
+    TickType_t last_consume;
+    /* Frames the session could not use: the queue overflowed, versus frames
+     * skipped while waiting for an IDR after the session began. */
+    uint32_t dropped_overflow;
     /* Index of the oldest queued frame and how many are queued. */
     uint8_t head;
     uint8_t count;
@@ -225,9 +234,19 @@ static bool handle_frame(int fd)
         if (!room && xTaskGetTickCount() > deadline) {
             /* The consumer has stalled: give up the oldest frame so the client
              * keeps making progress, and let it resynchronise on its next IDR. */
+            bool idle = (xTaskGetTickCount() - s_net.last_consume) > pdMS_TO_TICKS(NET_CONSUMER_IDLE_MS);
+            if (idle) {
+                /* Nobody is draining the queue: skip this frame instead of
+                 * evicting the ones already waiting for a session. */
+                xSemaphoreGive(s_net.lock);
+                return drain_frame(fd, au_len);
+            }
             s_net.head = (uint8_t)((s_net.head + 1) % NET_SLOTS);
             s_net.count--;
-            s_net.dropped++;
+            s_net.dropped_overflow++;
+            ESP_LOGW(TAG, "queue full: drop oldest after %lums without a consume (depth %u)",
+                     (unsigned long)(xTaskGetTickCount() - s_net.last_consume),
+                     (unsigned)s_net.count);
             /* The queue length and the semaphore must stay in step. */
             xSemaphoreTake(s_net.queued, 0);
             room = true;
@@ -301,8 +320,11 @@ static void capture_task(void *arg)
         xSemaphoreGive(s_net.lock);
         while (xSemaphoreTake(s_net.queued, 0) == pdTRUE) {
         }
-        ESP_LOGW(TAG, "capture client disconnected (%u frame(s) dropped, %u oversized)",
-                 (unsigned)s_net.dropped, (unsigned)s_net.oversized);
+        ESP_LOGW(TAG, "capture client disconnected (%u frame(s) dropped, %u before an IDR, "
+                  "%u oversized)",
+                 (unsigned)s_net.dropped_overflow, (unsigned)s_net.dropped,
+                 (unsigned)s_net.oversized);
+        s_net.dropped_overflow = 0;
         s_net.dropped = 0;
         s_net.oversized = 0;
     }
@@ -318,8 +340,12 @@ static const uint8_t *net_codec_record(void *user, size_t *len)
      * previous session - or before the encoder's last IDR - and a P frame it
      * cannot reference leaves the receiver showing nothing at all. */
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.head = 0;
+    s_net.count = 0;
     s_net.need_idr = true;
     xSemaphoreGive(s_net.lock);
+    while (xSemaphoreTake(s_net.queued, 0) == pdTRUE) {
+    }
     *len = s_net.avcc_len;
     return s_net.avcc;
 }
@@ -342,6 +368,7 @@ static esp_err_t net_next_frame(void *user, const uint8_t **au, size_t *len, boo
         uint8_t slot = s_net.head;
         s_net.head = (uint8_t)((s_net.head + 1) % NET_SLOTS);
         s_net.count--;
+        s_net.last_consume = xTaskGetTickCount();
         bool waiting_for_idr = s_net.need_idr && !s_net.slot_idr[slot];
         if (!waiting_for_idr) {
             s_net.need_idr = false;

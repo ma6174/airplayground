@@ -29,6 +29,12 @@
 #define APP_AIRPLAY_TARGET_HOST "192.168.1.10"
 #endif
 
+/* Name the default receiver is listed under once a session with it succeeds.
+ * Receivers that never answer an mDNS browse would otherwise stay invisible. */
+#ifndef APP_AIRPLAY_TARGET_NAME
+#define APP_AIRPLAY_TARGET_NAME APP_AIRPLAY_TARGET_HOST
+#endif
+
 #ifndef APP_AIRPLAY_TARGET_PORT
 #define APP_AIRPLAY_TARGET_PORT 7000
 #endif
@@ -62,6 +68,56 @@
 /* Host that serves the code (defaults to the receiver). */
 #ifndef APP_PIN_FETCH_HOST
 #define APP_PIN_FETCH_HOST APP_AIRPLAY_TARGET_HOST
+#endif
+
+/* Talk the legacy AirTunes protocol instead of HAP: for third-party receivers
+ * that advertise AppleTV3,2 / AirTunes 220.x (many projectors). */
+#ifndef APP_AIRPLAY_LEGACY
+#define APP_AIRPLAY_LEGACY 0
+#endif
+
+/* How the legacy mirror stream reaches a receiver that hands out no dataPort:
+ *   1 = RTSP interleaved (`$`+channel+length) on the control connection
+ *   2 = raw records ([128-byte header][payload]) on the control connection
+ *   3 = interleaved on a second connection to the RTSP port
+ *   4 = raw records on a second connection to the RTSP port
+ * Receivers that do answer SETUP with a dataPort ignore this. */
+#ifndef APP_LEGACY_DATA_MODE
+#define APP_LEGACY_DATA_MODE 1
+#endif
+
+/* Port for the mirror SETUP when the receiver answers it on another port than
+ * the advertised one (0 = use the advertised port). */
+#ifndef APP_LEGACY_STREAM_PORT
+#define APP_LEGACY_STREAM_PORT 0
+#endif
+
+/* How the mirror stream keys are derived from the FairPlay-unwrapped AES key:
+ * 0 hashes the bare key (Apple's own sender, and the boxes that emulate it),
+ * 1 mixes the pair-verify secret, 2 mixes 32 zero bytes (RPiPlay/UxPlay, which
+ * always run the mixing step even when no pairing happened). */
+#ifndef APP_LEGACY_KEY_MIX
+#define APP_LEGACY_KEY_MIX 0
+#endif
+
+/* 0 derives the mirror IV, 1 sends eiv through unchanged. */
+#ifndef APP_LEGACY_IV_SOURCE
+#define APP_LEGACY_IV_SOURCE 0
+#endif
+
+/* Send the SPS/PPS in-band with every legacy sync frame. */
+#ifndef APP_LEGACY_INBAND_SPS
+#define APP_LEGACY_INBAND_SPS 1
+#endif
+
+/* Pair before the legacy FairPlay exchange. Apple's own mirroring does not. */
+#ifndef APP_LEGACY_PAIRING
+#define APP_LEGACY_PAIRING 0
+#endif
+
+/* Ask for the audio stream as well (iOS sends one when it mirrors). */
+#ifndef APP_LEGACY_AUDIO
+#define APP_LEGACY_AUDIO 1
 #endif
 
 /* Fallback access point, used when APP_WIFI_SSID is empty. */

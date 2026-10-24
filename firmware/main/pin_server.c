@@ -148,9 +148,11 @@ static esp_err_t handle_start(httpd_req_t *request)
     /* Values arrive percent-encoded, and UTF-8 names expand 3x, so give the
      * scratch buffer room for a longest legal name before decoding. */
     char value[192];
+    pin_start_request_t start = { .port = 0, .data_mode = -1, .key_mix = -1, .iv_source = -1,
+                                  .interval_ms = 0, .sps = -1, .pair = -1, .audio = -1,
+                                  .stream_port = -1 };
     char name[64] = "";
     char host[48] = "";
-    int port = 0;
 
     char query[256];
     esp_err_t err = httpd_req_get_url_query_str(request, query, sizeof(query));
@@ -173,11 +175,37 @@ static esp_err_t handle_start(httpd_req_t *request)
             return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "host is too long\n");
         }
         if (httpd_query_key_value(query, "port", value, sizeof(value)) == ESP_OK) {
-            port = atoi(value);
+            start.port = atoi(value);
+        }
+        if (httpd_query_key_value(query, "mode", value, sizeof(value)) == ESP_OK) {
+            start.data_mode = atoi(value);
+        }
+        if (httpd_query_key_value(query, "mix", value, sizeof(value)) == ESP_OK) {
+            start.key_mix = atoi(value);
+        }
+        if (httpd_query_key_value(query, "iv", value, sizeof(value)) == ESP_OK) {
+            start.iv_source = atoi(value);
+        }
+        if (httpd_query_key_value(query, "sport", value, sizeof(value)) == ESP_OK) {
+            start.stream_port = atoi(value);
+        }
+        if (httpd_query_key_value(query, "audio", value, sizeof(value)) == ESP_OK) {
+            start.audio = atoi(value);
+        }
+        if (httpd_query_key_value(query, "pair", value, sizeof(value)) == ESP_OK) {
+            start.pair = atoi(value);
+        }
+        if (httpd_query_key_value(query, "sps", value, sizeof(value)) == ESP_OK) {
+            start.sps = atoi(value);
+        }
+        if (httpd_query_key_value(query, "fps_ms", value, sizeof(value)) == ESP_OK) {
+            start.interval_ms = atoi(value);
         }
     }
+    start.name = name;
+    start.host = host;
 
-    return httpd_resp_send(request, s_hooks.start(name, host, port), HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(request, s_hooks.start(&start), HTTPD_RESP_USE_STRLEN);
 }
 
 /* The browse takes seconds and the list can be long; keep it off the handler

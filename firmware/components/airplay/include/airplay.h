@@ -78,6 +78,32 @@ typedef struct {
     uint32_t frame_interval_ms;
     /* Long-term controller identity, owned by the caller and persisted there. */
     hap_identity_t *identity;
+    /* Talk the legacy AirTunes protocol (pre-HAP): raw pair exchanges, ANNOUNCE
+     * + two SETUPs, AES-128-CTR mirror records. For receivers advertising
+     * AppleTV3,2 / AirTunes 220.x - modern receivers must stay on the HAP path. */
+    bool legacy;
+    /* Transport for the mirror stream when the receiver hands out no dataPort:
+     * 1 interleaved on the control connection, 2 raw on the control connection,
+     * 3 interleaved on a second connection, 4 raw on a second connection. */
+    uint8_t legacy_data_mode;
+    /* Port that answers the mirror SETUP. Some receivers keep the RTSP stub in
+     * the advertised port and allocate the stream on a second one (0 = same). */
+    uint16_t legacy_stream_port;
+    /* Pair secret fed into the stream key derivation: 0 bare key, 1 the
+     * pair-verify secret, 2 an all-zero secret, 3 raw keys. */
+    uint8_t legacy_key_mode;
+    /* 0 derives the mirror IV with the AirPlayStreamIV hash, 1 uses eiv as it
+     * is. Receivers that skip the derivation need the latter. */
+    uint8_t legacy_iv_source;
+    /* Prepend the SPS/PPS to every legacy sync frame. */
+    bool legacy_inband_sps;
+    /* Run the legacy pair exchanges before FairPlay. Apple's own mirroring has
+     * no pairing at all, and receivers that key the stream off the pairing
+     * secret break when one did happen. */
+    bool legacy_pairing;
+    /* Ask for the type 96 audio stream next to the video one and keep it fed
+     * with silence; some receivers never start rendering video without it. */
+    bool legacy_audio;
 } airplay_config_t;
 
 /* Runs one mirroring session: pair, FairPlay, SETUP, stream still images until
@@ -91,6 +117,10 @@ void airplay_request_stop(void);
 
 /* True between airplay_mirror being requested and it returning. */
 bool airplay_is_running(void);
+
+/* True when the session that just ended delivered at least one frame, i.e. the
+ * receiver completed the handshake and took the stream. */
+bool airplay_last_session_streamed(void);
 
 /* After a failed session: how long the receiver asked us to stay away. Pairing
  * failures are throttled with a HomeKit backoff, and retrying early only

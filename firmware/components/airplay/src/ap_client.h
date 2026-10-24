@@ -27,6 +27,9 @@ typedef struct {
 
 typedef struct {
     int status;
+    /* Set when the reply line was HTTP rather than RTSP: some receivers expose an
+     * AirTunes HTTP stub on the port they advertise and keep RTSP one port up. */
+    bool is_http;
     size_t body_len;
     bool has_challenge;
     char realm[64];
@@ -49,6 +52,10 @@ typedef struct {
     bool has_clock_headers;
     uint64_t received_timestamp_ms;
     uint64_t processing_time_ms;
+    /* Headers every request carries (DACP-ID / Active-Remote). Apple's senders
+     * always send them and some receivers key their session on them. */
+    char extra_headers[2][64];
+
     /* Fixed request and reply buffers: control bodies are small plists, and a
      * receiver must not be able to make the sender allocate. */
     uint8_t request[AP_REQUEST_MAX];
@@ -61,6 +68,9 @@ int ap_client_connect(ap_client_t *client, const char *host, uint16_t port, uint
 /* Adopts an already-connected socket. Used by the host tests to drive the
  * parser over a socketpair. */
 void ap_client_attach_fd(ap_client_t *client, int fd);
+
+/* Sets a header that each request will carry (slot 0 or 1, format "Name: value"). */
+void ap_client_set_extra_header(ap_client_t *client, int slot, const char *line);
 
 void ap_client_close(ap_client_t *client);
 void ap_client_set_password(ap_client_t *client, const char *password);

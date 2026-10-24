@@ -14,8 +14,21 @@
 
 #include "airplay.h"
 #include "ap_client.h"
+
+/* Audio is filler that keeps the channel alive: one packet every 20 ms, which
+ * is 882 samples at the 44.1 kHz rate the audio stream is declared with. The
+ * RTP timestamp has to advance by that many samples, and start on the same
+ * clock the video timestamps use: a receiver that schedules video against the
+ * audio playhead holds the picture back forever when the two clocks disagree
+ * by the age of the device. */
+#define AP_LEGACY_AUDIO_CHUNK 96
+#define AP_LEGACY_AUDIO_INTERVAL_MS 20
+#define AP_LEGACY_AUDIO_SAMPLE_RATE 44100u
+#define AP_LEGACY_AUDIO_SAMPLES_PER_PACKET \
+    (AP_LEGACY_AUDIO_SAMPLE_RATE * AP_LEGACY_AUDIO_INTERVAL_MS / 1000u)
 #include "ap_data.h"
 #include "ap_event.h"
+#include "ap_legacy.h"
 #include "ap_ntp.h"
 #include "ap_platform.h"
 #include "fairplay.h"
@@ -67,6 +80,10 @@ typedef struct ap_session {
     char timing_peer_id[37];
     ap_clock_t clock;
 
+    /* Port the control connection actually uses. Receivers that advertise an
+     * AirTunes HTTP stub keep RTSP one port up, so this can differ from
+     * config->port. */
+    uint16_t control_port;
     int timing_fd;
     uint16_t timing_port;
     int audio_control_fd;
@@ -74,6 +91,29 @@ typedef struct ap_session {
 
     ap_data_channel_t data;
     ap_event_channel_t event;
+
+    /* Legacy (AirTunes) stream state: the ekey-wrapped key is unwrapped on the
+     * receiver with m3, then mixed with the pair-verify secret. */
+    uint8_t aeskey[FP_RAW_KEY_LEN];
+    uint8_t aesiv[FP_IV_LEN];
+    uint8_t legacy_skey[16];
+    uint8_t legacy_siv[16];
+    ap_legacy_ctr_t legacy_ctr;
+    /* 0: receiver handed out a dataPort; 1-4: see legacy_data_mode. */
+    uint8_t legacy_transport;
+    /* Audio side of a legacy session (receivers that gate video on it). */
+    uint16_t legacy_audio_port;
+    int legacy_audio_fd;
+    uint16_t legacy_audio_control_port;
+    uint16_t legacy_audio_seq;
+    uint32_t legacy_audio_rtp_time;
+    ap_legacy_ctr_t legacy_audio_ctr;
+    /* RECORD already went out in the legacy front half. */
+    bool legacy_recorded;
+    /* Receivers that answer the mirror SETUP on a second RTSP port keep that
+     * connection in this client. */
+    ap_client_t stream_client;
+    bool stream_client_open;
 
     /* Protocol scratch. Only the session task touches these buffers. */
     uint8_t msg[1024];

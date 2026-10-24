@@ -14,6 +14,22 @@
 
 #define PIN_SERVER_PORT 8080
 
+/* Query overrides for one session: -1 (or 0 for port) keeps the configured
+ * value. Handy for probing a receiver without reflashing. */
+typedef struct {
+    const char *name;
+    const char *host;
+    int port;
+    int data_mode;
+    int key_mix;
+    int iv_source;
+    int interval_ms;
+    int sps;
+    int pair;
+    int audio;
+    int stream_port;
+} pin_start_request_t;
+
 esp_err_t pin_server_start(void);
 
 /* Handlers for the session-control endpoints. Each returns a short one-line
@@ -23,7 +39,7 @@ typedef struct {
     /* name and host come from the /start query string (?name= or ?host=, plus
      * an optional ?port=); NULL or empty means the configured default
      * receiver. */
-    const char *(*start)(const char *name, const char *host, int port);
+    const char *(*start)(const pin_start_request_t *request);
     const char *(*stop)(void);
     const char *(*status)(void);
     /* Writes the discovered receiver list into buf; returns buf, or NULL when

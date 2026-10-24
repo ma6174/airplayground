@@ -222,7 +222,7 @@ final class NetworkSink {
     /* True when the stream has gone long enough without an IDR that a receiver
      * joining now would sit on an undecodable frame. */
     var needsKeyFrame: Bool {
-        Date().timeIntervalSince(lastIDR) > 5.0
+        Date().timeIntervalSince(lastIDR) > 2.5
     }
 
     /* One line a second: enough to tell an idle capture from a stalled socket
@@ -325,7 +325,11 @@ final class H264Encoder {
         session = s
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        /* Baseline keeps CABAC out of the stream. The cheap decoders behind TV
+         * boxes and projectors usually implement Baseline only, and a Main
+         * profile stream leaves them showing nothing at all. */
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
         /* AverageBitRate alone lets a keyframe spike far above it. A screen full
          * of text (a terminal running top, say) then produces keyframes several
@@ -338,13 +342,13 @@ final class H264Encoder {
         if limitStatus != noErr {
             fputs("编码器不接受码率上限（\(limitStatus)），关键帧可能远超平均值\n", stderr)
         }
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps * 5 as CFTypeRef)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps * 2 as CFTypeRef)
         /* Keyframes are the expensive ones: 1224x846 of text costs a couple of
-         * hundred kilobytes, which takes several frame intervals to send. A
-         * one-second period turns that into visible stutter every second, so
-         * only resynchronise every few seconds. */
+         * hundred kilobytes, which takes several frame intervals to send. The
+         * device queues that many frames, so a two-second period neither stalls
+         * the pipeline nor leaves a broken reference chain waiting long. */
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                             value: 5.0 as CFTypeRef)
+                             value: 2.0 as CFTypeRef)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
         guard VTCompressionSessionPrepareToEncodeFrames(s) == noErr else { throw CLIError.message("无法准备 H.264 编码器") }
     }

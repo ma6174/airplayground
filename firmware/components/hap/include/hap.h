@@ -62,6 +62,18 @@ int hap_verify_v4(hap_verify_t *verify, const uint8_t *in, size_t in_len);
 /* X25519 secret; the root of the control, event and data channel keys. */
 const uint8_t *hap_verify_shared_secret(const hap_verify_t *verify);
 
+/* --- legacy AirTunes pairing primitives (raw exchanges, no TLV8) --- */
+
+/* Ephemeral X25519 key pair for the legacy pair-verify. */
+void hap_x25519_keypair(uint8_t public_key[32], uint8_t private_key[32]);
+/* X25519(shared, private, peer); -1 on a degenerate (all-zero) secret. */
+int hap_x25519_secret(uint8_t shared[32], const uint8_t private_key[32], const uint8_t peer[32]);
+/* Verifies a receiver's Ed25519 signature during legacy pair-verify. */
+int hap_ed25519_verify(const uint8_t public_key[32], const uint8_t *message, size_t message_len,
+                       const uint8_t signature[64]);
+/* Raw SHA-512, used by the legacy key derivations. */
+void hap_sha512(const uint8_t *in, size_t in_len, uint8_t out[64]);
+
 /* Channel key derivation. Labels are part of the wire protocol. */
 void hap_derive_control_keys(const uint8_t shared[HAP_SHARED_SECRET_LEN], uint8_t write_key[HAP_KEY_LEN],
                              uint8_t read_key[HAP_KEY_LEN]);

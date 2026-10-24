@@ -9,6 +9,7 @@ idf_component_register(
         "src/hap_kdf.c"
         "src/hap_identity.c"
         "src/hap_x25519.c"
+        "src/hap_legacy.c"
         "third_party/ed25519/randombytes.c"
         "third_party/ed25519/add_scalar.c"
         "third_party/ed25519/fe.c"

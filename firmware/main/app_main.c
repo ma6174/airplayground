@@ -42,6 +42,9 @@ static char s_local_ip[16];
 /* The target lives in a writable buffer so /start can aim the session at a
  * discovered receiver; it is only written while no session is running. */
 static char s_target_host[48];
+/* Name this receiver is known by in the list: the mDNS name when one was used,
+ * otherwise the address the session was aimed at. */
+static char s_target_name[DISCOVERY_NAME_LEN];
 /* Replies assembled for /start, including the list of names seen when a
  * requested receiver is not found. */
 static char s_reply[512];
@@ -85,6 +88,11 @@ static void session_task(void *argument)
         snprintf(s_last_result, sizeof(s_last_result),
                  err == ESP_OK ? "last session: ok" : "last session: %s",
                  err == ESP_OK ? "" : esp_err_to_name(err));
+        if (err == ESP_OK || airplay_last_session_streamed()) {
+            /* A receiver that never answers a browse announcement is only ever
+             * seen through a working session. */
+            discovery_remember(s_target_name, s_target_host, s_config.port, s_config.legacy);
+        }
         /* The session ends on failure, on /stop, or when the receiver goes
          * away. Nothing restarts it automatically: /start does that. */
         s_session_stop = false;
@@ -92,11 +100,50 @@ static void session_task(void *argument)
     }
 }
 
-static const char *hook_start(const char *name, const char *host, int port)
+static const char *hook_start(const pin_start_request_t *request)
 {
     if (airplay_is_running()) {
         return "already mirroring\n";
     }
+
+    /* Per-session overrides let a receiver be probed without reflashing. Each
+     * session starts from the compiled configuration, so an override from an
+     * earlier /start cannot leak into this one. */
+    s_config.legacy_data_mode = APP_LEGACY_DATA_MODE;
+    s_config.legacy_key_mode = (uint8_t)APP_LEGACY_KEY_MIX;
+    s_config.legacy_iv_source = APP_LEGACY_IV_SOURCE;
+    s_config.legacy_stream_port = APP_LEGACY_STREAM_PORT;
+    s_config.legacy_audio = APP_LEGACY_AUDIO != 0;
+    s_config.legacy_pairing = APP_LEGACY_PAIRING != 0;
+    s_config.legacy_inband_sps = APP_LEGACY_INBAND_SPS != 0;
+    s_config.frame_interval_ms = APP_FRAME_INTERVAL_MS;
+    if (request->data_mode >= 0) {
+        s_config.legacy_data_mode = (uint8_t)request->data_mode;
+    }
+    if (request->key_mix >= 0) {
+        s_config.legacy_key_mode = (uint8_t)request->key_mix;
+    }
+    if (request->iv_source >= 0) {
+        s_config.legacy_iv_source = (uint8_t)request->iv_source;
+    }
+    if (request->stream_port >= 0) {
+        s_config.legacy_stream_port = (uint16_t)request->stream_port;
+    }
+    if (request->audio >= 0) {
+        s_config.legacy_audio = request->audio != 0;
+    }
+    if (request->pair >= 0) {
+        s_config.legacy_pairing = request->pair != 0;
+    }
+    if (request->sps >= 0) {
+        s_config.legacy_inband_sps = request->sps != 0;
+    }
+    if (request->interval_ms > 0) {
+        s_config.frame_interval_ms = (uint32_t)request->interval_ms;
+    }
+    const char *name = request->name;
+    const char *host = request->host;
+    int port = request->port;
 
     if (name != NULL && name[0] != '\0') {
         airplay_target_t target;
@@ -122,11 +169,16 @@ static const char *hook_start(const char *name, const char *host, int port)
             return s_reply;
         }
         strlcpy(s_target_host, target.host, sizeof(s_target_host));
+        strlcpy(s_target_name, target.name, sizeof(s_target_name));
         s_config.port = target.port;
-        ESP_LOGI(TAG, "\"%s\" resolved to %s:%u", name, s_target_host,
-                 (unsigned)s_config.port);
+        /* The advertised model/version decides the protocol generation: an
+         * AppleTV3,2-style box only speaks legacy AirTunes. */
+        s_config.legacy = target.legacy;
+        ESP_LOGI(TAG, "\"%s\" resolved to %s:%u (%s)", name, s_target_host,
+                 (unsigned)s_config.port, target.legacy ? "legacy AirTunes" : "HAP");
     } else if (host != NULL && host[0] != '\0') {
         strlcpy(s_target_host, host, sizeof(s_target_host));
+        strlcpy(s_target_name, host, sizeof(s_target_name));
         if (port > 0) {
             s_config.port = (uint16_t)port;
         }
@@ -359,6 +411,7 @@ void app_main(void)
         }
     }
     strlcpy(s_target_host, APP_AIRPLAY_TARGET_HOST, sizeof(s_target_host));
+    strlcpy(s_target_name, APP_AIRPLAY_TARGET_NAME, sizeof(s_target_name));
     airplay_config_t config = {
         .host = s_target_host,
         .port = APP_AIRPLAY_TARGET_PORT,
@@ -370,6 +423,14 @@ void app_main(void)
         .frames = media_still_frames(),
         .frame_interval_ms = APP_FRAME_INTERVAL_MS,
         .identity = identity,
+        .legacy = APP_AIRPLAY_LEGACY != 0,
+        .legacy_data_mode = APP_LEGACY_DATA_MODE,
+        .legacy_stream_port = APP_LEGACY_STREAM_PORT,
+        .legacy_key_mode = (uint8_t)(APP_LEGACY_KEY_MIX ? 1 : 0),
+        .legacy_iv_source = APP_LEGACY_IV_SOURCE,
+        .legacy_inband_sps = APP_LEGACY_INBAND_SPS != 0,
+        .legacy_pairing = APP_LEGACY_PAIRING != 0,
+        .legacy_audio = APP_LEGACY_AUDIO != 0,
     };
     s_config = config;
     ESP_LOGI(TAG, "default receiver %s:%d, GET /targets lists what else is on the LAN",
