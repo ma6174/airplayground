@@ -1,16 +1,24 @@
-# AirPlay on ESP32-S3
+# AirPlay 镜像发送端（ESP32-S3 / ESP32-P4）
 
-ESP32-S3（`esp32-s3-wroom-1`，16 MB flash）上的 AirPlay **屏幕镜像发送端**固件：
-设备自己完成 HAP 配对、FairPlay SAP 密钥交换和 SETUP 协商，然后把 H.264 视频流
-通过镜像数据通道投到接收端上。画面可以来自三种源：Mac 屏幕采集（`macos/capture-cli`
-推流）、片上软编码的动态测试图案，或预编码静态帧 —— 按此优先级选择，不可用的就退到
-下一档。
+AirPlay **屏幕镜像发送端**固件：设备自己完成 HAP 配对、FairPlay SAP 密钥交换和 SETUP
+协商，然后把 H.264 视频流通过镜像数据通道投到接收端上。画面可以来自三种源：
+Mac 屏幕采集（`macos/capture-cli` 推流）、片上软编码的动态测试图案，或预编码静态帧
+—— 按此优先级选择，不可用的就退到下一档。
+
+两个目标：
+
+| 目标 | 板子 | 无线 | 片上编码 |
+|---|---|---|---|
+| `esp32s3` | ESP32-S3-WROOM-1，16 MB flash | 片上 Wi-Fi | OpenH264 软编，320x180@10 是现实上限 |
+| `esp32p4` | JC4880P443C_I_W（ESP32-P4 + 板载 ESP32-C6），16 MB flash / 32 MB PSRAM | 经 SDIO 走 ESP-Hosted 到 C6 | 同上（P4 的硬编尚未接入） |
+
+协议栈（`fairplay` / `hap` / `airplay`）与芯片无关，两个目标共用同一份源码。
 
 ## 视频源
 
 ESP32-S3 没有硬件 H.264 编码器，官方 `esp_h264` 软编（OpenH264）在 S3 上能跑
-320x180@10fps 左右，这就是片上编码的现实上限。会话层不关心画面从哪来，只认
-两种字节流形态：
+320x180@10fps 左右，这就是片上编码的现实上限（P4 有硬编，固件目前仍用同一份软编路径）。
+会话层不关心画面从哪来，只认两种字节流形态：
 
 - **live 源**（`airplay_live_source_t`）：实现 `codec_record` + `next_frame` 两个回调，
   会话每次取一帧。已经有两份实现：
@@ -25,7 +33,8 @@ ESP32-S3 没有硬件 H.264 编码器，官方 `esp_h264` 软编（OpenH264）�
 否则静态帧。每次 `/start` 都重新选，`/status` 前的日志会打印 `video source: ...`。
 
 每个新会话开始时 live 源重建编码器：接收端拿到的第一帧必定是带新 SPS/PPS 的 IDR，
-无论设备之前闲置多久。
+无论设备之前闲置多久。网络源没有自己的编码器，它在会话开始时跳过队列直到下一个 IDR
+（采集端最长 5 秒内会强制一帧），所以接收端永远不会拿一个无法解码的 P 帧开场。
 
 ## 目录结构
 
@@ -41,7 +50,8 @@ firmware/
 ├── tools/make_frames.py   源图 → H.264 访问单元 → frames.c
 ├── tools/pin_bridge.py    常驻串口桥：日志落文件（FIFO 写入仅对真实 UART 板有意义）
 ├── partitions.csv         3 MB 应用分区
-└── sdkconfig.defaults     esp32s3 / 16 MB flash / USB-Serial-JTAG 控制台
+├── sdkconfig.defaults     两个目标共用的配置
+├── sdkconfig.defaults.esp32s3 / .esp32p4   目标专属配置（PSRAM、无线、芯片步进）
 docs/                      协议与 FairPlay 规格、C 参考实现、运维手册（见下文「文档」）
 macos/capture-cli/         Mac 采集端：ScreenCaptureKit + VideoToolbox → TCP 推流给设备
 ```
@@ -66,18 +76,26 @@ $EDITOR main/app_config_local.h      # Wi-Fi 账号密码；接收端地址是�
 
 ```sh
 . ~/esp/esp-idf/export.sh
-idf.py set-target esp32s3
+cd firmware
+idf.py set-target esp32s3      # 或 esp32p4
 idf.py build
-idf.py -p /dev/cu.usbmodem1101 flash
-python -m esptool --port /dev/cu.usbmodem1101 --after watchdog-reset chip-id
+idf.py -p /dev/cu.usbmodem… flash
 ```
 
-最后一条不是查芯片，是借它发复位：S3 用原生 USB 口烧完会停在 download 模式，
-不复位 app 不会跑（不用换线、不用拔插）。
+S3 用原生 USB 口烧完会停在 download 模式，要借一条 esptool 命令发复位（不用换线、
+不用拔插）；P4 烧完自己复位跑起来：
 
-板子的两个 USB 口都是 USB-Serial/JTAG，日志两个口都能看；但**这台板的控制台只能读不能写**
+```sh
+# 仅 S3：
+python -m esptool --port /dev/cu.usbmodem… --after watchdog-reset chip-id
+```
+
+`set-target` 会读 `sdkconfig.defaults` 加上 `sdkconfig.defaults.<目标>`；改过这两个文件
+之后重新 `set-target`（或删掉 `sdkconfig`）才会生效。
+
+S3 板的两个 USB 口都是 USB-Serial/JTAG，日志两个口都能看；但**这台板的控制台只能读不能写**
 （主机写入的字节到不了固件 STDIN），所以配对码不走串口输入，走 HTTP 投递 ——
-完整步骤见 [docs/runbook.md](docs/runbook.md)。
+完整步骤见 [docs/runbook.md](docs/runbook.md)。P4 板同理。
 
 ### 3. 运行
 

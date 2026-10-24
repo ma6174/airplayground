@@ -68,6 +68,9 @@ static struct {
     /* Index of the oldest queued frame and how many are queued. */
     uint8_t head;
     uint8_t count;
+    /* Set when a session starts: the receiver has no reference picture yet, so
+     * the queue is skipped until an IDR arrives. */
+    bool need_idr;
     uint32_t dropped;
     uint32_t oversized;
     SemaphoreHandle_t queued;
@@ -311,6 +314,12 @@ static const uint8_t *net_codec_record(void *user, size_t *len)
     if (!s_net.configured) {
         return NULL;
     }
+    /* A session starts here. Whatever is already queued was produced for a
+     * previous session - or before the encoder's last IDR - and a P frame it
+     * cannot reference leaves the receiver showing nothing at all. */
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.need_idr = true;
+    xSemaphoreGive(s_net.lock);
     *len = s_net.avcc_len;
     return s_net.avcc;
 }
@@ -324,19 +333,37 @@ static esp_err_t net_next_frame(void *user, const uint8_t **au, size_t *len, boo
      * several hundred milliseconds. Timing out early would drop a slot and halve
      * the effective rate. */
     uint32_t wait_ms = 500;
-    if (xSemaphoreTake(s_net.queued, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
+    for (;;) {
+        if (xSemaphoreTake(s_net.queued, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
 
-    xSemaphoreTake(s_net.lock, portMAX_DELAY);
-    uint8_t slot = s_net.head;
-    s_net.head = (uint8_t)((s_net.head + 1) % NET_SLOTS);
-    s_net.count--;
-    *au = s_net.slots[slot];
-    *len = s_net.slot_len[slot];
-    *idr = s_net.slot_idr[slot];
-    xSemaphoreGive(s_net.lock);
-    return ESP_OK;
+        xSemaphoreTake(s_net.lock, portMAX_DELAY);
+        uint8_t slot = s_net.head;
+        s_net.head = (uint8_t)((s_net.head + 1) % NET_SLOTS);
+        s_net.count--;
+        bool waiting_for_idr = s_net.need_idr && !s_net.slot_idr[slot];
+        if (!waiting_for_idr) {
+            s_net.need_idr = false;
+        }
+        if (waiting_for_idr) {
+            s_net.dropped++;
+        }
+        xSemaphoreGive(s_net.lock);
+
+        if (waiting_for_idr) {
+            /* The stream is undecodable until the next IDR; the client is asked
+             * for one every few seconds, so this gap stays short. */
+            ESP_LOGI(TAG, "waiting for an IDR to start the stream");
+            wait_ms = 2000;
+            continue;
+        }
+
+        *au = s_net.slots[slot];
+        *len = s_net.slot_len[slot];
+        *idr = s_net.slot_idr[slot];
+        return ESP_OK;
+    }
 }
 
 bool media_net_init(uint16_t port)

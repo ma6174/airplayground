@@ -5,9 +5,25 @@
 
 ## 硬件与串口
 
-- 板子：esp32-s3-wroom-1，16 MB flash。
+两块板共用同一套固件，烧写/看日志的方式不同：
+
+**ESP32-S3-WROOM-1**（`esp32s3`，16 MB flash）
+
 - 两个 USB 口都是 **USB-Serial/JTAG**（设备名形如 `/dev/cu.usbmodem…`，每台主机、每个口
   都不一样，用 `ls /dev/cu.usbmodem*` 现查）。flash 和日志走哪个都行。
+- 烧完会停在 download 模式，要借 esptool 发一次复位 app 才跑（见下文）。
+
+**JC4880P443C_I_W**（`esp32p4`，16 MB flash / 32 MB PSRAM，板载 ESP32-C6）
+
+- 烧写/日志口是 **USB2** 口（板丝印 USB1/USB2 分开），USB1 是 HS OTG，不是控制台。
+- 日志口和烧写口是同一个（USB-Serial/JTAG），烧完自己复位跑起来，不需要额外复位命令。
+- 芯片是 **pre-rev3**（revision v1.3），依赖 `sdkconfig.defaults.esp32p4` 里的
+  `CONFIG_ESP32P4_SELECTS_REV_LESS_V3` / `CONFIG_ESP32P4_REV_MIN_100`；配错不会起机。
+- 这块板没有 P4 的射频：Wi-Fi 全走 SDIO 到 C6（ESP-Hosted），细节见下文「P4 的无线」。
+
+两块板共用同一个仓库，但**上板操作要分开排队**：`ESP32_BOARD=board`（默认，S3）与
+`ESP32_BOARD=p4` 是两把独立的锁（`tools/esp32lock`）。
+
 - **控制台只能读不能写**：USB-Serial/JTAG 口上主机写入的字节到不了固件的 `STDIN`
   （设备侧 `read()` 一直 `EAGAIN`；UART0 口同理）。所以配对码不要走串口输入，
   用下面的 HTTP 投递通道。
@@ -20,7 +36,12 @@
 cd firmware && . ~/esp/esp-idf/export.sh && idf.py build
 ```
 
-- ESP-IDF 6.1（mbedtls 4.1，纯 PSA API）。
+- 两个目标：`esp32s3`（默认那块 S3 板）和 `esp32p4`（JC4880P443C_I_W）。
+- 用 `idf.py set-target <目标>` 切换；公共配置在 `sdkconfig.defaults`，目标专属的
+  在 `sdkconfig.defaults.<目标>`（PSRAM 模式/速率、无线、芯片步进）。改过它们后要
+  重新 `set-target`（或删掉 `sdkconfig`），否则旧 `sdkconfig` 会把新值挡掉。
+- ESP-IDF 6.1（mbedtls 4.1，纯 PSA API）。网络芯片相关的两个托管组件只在 P4 上拉：
+  `espressif/esp_hosted`（见 `main/idf_component.yml` 的 target 规则）。
 - host 测试不需要 IDF，改了组件先跑这个再上板：
 
 ```sh
@@ -34,9 +55,12 @@ cd firmware/components/media/test && ./run.sh
 
 ```sh
 idf.py -p /dev/cu.usbmodem… flash
-# S3 烧完停在 download 模式，app 不会自己跑，复位一下：
+# 仅 S3：烧完停在 download 模式，app 不会自己跑，复位一下：
 python -m esptool --port /dev/cu.usbmodem… --after watchdog-reset chip-id
 ```
+
+P4 烧完会自己复位进 app，不需要第二条；它的 bootloader 只剩约 300 字节余量，改分区表或
+再开 bootloader 选项前先看 `idf.py build` 结尾的 `Bootloader binary size` 警告。
 
 `chip-id` 只是借这条命令发复位，不用换线、不用拔插。注意先停掉占着串口的日志桥接，
 复位成功后再启动（桥接开着 esptool 打不开串口）。
@@ -155,6 +179,33 @@ python3 firmware/tools/make_frames.py 图1.png 图2.png 图3.png
 
 生成 720p H.264 Baseline IDR 帧（每帧 18~27 KB），替换 `firmware/components/media/src/frames.c`
 后重编。设备端只回放字节，编码在主机完成。
+
+## P4 的无线（ESP-Hosted）
+
+P4 没有射频，`esp_wifi_*` 在 IDF 6.1 里由 `esp_wifi/remote` 转成 RPC，经 SDIO 发给
+板载 C6（后端就是 `espressif/esp_hosted`）。应用代码照旧调 `esp_wifi_*`，`wifi_net.c`
+两个目标一模一样；只有 kconfig 名字不同（P4 上是 `CONFIG_WIFI_RMT_*`）。
+
+- SDIO 用 slot 1 的默认引脚：CLK 18 / CMD 19 / D0-D3 14-17，从机复位 GPIO 54。
+- `esp_wifi_set_ps(WIFI_PS_NONE)` 通过 RPC 作用在 C6 上，所以 mDNS 组播在两个目标上
+  行为一致。
+- C6 从机固件可能比主机侧旧。启动日志里会看到：
+
+  ```
+  esp-hosted fw versions: host=3.0.10 coprocessor=0.0.0
+  E: major version mismatch - OTA coprocessor from host
+  ```
+
+  实测 Wi-Fi 照常工作（连接、DHCP、mDNS 都正常）。要让两边版本对齐，需要给 C6 烧同一
+  版本的 slave 固件；出厂包在开发资料 `8-Bin Burn operation/Burn files/JC4880P443_C6.bin`。
+- Hosted 的建链日志（`eh_sdio` / `eh_init_evt`）是判断无线是否起来的根据：看到
+  `slave chip id: 0x0d (esp32c6)` 和 `sta ip: …` 就说明 SDIO 和 RPC 都通了。
+
+## 会话任务的栈深度
+
+openh264 的 slice / 码率控制路径嵌套较深：`session` 任务 8 KB 栈会在首帧编码时触发
+`Stack protection fault`（`Detected in task "session"`），在 RISC-V 上尤其明显。
+现在是 16 KB。以后要把编码器搬到单独任务里，栈不能低于这个量级。
 
 ## 故障速查
 
