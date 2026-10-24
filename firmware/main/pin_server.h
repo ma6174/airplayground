@@ -47,6 +47,10 @@ typedef struct {
     const char *(*targets)(char *buf, size_t len);
     /* Drops the receiver with this name from the list. */
     const char *(*forget)(const char *name);
+    /* The live source's on-screen text. Called with the decoded ?msg= value
+     * (an empty string clears it, back to the test pattern); NULL asks for
+     * the current text as a one-line report. */
+    const char *(*text)(const char *msg);
 } pin_server_session_hooks_t;
 
 void pin_server_set_session_hooks(const pin_server_session_hooks_t *hooks);
