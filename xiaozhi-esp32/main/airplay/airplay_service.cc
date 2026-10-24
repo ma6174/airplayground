@@ -1,6 +1,7 @@
 #include "airplay_service.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -31,7 +32,11 @@ namespace {
 
 constexpr size_t kAuCap = 128 * 1024;
 constexpr size_t kAvccCap = 64;
-constexpr uint8_t kGop = 15;
+/* Every encoded frame is a keyframe. The virtual display only re-encodes when
+ * the UI changes, so the rate cost is small, and a keyframe carries no reference
+ * chain: a receiver that mishandles P-frames cannot smear the picture, and the
+ * unchanged-screen resend keeps replaying a self-contained frame. */
+constexpr uint8_t kGop = 1;
 constexpr uint32_t kBitrateBps = 1200000;
 constexpr uint8_t kQpMin = 26;
 constexpr uint8_t kQpMax = 42;
@@ -107,10 +112,10 @@ void Rgb565ToI420(const uint16_t* src, int width, int height, uint8_t* y_plane, 
     }
 }
 
-bool OpenEncoder(int width, int height, int fps) {
+bool OpenEncoder(esp_h264_enc_handle_t* out, int width, int height, int fps, uint8_t gop) {
     esp_h264_enc_cfg_sw_t cfg = {};
     cfg.pic_type = ESP_H264_RAW_FMT_I420;
-    cfg.gop = kGop;
+    cfg.gop = gop;
     cfg.fps = static_cast<uint8_t>(fps);
     cfg.res.width = static_cast<uint16_t>(width);
     cfg.res.height = static_cast<uint16_t>(height);
@@ -118,17 +123,17 @@ bool OpenEncoder(int width, int height, int fps) {
     cfg.rc.qp_min = kQpMin;
     cfg.rc.qp_max = kQpMax;
 
-    esp_h264_err_t err = esp_h264_enc_sw_new(&cfg, &s_sink.enc);
+    esp_h264_err_t err = esp_h264_enc_sw_new(&cfg, out);
     if (err != ESP_H264_ERR_OK) {
         ESP_LOGE(TAG, "cannot create the encoder (%d)", err);
-        s_sink.enc = nullptr;
+        *out = nullptr;
         return false;
     }
-    err = esp_h264_enc_open(s_sink.enc);
+    err = esp_h264_enc_open(*out);
     if (err != ESP_H264_ERR_OK) {
         ESP_LOGE(TAG, "cannot open the encoder (%d)", err);
-        esp_h264_enc_del(s_sink.enc);
-        s_sink.enc = nullptr;
+        esp_h264_enc_del(*out);
+        *out = nullptr;
         return false;
     }
     return true;
@@ -150,8 +155,12 @@ bool EncodeOne(size_t* annexb_len, bool* idr) {
     const int height = s_sink.height;
     const size_t luma = static_cast<size_t>(width) * height;
 
+    /* LVGL draws straight into the frame buffer; hold the render lock so the
+     * conversion reads one consistent frame instead of a mid-redraw tear. */
+    s_sink.display->LockRender();
     Rgb565ToI420(s_sink.display->framebuffer(), width, height, s_sink.i420, s_sink.i420 + luma,
                  s_sink.i420 + luma + luma / 4);
+    s_sink.display->UnlockRender();
 
     esp_h264_enc_in_frame_t in = {};
     in.raw_data.buffer = s_sink.i420;
@@ -240,7 +249,7 @@ const uint8_t* SourceCodecRecord(void* user, size_t* len) {
     s_sink.frame_index = 0;
     s_sink.pts_ms = 0;
 
-    if (!OpenEncoder(s_sink.width, s_sink.height, s_sink.fps)) {
+    if (!OpenEncoder(&s_sink.enc, s_sink.width, s_sink.height, s_sink.fps, kGop)) {
         return nullptr;
     }
 
@@ -398,9 +407,17 @@ std::string AirplayService::ResolveHost() const {
     return host;
 }
 
-void AirplayService::RememberHost(const std::string& host) const {
+bool AirplayService::ResolveLegacy() const {
+    Settings settings("airplay", false);
+    return settings.GetString("legacy", "0") == "1";
+}
+
+/* Stores the effective target (with port) and transport, so a reboot can
+ * reconnect the same way. Only called with the resolved values. */
+void AirplayService::Remember(const std::string& host, bool legacy) const {
     Settings settings("airplay", true);
     settings.SetString("host", host);
+    settings.SetString("legacy", legacy ? "1" : "0");
 }
 
 bool AirplayService::Start(const std::string& host, bool legacy) {
@@ -420,9 +437,23 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
         return false;
     }
 
+    /* "host:port" for receivers whose RTSP does not live on 7001/7000; the
+     * projector advertises 7001, the real RTSP service answers on 7002. */
+    uint16_t port = 7000;
+    const auto colon = target.rfind(':');
+    if (colon != std::string::npos && target.find(':') == colon) {
+        int parsed = atoi(target.c_str() + colon + 1);
+        if (parsed > 0 && parsed < 65536) {
+            port = static_cast<uint16_t>(parsed);
+            target.resize(colon);
+        }
+    }
+
     host_ = target;
+    port_ = port;
     legacy_ = legacy;
-    RememberHost(target);
+    Remember(target + ":" + std::to_string(port), legacy);
+    stop_requested_ = false;
     last_result_ = "starting";
 
     BaseType_t created = xTaskCreate(SessionTask, "airplay", 16 * 1024, this, 3, &task_);
@@ -432,7 +463,8 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
         running_ = false;
         return false;
     }
-    ESP_LOGI(TAG, "connecting to %s (%s)", host_.c_str(), legacy_ ? "legacy AirTunes" : "HAP");
+    ESP_LOGI(TAG, "connecting to %s:%u (%s)", host_.c_str(), (unsigned)port_,
+             legacy_ ? "legacy AirTunes" : "HAP");
     return true;
 }
 
@@ -441,6 +473,7 @@ void AirplayService::Stop() {
         return;
     }
     ESP_LOGI(TAG, "stop requested");
+    stop_requested_ = true;
     airplay_request_stop();
 }
 
@@ -500,6 +533,62 @@ std::string AirplayService::StatusJson() const {
     return result;
 }
 
+size_t AirplayService::ScreenBytes() const {
+    if (display_ == nullptr) {
+        return 0;
+    }
+    return static_cast<size_t>(display_->width()) * display_->height() * 2;
+}
+
+bool AirplayService::CopyScreen(uint8_t* dst, size_t cap) {
+    return display_ != nullptr && display_->CopyFramebuffer(dst, cap);
+}
+
+bool AirplayService::EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len) {
+    if (display_ == nullptr || dst == nullptr || len == nullptr) {
+        return false;
+    }
+    const int width = display_->width();
+    const int height = display_->height();
+    const size_t luma = static_cast<size_t>(width) * height;
+
+    auto* i420 = static_cast<uint8_t*>(heap_caps_malloc(luma * 3 / 2, MALLOC_CAP_SPIRAM));
+    auto* annexb = static_cast<uint8_t*>(heap_caps_malloc(kAuCap, MALLOC_CAP_SPIRAM));
+    if (i420 == nullptr || annexb == nullptr) {
+        heap_caps_free(i420);
+        heap_caps_free(annexb);
+        return false;
+    }
+
+    display_->LockRender();
+    Rgb565ToI420(display_->framebuffer(), width, height, i420, i420 + luma, i420 + luma + luma / 4);
+    display_->UnlockRender();
+
+    /* gop 1 makes every frame an IDR, so the dump decodes on its own. */
+    esp_h264_enc_handle_t enc = nullptr;
+    bool ok = OpenEncoder(&enc, width, height, display_->fps(), 1);
+    if (ok) {
+        esp_h264_enc_in_frame_t in = {};
+        in.raw_data.buffer = i420;
+        in.raw_data.len = static_cast<uint32_t>(luma * 3 / 2);
+        esp_h264_enc_out_frame_t out = {};
+        out.raw_data.buffer = annexb;
+        out.raw_data.len = static_cast<uint32_t>(kAuCap);
+        ok = esp_h264_enc_process(enc, &in, &out) == ESP_H264_ERR_OK && out.length > 0 &&
+             out.length <= cap;
+        if (ok) {
+            memcpy(dst, annexb, out.length);
+            *len = out.length;
+        }
+        esp_h264_enc_close(enc);
+        esp_h264_enc_del(enc);
+    }
+
+    heap_caps_free(i420);
+    heap_caps_free(annexb);
+    return ok;
+}
+
 void AirplayService::SessionTask(void* arg) {
     auto* self = static_cast<AirplayService*>(arg);
 
@@ -520,7 +609,7 @@ void AirplayService::SessionTask(void* arg) {
 
     airplay_config_t cfg = {};
     cfg.host = self->host_.c_str();
-    cfg.port = 7000;
+    cfg.port = self->port_;
     cfg.device_name = device_name;
     cfg.local_address = local_ip;
     cfg.identity = &identity;
@@ -543,10 +632,22 @@ void AirplayService::SessionTask(void* arg) {
 
     ESP_LOGI(TAG, "session start: host %s, local %s, %dx%d", cfg.host, local_ip, s_sink.width,
              s_sink.height);
-    esp_err_t err = airplay_mirror(&cfg);
-    self->last_result_ = err == ESP_OK ? "session ended" : esp_err_to_name(err);
-    ESP_LOGI(TAG, "session end: %s (streamed=%d)", self->last_result_.c_str(),
-             (int)airplay_last_session_streamed());
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0;; attempt++) {
+        err = airplay_mirror(&cfg);
+        self->last_result_ = err == ESP_OK ? "session ended" : esp_err_to_name(err);
+        ESP_LOGI(TAG, "session end: %s (streamed=%d)", self->last_result_.c_str(),
+                 (int)airplay_last_session_streamed());
+        /* A refused session is usually the receiver still tearing the previous
+         * one down right after this device rebooted; retry with growing gaps.
+         * A clean end (stop request, receiver goodbye) is final. */
+        if (err == ESP_OK || attempt >= 4 || self->stop_requested_.load()) {
+            break;
+        }
+        const uint32_t delay_ms = 5000u << attempt;
+        ESP_LOGW(TAG, "receiver not ready, retrying in %lu ms", (unsigned long)delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
 
     self->task_ = nullptr;
     self->running_ = false;
@@ -584,6 +685,9 @@ void AirplayService::AutoStartTask(void* arg) {
         return;
     }
     ESP_LOGI(TAG, "network is up (%s), connecting to the configured receiver", ip);
-    self->Start("", false);
+    /* The receiver needs a moment to tear the previous session down after this
+     * device rebooted; connecting too early yields a black session. */
+    vTaskDelay(pdMS_TO_TICKS(15000));
+    self->Start("", self->ResolveLegacy());
     vTaskDelete(nullptr);
 }

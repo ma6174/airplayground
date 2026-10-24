@@ -20,7 +20,9 @@
 /* ES8311 7-bit I2C address. */
 #define AUDIO_CODEC_ES8311_ADDR 0x30
 
-#define BOOT_BUTTON_GPIO GPIO_NUM_0
+// 这块板的 BOOT 按键接 GPIO35（guition-jc4880p443 原厂配置）；GPIO0 是面板 TE 线，
+// 别用。第三个物理键 SW1 接充电芯片 KEY，不接 ESP32。
+#define BOOT_BUTTON_GPIO        GPIO_NUM_35
 
 /* Frame the AirPlay sink encodes. 480x270 is 16:9 and keeps text legible on a
  * TV while the software encoder keeps up on both targets. */

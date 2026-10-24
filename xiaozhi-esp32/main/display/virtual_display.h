@@ -23,12 +23,21 @@ public:
     void SetupUI() override;
     void SetEmotion(const char* emotion) override;
     void SetChatMessage(const char* role, const char* content) override;
+    void SetTheme(Theme* theme) override;
     void SetPowerSaveMode(bool on) override { (void)on; }
 
     /* RGB565 frame the sink encodes, and a counter bumped per rendered frame so
      * it can skip re-encoding an unchanged screen. */
     const uint16_t* framebuffer() const { return framebuffer_; }
     uint32_t frame_counter() const { return frame_counter_.load(); }
+
+    /* Serialises the frame buffer against the LVGL render task. Hold it while
+     * converting the frame, a read without it tears mid-redraw. */
+    void LockRender();
+    void UnlockRender();
+
+    /* Copies the frame currently on screen (RGB565, width*height*2 bytes). */
+    bool CopyFramebuffer(uint8_t* dst, size_t cap) const;
     int fps() const { return fps_; }
 
 protected:

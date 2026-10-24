@@ -34,6 +34,14 @@ public:
     std::string StatusJson() const;
     bool running() const { return running_.load(); }
 
+    /* Snapshot of the screen as RGB565 for the bench API. */
+    size_t ScreenBytes() const;
+    bool CopyScreen(uint8_t* dst, size_t cap);
+
+    /* Current screen as one standalone IDR access unit (Annex B), encoded with
+     * a private encoder so a running session keeps its reference state. */
+    bool EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len);
+
     /* Waits for Wi-Fi, then connects to the configured receiver on its own. */
     void AutoStart();
 
@@ -45,12 +53,15 @@ private:
     static void SessionTask(void* arg);
     static void AutoStartTask(void* arg);
     std::string ResolveHost() const;
-    void RememberHost(const std::string& host) const;
+    bool ResolveLegacy() const;
+    void Remember(const std::string& host, bool legacy) const;
 
     VirtualDisplay* display_ = nullptr;
     std::atomic<bool> running_{false};
+    std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
     std::string host_;
+    uint16_t port_ = 7000;
     bool legacy_ = false;
     mutable std::string last_result_ = "idle since boot";
     TaskHandle_t task_ = nullptr;

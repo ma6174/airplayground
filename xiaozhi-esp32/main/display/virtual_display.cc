@@ -124,6 +124,34 @@ void VirtualDisplay::InitializeThemes() {
     theme_manager.RegisterTheme("dark", dark_theme);
 }
 
+void VirtualDisplay::LockRender() { lvgl_port_lock(0); }
+
+void VirtualDisplay::UnlockRender() { lvgl_port_unlock(); }
+
+bool VirtualDisplay::CopyFramebuffer(uint8_t* dst, size_t cap) const {
+    const size_t bytes = static_cast<size_t>(width_) * height_ * 2;
+    if (framebuffer_ == nullptr || dst == nullptr || cap < bytes) {
+        return false;
+    }
+    auto* self = const_cast<VirtualDisplay*>(this);
+    self->LockRender();
+    memcpy(dst, framebuffer_, bytes);
+    self->UnlockRender();
+    return true;
+}
+
+void VirtualDisplay::SetTheme(Theme* theme) {
+    /* Once the device is online, the assets partition supplies a cbin font and
+     * SetTextFont releases the built-in one. Widget styles hold lv_font_t
+     * pointers, so they must be rebound with the theme or the render task walks
+     * a freed font (LcdDisplay::SetTheme does the same). */
+    Display::SetTheme(theme);
+    if (lvgl_ready_ && setup_ui_called_) {
+        DisplayLockGuard lock(this);
+        ApplyTheme();
+    }
+}
+
 void VirtualDisplay::ApplyTheme() {
     if (current_theme_ == nullptr) {
         return;

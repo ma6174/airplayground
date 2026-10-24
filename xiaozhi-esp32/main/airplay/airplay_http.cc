@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 
+#include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 
@@ -68,6 +69,44 @@ esp_err_t PinHandler(httpd_req_t* req) {
     return Reply(req, accepted ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
+esp_err_t ScreenHandler(httpd_req_t* req) {
+    auto& service = AirplayService::GetInstance();
+    const size_t bytes = service.ScreenBytes();
+    if (bytes == 0) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no display\"}");
+    }
+    auto* buffer = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+    if (buffer == nullptr) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no memory\"}");
+    }
+    if (!service.CopyScreen(buffer, bytes)) {
+        heap_caps_free(buffer);
+        return Reply(req, "{\"ok\":false,\"error\":\"copy failed\"}");
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    const esp_err_t err = httpd_resp_send(req, reinterpret_cast<const char*>(buffer), bytes);
+    heap_caps_free(buffer);
+    return err;
+}
+
+esp_err_t FrameHandler(httpd_req_t* req) {
+    auto& service = AirplayService::GetInstance();
+    constexpr size_t kCap = 128 * 1024;
+    auto* buffer = static_cast<uint8_t*>(heap_caps_malloc(kCap, MALLOC_CAP_SPIRAM));
+    if (buffer == nullptr) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no memory\"}");
+    }
+    size_t len = 0;
+    if (!service.EncodeScreenFrame(buffer, kCap, &len)) {
+        heap_caps_free(buffer);
+        return Reply(req, "{\"ok\":false,\"error\":\"encode failed\"}");
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    const esp_err_t err = httpd_resp_send(req, reinterpret_cast<const char*>(buffer), len);
+    heap_caps_free(buffer);
+    return err;
+}
+
 }  // namespace
 
 void AirplayHttpStart() {
@@ -80,6 +119,8 @@ void AirplayHttpStart() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 8080;
     config.lru_purge_enable = true;
+    /* The screenshot endpoint runs the software H.264 encoder in the handler. */
+    config.stack_size = 32768;
 
     httpd_handle_t server = nullptr;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -92,9 +133,11 @@ void AirplayHttpStart() {
         {.uri = "/airplay/start", .method = HTTP_GET, .handler = StartHandler, .user_ctx = nullptr},
         {.uri = "/airplay/stop", .method = HTTP_GET, .handler = StopHandler, .user_ctx = nullptr},
         {.uri = "/airplay/pin", .method = HTTP_GET, .handler = PinHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/screen.raw", .method = HTTP_GET, .handler = ScreenHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/frame.h264", .method = HTTP_GET, .handler = FrameHandler, .user_ctx = nullptr},
     };
     for (const auto& uri : uris) {
         httpd_register_uri_handler(server, &uri);
     }
-    ESP_LOGI(TAG, "bench API on http://<device>:8080/airplay/{status,start,stop,pin}");
+    ESP_LOGI(TAG, "bench API on http://<device>:8080/airplay/{status,start,stop,pin,screen.raw,frame.h264}");
 }
