@@ -293,24 +293,23 @@ static const char *hook_stop(void)
 
 static const char *hook_status(void)
 {
-    if (airplay_is_running()) {
-        return "mirroring\n";
-    }
-    /* The audio counters only exist once a session has run; they answer the one
-     * question the ears cannot: did the sound arrive on time, or did it starve? */
+    const char *state = airplay_is_running() ? "mirroring\n" : s_last_result;
+    /* The audio counters answer the one question the ears cannot: did the sound
+     * arrive on time, or did it starve? They are worth reading mid-session too,
+     * which is the only way to catch a rate that is short of real time. */
     static char line[224];
     airplay_audio_stats_t audio = { 0 };
     airplay_last_audio_stats(&audio);
     if (audio.packets != 0) {
         snprintf(line, sizeof(line), "%saudio: %llu packet(s), %llu received, "
                                      "%llu without a frame, %llu late (max %llu ms)\n",
-                 s_last_result, (unsigned long long)audio.packets,
+                 state, (unsigned long long)audio.packets,
                  (unsigned long long)media_net_audio_received(),
                  (unsigned long long)audio.gaps, (unsigned long long)audio.late,
                  (unsigned long long)audio.late_max_ms);
         return line;
     }
-    return s_last_result;
+    return state;
 }
 
 static void log_banner(void)

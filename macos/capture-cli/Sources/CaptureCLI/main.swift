@@ -24,6 +24,10 @@ struct Options {
     var showCursor = true
     var audio = false
     var audioOutput: String?
+    /* The receiver applies its own gain and there is no volume control in the
+     * AirPlay audio path, so trimming happens here, before the samples are cut
+     * into frames. */
+    var audioGain = 1.0
 
     static func parse(_ args: [String]) throws -> Options {
         guard let commandName = args.first else { throw CLIError.usage }
@@ -71,6 +75,11 @@ struct Options {
             case "--no-cursor": o.showCursor = false
             case "--audio": o.audio = true
             case "--audio-output": o.audioOutput = try value()
+            case "--audio-gain":
+                guard let gain = Double(try value()), gain > 0, gain <= 4 else {
+                    throw CLIError.invalid("--audio-gain 必须在 0 到 4 之间")
+                }
+                o.audioGain = gain
             case "--help", "-h": throw CLIError.usage
             default: throw CLIError.invalid("未知参数：\(arg)")
             }
@@ -97,7 +106,7 @@ enum CLIError: Error, CustomStringConvertible {
     case usage, invalid(String), message(String)
     var description: String {
         switch self {
-        case .usage: return "用法：\n  capture-cli list\n  capture-cli record (--display INDEX | --window-id ID) (--output PATH | --stdout | --tcp host:port) [选项]\n\n选项：\n  --fps N                 帧率，默认 30\n  --bitrate BPS          平均码率，默认按分辨率估算\n  --width N --height N   输出尺寸（必须为偶数）\n  --duration SECONDS     录制时长\n  --no-cursor            不捕获鼠标指针\n  --audio                 同时采集系统音频（默认关闭，需 macOS 13+）\n  --audio-output PATH     音频另外写成 WAV 文件（裸流/--stdout 需要；--tcp 时可选；MP4 直接混流）\n\n输出格式：\n  --output *.mp4         MP4 视频文件\n  --output *.h264/*.264  Annex-B H.264 裸流文件（包含 SPS/PPS）\n  --stdout               Annex-B H.264 裸流，二进制数据写 stdout，日志写 stderr\n  --tcp host:port        发给 ESP32 的 AirPlay 发送端（长度前缀的访问单元协议；--audio 时音频走 port+1）"
+        case .usage: return "用法：\n  capture-cli list\n  capture-cli record (--display INDEX | --window-id ID) (--output PATH | --stdout | --tcp host:port) [选项]\n\n选项：\n  --fps N                 帧率，默认 30\n  --bitrate BPS          平均码率，默认按分辨率估算\n  --width N --height N   输出尺寸（必须为偶数）\n  --duration SECONDS     录制时长\n  --no-cursor            不捕获鼠标指针\n  --audio                 同时采集系统音频（默认关闭，需 macOS 13+）\n  --audio-gain FACTOR     音频增益，默认 1.0（接收端音量不可控时用它压一点）\n  --audio-output PATH     音频另外写成 WAV 文件（裸流/--stdout 需要；--tcp 时可选；MP4 直接混流）\n\n输出格式：\n  --output *.mp4         MP4 视频文件\n  --output *.h264/*.264  Annex-B H.264 裸流文件（包含 SPS/PPS）\n  --stdout               Annex-B H.264 裸流，二进制数据写 stdout，日志写 stderr\n  --tcp host:port        发给 ESP32 的 AirPlay 发送端（长度前缀的访问单元协议；--audio 时音频走 port+1）"
         case .invalid(let s), .message(let s): return s
         }
     }
@@ -165,6 +174,12 @@ final class NetworkSink {
             /* One 1415-byte frame every 8 ms: delaying a frame until the previous
              * one is acknowledged reaches the device as a gap in the sound. */
             setsockopt(audio, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
+            /* Keep about a fifth of a second in the kernel. The socket buffer is
+             * the one queue we cannot drop from, so audio that piles up there
+             * plays late instead of being skipped; the slack belongs in the
+             * sender's own queue, which is bounded and counted. */
+            var sendBuffer: Int32 = 32 * 1024
+            setsockopt(audio, SOL_SOCKET, SO_SNDBUF, &sendBuffer, socklen_t(MemoryLayout<Int32>.size))
             fputs("audio connected to \(host):\(audioPort)\n", stderr)
         } else {
             fputs("音频连接 \(host):\(audioPort) 失败，本次只发送视频\n", stderr)
@@ -308,17 +323,21 @@ final class NetworkSink {
         return (sets[0], sets[1])
     }
 
-    /* One ALAC frame per packet; the device reads only frame_len off an audio
-     * header and takes its timing from the samples, so the timestamp is the
-     * audio timeline rather than a wall clock. */
-    func sendAudio(_ frame: [UInt8], ptsMs: Int) -> Bool {
-        guard audioFD >= 0 else { return false }
+    /* One ALAC frame as it goes on the wire: the shared header, type 3, then the
+     * frame. The device reads only frame_len off an audio header and takes its
+     * timing from the samples, so the timestamp is the audio timeline. */
+    func makeAudioPacket(_ frame: [UInt8], ptsMs: Int) -> Data {
         var message = Data([0x41, 0x50, 0x56, 0x4e, 3, 1, 0, 0])
         appendBigEndian(&message, UInt32(frame.count))
         appendBigEndian(&message, UInt32(max(0, ptsMs)))
         message.append(contentsOf: frame)
-        guard writeAll(message, to: audioFD) else { return false }
-        return true
+        return message
+    }
+
+    /* Writes whatever the caller hands over. A device whose link is full blocks
+     * here, which is why only the writer thread calls it. */
+    func writeAudio(_ data: Data) -> Bool {
+        audioFD >= 0 && writeAll(data, to: audioFD)
     }
 
     private func writeVideo(_ data: Data) -> Bool {
@@ -562,12 +581,24 @@ final class WAVWriter {
  * drops frames that do not match, so the format is fixed here and the captured
  * PCM is resampled into it.
  *
- * Three stages. The capture callback only copies bytes into a queue: resampling
- * there holds ScreenCaptureKit's audio thread, and a held audio thread does not
- * deliver slower - it drops buffers, which the receiver hears as gaps. The
- * converter thread turns the queued buffers into 44100 Hz s16, and the pacing
- * thread cuts 352-sample ALAC frames out of that, one per 7.98 ms, on an
- * absolute schedule that runs a lead ahead of the capture clock. */
+ * Four stages, so that nothing downstream can slow an upstream clock:
+ *
+ *   capture callback  copies the bytes into a queue and returns. Resampling
+ *                     there holds ScreenCaptureKit's audio thread, and a held
+ *                     audio thread does not deliver slower - it drops buffers.
+ *   converter         resamples the queued buffers into 44100 Hz s16.
+ *   pacer             cuts 352-sample ALAC frames out of that, one per 7.98 ms,
+ *                     on an absolute schedule that runs a lead ahead of the
+ *                     capture clock, and hands the packets over.
+ *   writer            puts them on the socket. A link that cannot absorb one
+ *                     packet every 8 ms blocks write(2) for hundreds of
+ *                     milliseconds; doing that on the pacing thread would stop
+ *                     the frames flowing on the audio timeline and turn a slow
+ *                     link into a stream that lags and gaps.
+ *
+ * Every sample that leaves the converter either reaches the socket or is counted
+ * as dropped, on one timeline, so the 10 s report adds up:
+ * converted = sent + pcm queue + packet queue + dropped. */
 final class ALACAudioSender {
     /* Must match APP_AUDIO_SPF / sr / ss / ch in the device's SETUP reply. */
     static let sampleRate = 44100
@@ -577,6 +608,7 @@ final class ALACAudioSender {
     static let frameInterval = Double(samplesPerFrame) / Double(sampleRate)
 
     private static let frameBytes = samplesPerFrame * channels * 2
+    private static let bytesPerSecond = sampleRate * channels * 2
     /* How far ahead of the capture clock the schedule runs. The device's ring
      * holds 64 frames (511 ms): 200 ms rides out the drift between two clocks
      * without ever leaving it short of room. */
@@ -584,11 +616,18 @@ final class ALACAudioSender {
     /* In whole frames, so what leaves the queue lines up with the ring. */
     private static let leadFrames = Int((leadSeconds / frameInterval).rounded(.up))
     private static let leadBytes = leadFrames * frameBytes
-    /* A couple of seconds on both queues: long enough to ride out a stall in one
-     * stage, short enough that neither grows without bound. ScreenCaptureKit
-     * delivers 48 kHz float32 stereo, where 2 MiB is about 2.7 s. */
+    /* Raw capture PCM: 2 MiB is about 2.7 s of what ScreenCaptureKit delivers,
+     * enough to ride out a stall in this process without unbounded growth. */
     private static let captureLimitBytes = 2 * 1024 * 1024
-    private static let pcmLimitBytes = sampleRate * channels * 2 * 2
+    /* Converted PCM waiting for the pacer, and packets waiting for the socket.
+     * Half a second each: the pacer only has to cover capture chunkiness, and a
+     * backlog past the device's 511 ms ring is stale audio nobody can play. */
+    private static let pcmLimitBytes = bytesPerSecond / 2
+    private static let outboundLimit = Int((0.5 / frameInterval).rounded())
+    /* Packets per write(2). Coalescing cuts the syscall and segment count when
+     * the link is the bottleneck; eight frames still leave the queue small
+     * enough to drop from while a write is in flight. */
+    private static let writeBatch = 8
     /* The converter's output side, fixed by the device's SETUP. */
     private static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                                     sampleRate: Double(sampleRate),
@@ -608,37 +647,56 @@ final class ALACAudioSender {
     private let condition = NSCondition()
     private let converterDone = DispatchSemaphore(value: 0)
     private let pacerDone = DispatchSemaphore(value: 0)
+    private let writerDone = DispatchSemaphore(value: 0)
     private var threads: [Thread] = []
-    /* Raw capture PCM, oldest first, and the converted 44100 Hz s16 stream the
-     * pacer cuts frames out of. Both guarded by `condition`. */
+    private var reporter: DispatchSourceTimer?
+    /* Raw capture PCM, oldest first. Guarded by `condition`, like everything
+     * below it up to `sendBlocked`. */
     private var capture: [Chunk] = []
     private var capturedBytes = 0
+    /* Converted 44100 Hz s16 samples the pacer cuts frames out of, and whole
+     * packets the writer still has to put on the wire. */
     private var pcm = Data()
+    private var outbound: [Data] = []
     private var converter: AVAudioConverter?
     private var converterFormat: AudioStreamBasicDescription?
     private var stopped = false
     private var live = true
     private var overflowing = false
-    /* What capture delivered, what the converter made of it, and what never made
-     * it out: these are the numbers that place a shortfall on one side or the
-     * other. Guarded by `condition`. */
+    /* Counters, all on the 44100 Hz sample timeline: what capture delivered,
+     * what the converter made of it, what reached the socket, and what was
+     * thrown away where. */
     private var buffersTaken = 0
     private var samplesConverted = 0
     private var samplesDropped = 0
     private var framesSent = 0
+    private var framesQueued = 0
     private var framesSentAtLastReport = 0
-    private var lastReport = Date()
+    private var sendBlocked = 0.0
 
-    init(sink: NetworkSink) {
+    private let gain: Double
+
+    init(sink: NetworkSink, gain: Double) {
         self.sink = sink
-        /* Both threads wait on their queue, so they can start right away: the
-         * first capture buffer only wakes the converter. */
-        for (name, loop) in [("capture-cli.alac.convert", convertLoop), ("capture-cli.alac.pace", paceLoop)] {
+        self.gain = gain
+        /* Every thread waits on its own queue, so they can all start at once:
+         * the first capture buffer only wakes the converter. */
+        for (name, loop) in [("capture-cli.alac.convert", convertLoop),
+                             ("capture-cli.alac.pace", paceLoop),
+                             ("capture-cli.alac.write", writeLoop)] {
             let thread = Thread { loop() }
             thread.name = name
             thread.start()
             threads.append(thread)
         }
+        /* Reporting runs on a timer rather than off the audio threads: it has to
+         * keep ticking when the pipeline is stalled, which is when it matters,
+         * and it must never hold the lock while writing to stderr. */
+        let reporter = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "capture-cli.alac.report"))
+        reporter.schedule(deadline: .now() + 10, repeating: 10)
+        reporter.setEventHandler { [weak self] in self?.report() }
+        reporter.activate()
+        self.reporter = reporter
     }
 
     /* Called on ScreenCaptureKit's audio queue, so it does the least it can:
@@ -660,39 +718,52 @@ final class ALACAudioSender {
         guard status == noErr else { return }
 
         condition.lock()
-        defer { condition.unlock() }
-        guard live, !stopped else { return }
-        buffersTaken += 1
-        capture.append(Chunk(bytes: bytes, frames: frames, format: format.pointee))
-        capturedBytes += length
-        /* The newest audio is the one worth keeping, so the queue gives up its
-         * oldest buffers - and says so once per episode, not once per buffer. */
-        while capturedBytes > Self.captureLimitBytes, capture.count > 1 {
-            let dropped = capture.removeFirst()
-            capturedBytes -= dropped.bytes.count
-            samplesDropped += Self.samples(at: dropped.format, frames: dropped.frames)
+        var warning: String?
+        if live, !stopped {
+            buffersTaken += 1
+            capture.append(Chunk(bytes: bytes, frames: frames, format: format.pointee))
+            capturedBytes += length
+            /* The newest audio is the one worth keeping, so the queue gives up
+             * its oldest buffers. */
+            while capturedBytes > Self.captureLimitBytes, capture.count > 1 {
+                let dropped = capture.removeFirst()
+                capturedBytes -= dropped.bytes.count
+                samplesDropped += Self.samples(at: dropped.format, frames: dropped.frames)
+            }
+            if capturedBytes > Self.captureLimitBytes {
+                warning = overflowWarning("音频队列已满，丢弃最旧的采集数据")
+            }
         }
-        if capturedBytes > Self.captureLimitBytes, !overflowing {
-            overflowing = true
-            fputs("音频队列已满，丢弃最旧的采集数据\n", stderr)
-        }
-        if capturedBytes <= Self.captureLimitBytes / 2, pcm.count <= Self.pcmLimitBytes / 2 {
-            overflowing = false
-        }
+        /* Once the pipeline has shut down the buffer is simply not ours any
+         * more; counting it would break the report, where every dropped sample
+         * is one the converter produced. */
         condition.broadcast()
+        condition.unlock()
+        /* Never write to stderr while holding the lock: this runs on
+         * ScreenCaptureKit's audio queue, and a blocked terminal would come
+         * straight back in as dropped buffers. */
+        if let warning { fputs(warning, stderr) }
     }
 
-    /* Stops both threads and reports what went out. */
+    /* Stops every thread and reports the totals. */
     func finish() {
+        reporter?.cancel()
         condition.lock()
         stopped = true
         condition.broadcast()
         condition.unlock()
-        /* Bounded: each thread only ever waits on its queue or sleeps for one
-         * frame interval, and the stop flag releases both. */
+        /* Bounded: each thread only waits on its queue or sleeps for one frame
+         * interval, and the stop flag releases both. The writer may still be
+         * inside write(2) on a slow link, which is why the wait has a limit. */
         _ = converterDone.wait(timeout: .now() + 2)
         _ = pacerDone.wait(timeout: .now() + 2)
+        _ = writerDone.wait(timeout: .now() + 2)
         threads = []
+        condition.lock()
+        let sent = framesSent
+        let dropped = samplesDropped / Self.samplesPerFrame
+        condition.unlock()
+        fputs("audio: \(sent) frame(s) sent, \(dropped) frame(s) dropped\n", stderr)
     }
 
     /* Raw capture PCM into the device format, one buffer at a time. */
@@ -709,16 +780,65 @@ final class ALACAudioSender {
 
             let converted = convert(chunk)
             condition.lock()
+            var warning: String?
             if let converted, !converted.isEmpty {
                 pcm.append(converted)
                 samplesConverted += converted.count / (Self.channels * 2)
-                trimLocked()
+                warning = trimLocked()
             } else {
                 samplesDropped += Self.samples(at: chunk.format, frames: chunk.frames)
             }
             condition.broadcast()
             condition.unlock()
+            if let warning { fputs(warning, stderr) }
         }
+    }
+
+    /* Puts queued packets on the socket, coalescing what has piled up into one
+     * write. Blocking here - and only here - means a slow link delays packets
+     * but never the schedule they were cut on. */
+    private func writeLoop() {
+        defer { writerDone.signal() }
+        while true {
+            condition.lock()
+            while outbound.isEmpty && !stopped && live { condition.wait() }
+            if outbound.isEmpty {
+                condition.unlock()
+                break
+            }
+            let batch = Array(outbound.prefix(Self.writeBatch))
+            outbound.removeFirst(batch.count)
+            condition.unlock()
+
+            var message = Data()
+            message.reserveCapacity(batch.reduce(0) { $0 + $1.count })
+            for packet in batch { message.append(packet) }
+            let started = Date()
+            let written = sink.writeAudio(message)
+            let spent = Date().timeIntervalSince(started)
+
+            condition.lock()
+            sendBlocked += spent
+            if written {
+                framesSent += batch.count
+            } else {
+                /* The socket is gone, so these packets will never play. */
+                samplesDropped += batch.count * Self.samplesPerFrame
+            }
+            condition.unlock()
+            guard written else {
+                fputs("音频发送失败，已停止音频通道（视频继续）\n", stderr)
+                shutDown()
+                break
+            }
+        }
+        /* Nothing left can be delivered; count it so the report still adds up. */
+        condition.lock()
+        if !outbound.isEmpty {
+            samplesDropped += outbound.count * Self.samplesPerFrame
+            outbound.removeAll()
+        }
+        condition.unlock()
     }
 
     /* Frames leave one per frame interval on a schedule anchored to an origin
@@ -747,15 +867,23 @@ final class ALACAudioSender {
             /* The device times its packets from the samples themselves, so the
              * timestamp only has to advance with the audio: frame n starts at
              * n * 352 samples. */
-            let ptsMs = framesSent * Self.samplesPerFrame * 1000 / Self.sampleRate
-            guard sink.sendAudio(step.frame, ptsMs: ptsMs) else {
-                fputs("音频发送失败，已停止音频通道（视频继续）\n", stderr)
-                shutDown()
-                break
+            let ptsMs = framesQueued * Self.samplesPerFrame * 1000 / Self.sampleRate
+            let packet = sink.makeAudioPacket(step.frame, ptsMs: ptsMs)
+            condition.lock()
+            framesQueued += 1
+            outbound.append(packet)
+            var warning: String?
+            /* A backlog the device could not have played yet is worth less than
+             * the audio being captured now: drop the oldest. */
+            while outbound.count > Self.outboundLimit {
+                outbound.removeFirst()
+                samplesDropped += Self.samplesPerFrame
+                if warning == nil { warning = overflowWarning("音频链路跟不上，丢弃了最旧的音频包") }
             }
-            framesSent += 1
+            condition.broadcast()
+            condition.unlock()
+            if let warning { fputs(warning, stderr) }
         }
-        fputs("audio: \(framesSent) frame(s) sent\n", stderr)
     }
 
     /* The ring is empty when the stream starts, so the first frames have to
@@ -774,13 +902,7 @@ final class ALACAudioSender {
         condition.lock()
         defer { condition.unlock() }
         let waited = pcm.count < Self.frameBytes
-        while pcm.count < Self.frameBytes && !stopped && live {
-            reportLocked()
-            /* Wake up even when nothing arrives: the report has to keep ticking
-             * while the pipeline is stalled, which is when it matters. */
-            condition.wait(until: Date().addingTimeInterval(0.5))
-        }
-        reportLocked()
+        while pcm.count < Self.frameBytes && !stopped && live { condition.wait() }
         guard !stopped, live else { return nil }
         let frame = alacFrame(pcm)
         pcm.removeFirst(Self.frameBytes)
@@ -790,31 +912,44 @@ final class ALACAudioSender {
     /* Whole frames, oldest first: the samples after a drop stay where they were,
      * while dropping part of a frame would garble the bits. Caller holds the
      * lock. */
-    private func trimLocked() {
+    private func trimLocked() -> String? {
         let excess = pcm.count - Self.pcmLimitBytes
-        guard excess > 0 else { return }
+        guard excess > 0 else { return nil }
         let drop = (excess + Self.frameBytes - 1) / Self.frameBytes * Self.frameBytes
         pcm.removeFirst(drop)
         samplesDropped += drop / (Self.channels * 2)
-        if !overflowing {
-            overflowing = true
-            fputs("音频发送跟不上采集，丢弃了最旧的音频\n", stderr)
-        }
+        return overflowWarning("音频发送跟不上采集，丢弃了最旧的音频")
     }
 
-    /* One line every 10 s: frames sent since the last line, then what capture
-     * delivered, what the converter made of it and what was dropped. A stalled
-     * buffer count points at capture; a growing sample count with falling frames
-     * points at the socket. Caller holds the lock. */
-    private func reportLocked() {
-        let now = Date()
-        guard now.timeIntervalSince(lastReport) >= 10 else { return }
-        lastReport = now
-        fputs(String(format: "sent %d audio frame(s), %d buffer(s) captured, "
-                            + "%d sample(s) converted, %d sample(s) dropped\n",
-                     framesSent - framesSentAtLastReport, buffersTaken,
-                     samplesConverted, samplesDropped), stderr)
+    /* Overflow warnings are per episode: a link that cannot keep up would
+     * otherwise print one line per dropped packet. Caller holds the lock. */
+    private func overflowWarning(_ text: String) -> String? {
+        guard !overflowing else { return nil }
+        overflowing = true
+        return text + "\n"
+    }
+
+    /* One line every 10 s. Every number is on the 44100 Hz timeline, so they add
+     * up: converted = sent + pcm queue + packet queue + dropped. `blocked` is how
+     * long write(2) held the writer up: when it grows, the link cannot absorb the
+     * stream and the shortfall is the link's, not the capture's. */
+    private func report() {
+        condition.lock()
+        let line = String(format: "sent %d audio frame(s) (%d total), %d buffer(s) captured, "
+                                + "converted %d sample(s) = %d ms, dropped %d sample(s), "
+                                + "queues %d + %d ms, blocked %d ms writing\n",
+                          framesSent - framesSentAtLastReport, framesSent, buffersTaken,
+                          samplesConverted, samplesConverted * 1000 / Self.sampleRate, samplesDropped,
+                          pcm.count * 1000 / Self.bytesPerSecond,
+                          outbound.count * Self.samplesPerFrame * 1000 / Self.sampleRate,
+                          Int(sendBlocked * 1000))
         framesSentAtLastReport = framesSent
+        if overflowing, capturedBytes <= Self.captureLimitBytes / 2,
+           pcm.count <= Self.pcmLimitBytes / 2, outbound.count <= Self.outboundLimit / 2 {
+            overflowing = false
+        }
+        condition.unlock()
+        fputs(line, stderr)
     }
 
     /* Dropped audio is counted on the 44100 Hz timeline, so the report compares
@@ -876,7 +1011,17 @@ final class ALACAudioSender {
         let bytes = Int(output.frameLength) * Self.channels * 2
         guard buffers.mNumberBuffers == 1, let data = buffers.mBuffers.mData,
               Int(buffers.mBuffers.mDataByteSize) >= bytes else { return nil }
-        return Data(bytes: data, count: bytes)
+        var pcm = Data(bytes: data, count: bytes)
+        if gain != 1.0 {
+            pcm.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: Int16.self) else { return }
+                for i in 0..<(bytes / 2) {
+                    let scaled = Double(base[i]) * gain
+                    base[i] = Int16(max(-32768, min(32767, scaled.rounded())))
+                }
+            }
+        }
+        return pcm
     }
 
     /* Puts the copied bytes back into the layout the format describes: a
@@ -1258,7 +1403,7 @@ func record(_ options: Options, content: SCShareableContent) async throws {
      * video only rather than an error. */
     var audioSender: ALACAudioSender?
     if options.audio, let network, network.audioConnected {
-        audioSender = ALACAudioSender(sink: network)
+        audioSender = ALACAudioSender(sink: network, gain: options.audioGain)
     }
     let audioSink = try makeAudioSink(options, muxer: muxer, outputURL: outputURL, sender: audioSender)
     let encoder = try H264Encoder(width: target.width, height: target.height, fps: options.fps,

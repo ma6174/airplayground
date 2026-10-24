@@ -84,22 +84,38 @@ capture-cli record --display 0 --stdout | ffplay -f h264 -
 `spf=352 sr=44100 ss=16 ch=2` 一致）。所以走网络时不需要 `--audio-output`；
 给了它则额外再存一份 WAV。
 
-系统音频分两段处理：采集回调只把 PCM 字节拷进队列就返回（在那里重采样会把
-ScreenCaptureKit 的音频线程拖住，丢了 buffer 就是片子里的空洞），后台一个线程
-用 `AVAudioConverter` 重采样成 44100 Hz / 16 bit / 交错立体声，另一个线程攒够约
-200 ms 后按 352 采样（7.98 ms）的节拍切帧发出：设备环形缓冲是 64 帧（约 511 ms），
-客户端领先 200 ms 能扛住抖动，又不会把环填满。音频连接建不上（设备没在听 8091、
-或者旧固件）只打印一行警告，视频照常发送；发到一半断了则停掉音频线程、视频继续。
+系统音频分四级处理，任何一级慢下来都不会倒推上游的时钟：采集回调只把 PCM 字节
+拷进队列就返回（在那里重采样会把 ScreenCaptureKit 的音频线程拖住，丢了 buffer
+就是片子里的空洞）；一个线程用 `AVAudioConverter` 重采样成 44100 Hz / 16 bit /
+交错立体声；一个线程攒够约 200 ms 后按 352 采样（7.98 ms）的节拍切帧（设备环形
+缓冲是 64 帧约 511 ms，客户领先 200 ms 能扛住抖动，又不会把环填满）；最后一个
+线程只管写 socket——链路塞住时 `write(2)` 会阻塞几百毫秒，卡在节拍线程上就会
+把慢链路变成“又晚又断”的流。
 
-stderr 每 10 秒打印一行，四个数字定位问题在哪一侧：
+两级队各 0.5 s（待转换的采集数据另算），满了丢最旧的，并计入 `dropped`。音频
+连接建不上（设备没在听 8091、或者旧固件）只打印一行警告，视频照常发送；发到
+一半断了则停掉音频线程、视频继续。
+
+stderr 每 10 秒打印一行，所有数字都在同一条 44100 Hz 时间线上，所以可以对账：
 
 ```
-sent 1255 audio frame(s), 1501 buffer(s) captured, 1312401 sample(s) converted, 0 sample(s) dropped
+sent 721 audio frame(s) (1714 total), 987 buffer(s) captured, converted 870519 sample(s) = 19739 ms, dropped 267168 sample(s), queues 0 + 0 ms, blocked 8622 ms writing
 ```
 
-第一个是这 10 秒发出的帧数（应接近 1253，即 10 秒 ×125.28 帧）；后面三个是累计值，
-采集到的 buffer 数、转出来的 44.1 kHz 采样数、丢弃的采样数。采集数不涨说明问题在
-ScreenCaptureKit 一侧，采样数涨而帧数不涨则卡在发送端。
+前两个是这 10 秒与累计发出的帧数（稳定时应为 10 s × 125.28 ≈ 1253）；`captured`
+是采集侧累计 buffer 数（这个不涨就是 ScreenCaptureKit 那侧的事）；`converted` 是
+转出来的采样数；`dropped` 是中途丢掉的采样数；`queues` 是待发送 PCM 与待写
+socket 的两级队深；`blocked` 是累计卡在 `write(2)` 里的时间。
+
+对账公式（容差几毫秒的取整）：
+
+```
+converted = sent × 7.982 ms + queues + dropped
+```
+
+拿上面那行举例：`1714 × 7.982 + 0 + 6059 = 19740 ms`，与 `converted 19739 ms`
+对得上。`blocked` 占了墙钟时间的相当一部分，就说明短板在链路上（设备收得慢
+或者 WiFi 拥挤），不是在采集；此时 `dropped` 会同步增长，而不是静静卡死。
 
 ## 权限与已知问题
 
