@@ -56,6 +56,8 @@ capture-cli record --display 0 --stdout | ffplay -f h264 -
 - `--no-cursor`：不捕获鼠标指针
 - `--audio`：同时采集系统输出音频（默认关闭；需要 macOS 13+，非窗口专属，
   录的是整个系统的输出声音）；配合 `--tcp` 时音频实时发给设备（见下）
+- `--audio-gain FACTOR`：音频增益，默认 `1.0`。AirPlay 的音频通道没有音量控制，
+  接收端按自己的增益播，觉得吵就用它压（`0.5` 约 −6 dB）
 - `--audio-output PATH`：音频另外写成 WAV 文件；裸流输出时省略则取视频文件同名
   `.wav`，`--tcp` 时省略则只走网络，MP4 不需要（会直接混流）
 - `--tcp host:port`：把 H.264 访问单元推给 ESP32 AirPlay 发送端（见下）
@@ -83,6 +85,9 @@ capture-cli record --display 0 --stdout | ffplay -f h264 -
 未压缩模式，44100 Hz / 16 bit / 2 声道 / 每帧 352 采样（与设备 SETUP 里声明的
 `spf=352 sr=44100 ss=16 ch=2` 一致）。所以走网络时不需要 `--audio-output`；
 给了它则额外再存一份 WAV。
+
+走到接收端的声音大小由它自己定：链路本身是 1:1 的（实测峰值与源文件一致），
+需要调整就在切帧之前用 `--audio-gain` 缩放。
 
 系统音频分四级处理，任何一级慢下来都不会倒推上游的时钟：采集回调只把 PCM 字节
 拷进队列就返回（在那里重采样会把 ScreenCaptureKit 的音频线程拖住，丢了 buffer
