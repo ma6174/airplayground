@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# esp32lock — 多 agent 共享 ESP32 开发板的互斥锁。
+#
+# 原理：flock 文件锁。锁的生命周期严格等于持有它的 esp32lock 进程：
+# exec 模式进程退出/被杀即自动释放，子命令不继承锁 fd，不可能留死锁；
+# begin 模式由常驻 holder 进程持锁，用 end 释放，超时未释放
+# 会被等待方按 ESP32_LOCK_MAX_HOLD 抢走。锁文件在 /tmp/esp32lock（仓库外），
+# 所有 worktree/项目共用同一把锁。
+set -euo pipefail
+
+LOCK_DIR="${ESP32_LOCK_DIR:-/tmp/esp32lock}"
+BOARD="${ESP32_BOARD:-board}"
+LOCK_FILE="$LOCK_DIR/$BOARD.lock"
+META_FILE="$LOCK_DIR/$BOARD.meta"
+MAX_HOLD="${ESP32_LOCK_MAX_HOLD:-900}"   # 会话最长持有秒数，超过被等待方抢走
+DEFAULT_WAIT=600                          # 排队默认最长等待秒数
+
+command -v flock >/dev/null 2>&1 || { echo "esp32lock: flock not found (brew install flock)" >&2; exit 2; }
+mkdir -p "$LOCK_DIR"
+touch "$LOCK_FILE"
+
+PROG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+usage() {
+  cat <<EOF
+usage:
+  $PROG status                  看板子现在被谁占着
+  $PROG wait [seconds]          等板子空闲（默认 ${DEFAULT_WAIT}s）
+  $PROG exec [seconds] -- CMD...  排队拿到锁后执行 CMD，结束自动释放（推荐）
+  $PROG begin [label]           开始多步交互会话（常驻 holder 持锁）
+  $PROG end [holder_pid]        结束会话
+env:
+  ESP32_BOARD=board             锁名字空间，一板一名
+  ESP32_LOCK_MAX_HOLD=900       超过该秒数的会话会被等待方自动抢走
+EOF
+}
+
+# ---------- meta 读写 ----------
+# 格式: holder_pid|owner_pid|label|epoch
+read_meta() {
+  HPID=""; OPID=""; LABEL=""; EPOCH=0
+  [[ -f "$META_FILE" ]] || return 1
+  local line
+  line="$(head -n 1 "$META_FILE" 2>/dev/null)" || return 1
+  IFS='|' read -r HPID OPID LABEL EPOCH <<<"$line"
+  [[ -n "${HPID:-}" && -n "${EPOCH:-}" ]] || return 1
+  return 0
+}
+
+write_meta() { # $1=holder_pid $2=label
+  local label=${2//|/ }
+  printf '%s|%s|%s|%s\n' "$1" "$PPID" "$label" "$(date +%s)" >"$META_FILE.tmp.$$"
+  mv -f "$META_FILE.tmp.$$" "$META_FILE"
+}
+
+brief() {
+  # 以真实 flock 状态为准，meta 只是展示信息
+  if flock -n "$LOCK_FILE" true 2>/dev/null; then
+    rm -f "$META_FILE" 2>/dev/null   # 锁空闲，meta 必为残留
+    echo "free"
+  elif read_meta && kill -0 "$HPID" 2>/dev/null; then
+    echo "BUSY holder=$HPID label=\"$LABEL\" held=$(( $(date +%s) - EPOCH ))s"
+  else
+    echo "busy (anonymous flock holder, no meta)"
+  fi
+}
+
+# 等待方清理：holder 已死的残留 meta，以及超过 MAX_HOLD 的会话
+try_steal() {
+  read_meta || return 0
+  if ! kill -0 "$HPID" 2>/dev/null; then
+    rm -f "$META_FILE"
+    return 0
+  fi
+  local age=$(( $(date +%s) - EPOCH ))
+  if (( age > MAX_HOLD )); then
+    echo "esp32lock: STEALING — held ${age}s > MAX_HOLD ${MAX_HOLD}s (holder=$HPID label=\"$LABEL\")" >&2
+    kill -9 "$HPID" 2>/dev/null || true
+    rm -f "$META_FILE"
+    sleep 0.3
+  fi
+}
+
+# 在 fd 9 上排队拿锁；每 30s 打一行进度，支持中途抢超时会话
+acquire_fd() { # $1=timeout
+  local timeout=$1 start=$(date +%s) announced=$start
+  while :; do
+    if flock -n 9 2>/dev/null; then return 0; fi
+    local now el
+    now=$(date +%s); el=$((now - start))
+    if (( el >= timeout )); then
+      echo "esp32lock: board still busy after ${timeout}s — $(brief)" >&2
+      echo "esp32lock: 不要绕过锁硬上，稍后再试（esp32lock wait / status）" >&2
+      return 1
+    fi
+    if (( now - announced >= 30 )); then
+      announced=$now
+      echo "esp32lock: board busy, waiting... $(brief) (waited ${el}s)" >&2
+    fi
+    try_steal
+    sleep 2
+  done
+}
+
+# ---------- 子命令 ----------
+cmd_status() {
+  echo "board=$BOARD lock=$LOCK_FILE"
+  brief
+}
+
+cmd_wait() {
+  local timeout=${1:-$DEFAULT_WAIT}
+  exec 9>>"$LOCK_FILE"
+  if acquire_fd "$timeout"; then
+    exec 9>&-
+    echo "esp32lock: board free now"
+  else
+    exit 1
+  fi
+}
+
+cmd_exec() {
+  local timeout=$DEFAULT_WAIT
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then timeout=$1; shift; fi
+  [[ "${1:-}" == "--" ]] && shift
+  if (( $# == 0 )); then echo "esp32lock exec: no command (usage: exec [seconds] -- CMD...)" >&2; exit 2; fi
+
+  exec 9>>"$LOCK_FILE"
+  local start=$(date +%s)
+  if ! acquire_fd "$timeout"; then exit 1; fi
+  local waited=$(( $(date +%s) - start ))
+  (( waited > 2 )) && echo "esp32lock: board acquired after ${waited}s wait" >&2
+
+  write_meta "$$" "exec: $*"
+  local rc=0
+  set +e
+  # 9>&-：子命令不继承持锁 fd，锁的生命周期严格等于本进程——
+  # 本进程被杀锁立刻释放，不会被子命令的孤儿进程拖住
+  "$@" 9>&-
+  rc=$?
+  set -e
+  rm -f "$META_FILE"
+  exit $rc
+}
+
+cmd_begin() { # $1=label
+  local label="${1:-session}"
+  exec 9>>"$LOCK_FILE"
+  if ! flock -n 9 2>/dev/null; then
+    try_steal
+    if ! flock -n 9 2>/dev/null; then
+      echo "esp32lock: board busy — $(brief)" >&2
+      exit 1
+    fi
+  fi
+  nohup "$PROG" __holder "$LOCK_FILE" "$META_FILE" "$label" >/dev/null 2>&1 &
+  local holder=$!
+  disown 2>/dev/null || true
+  exec 9>&-   # 让位给 holder；它已在排队
+
+  local i=0
+  while (( i < 40 )); do
+    if read_meta && [[ "$HPID" == "$holder" ]]; then
+      echo "esp32lock: session started holder=$holder label=\"$label\""
+      echo "esp32lock: 结束时执行: $PROG end $holder"
+      return 0
+    fi
+    sleep 0.2; i=$((i + 1))
+  done
+  echo "esp32lock: begin failed (holder $holder did not acquire the lock)" >&2
+  exit 1
+}
+
+cmd_end() { # $1=可选 holder_pid 校验
+  local want="${1:-}"
+  if ! read_meta; then
+    echo "esp32lock: no active session — $(brief)" >&2
+    exit 1
+  fi
+  if [[ -n "$want" && "$want" != "$HPID" ]]; then
+    echo "esp32lock: 不是你的会话 — holder=$HPID label=\"$LABEL\"（要结束的是 $want）" >&2
+    exit 1
+  fi
+  kill "$HPID" 2>/dev/null || true
+  # holder 的 trap 在 wait 处立即生效；保险起见确认死亡，否则补刀
+  local i=0
+  while kill -0 "$HPID" 2>/dev/null && (( i < 20 )); do sleep 0.1; i=$((i + 1)); done
+  kill -9 "$HPID" 2>/dev/null || true
+  rm -f "$META_FILE"
+  echo "esp32lock: released (was holder=$HPID label=\"$LABEL\"; now $(brief))"
+}
+
+cmd_holder() { # 内部: 常驻持锁进程
+  local lock_file=$1 meta_file=$2 label=$3
+  exec 9>>"$lock_file"
+  flock -w 5 9 || exit 1
+  printf '%s|%s|%s|%s\n' "$$" "$PPID" "${label//|/ }" "$(date +%s)" >"$meta_file.tmp.$$"
+  mv -f "$meta_file.tmp.$$" "$meta_file"
+  trap 'rm -f "$meta_file"; exit 0' TERM INT
+  # sleep 放后台 + wait：信号到达时 wait 立即被打断，trap 即刻生效；
+  # sleep 必须 9>&- 关闭持锁 fd，否则它 fork 出的孤儿会继续持有 flock
+  while :; do sleep 60 9>&- & wait $!; done
+}
+
+case "${1:-}" in
+  status)  shift; cmd_status "$@" ;;
+  wait)    shift; cmd_wait "$@" ;;
+  exec)    shift; cmd_exec "$@" ;;
+  begin)   shift; cmd_begin "$@" ;;
+  end)     shift; cmd_end "$@" ;;
+  __holder) shift; cmd_holder "$@"; exit ;;
+  *)       usage; [[ -n "${1:-}" ]] && exit 2; exit 0 ;;
+esac
