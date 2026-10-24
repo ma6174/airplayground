@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 
 class VirtualDisplay;
+struct DisplayTextStyle;
 
 /**
  * AirPlay mirroring session driver.
@@ -33,8 +34,9 @@ public:
      * whether the receiver needs the legacy AirTunes path. */
     std::string DiscoverJson();
 
-    /* Puts text on the whole screen; an empty string restores the chat UI. */
-    bool ShowText(const std::string& text);
+    /* Puts text on the whole screen; an empty string restores the chat UI. The
+     * style picks colour, background and text size (auto shrinks long text). */
+    bool ShowText(const std::string& text, const DisplayTextStyle& style);
 
     /* Feeds the 4-digit code a receiver asks for while pairing. Accepts what
      * speech recognition produces: "1234", "一二三四", or a sentence with the

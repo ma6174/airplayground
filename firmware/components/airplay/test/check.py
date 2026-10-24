@@ -62,6 +62,17 @@ def check_control(directory):
     check(len(value) == 12, f"exactly 12 keys (got {len(value)})")
 
 
+def check_control_utf8(directory):
+    """A non-ASCII sender name has to arrive as UTF-16BE code units.
+
+    Written as ASCII bytes the receiver decodes them as single-byte characters,
+    which is how "小智 TV" used to show up as "å°æ° TV".
+    """
+    value = load(directory, "control_utf8.bplist")
+    print("control_utf8.bplist:")
+    check(value["name"] == "小智 TV", f'name round-trips (got {value["name"]!r})')
+
+
 def check_control_ptp(directory):
     value = load(directory, "control_ptp.bplist")
     print("control_ptp.bplist:")
@@ -128,6 +139,7 @@ def main():
     directory = sys.argv[1] if len(sys.argv) > 1 else "out"
     check_encoded(directory)
     check_control(directory)
+    check_control_utf8(directory)
     check_control_ptp(directory)
     check_audio(directory)
     check_audio_connections(directory)

@@ -10,6 +10,7 @@
 #include <esp_log.h>
 
 #include "airplay_service.h"
+#include "display/virtual_display.h"
 
 #define TAG "AirplayHttp"
 
@@ -138,7 +139,8 @@ esp_err_t DiscoverHandler(httpd_req_t* req) {
     return Reply(req, list.c_str());
 }
 
-/* Body is the text itself; an empty body hands the screen back to the chat UI. */
+/* Body is the text itself; an empty body hands the screen back to the chat UI.
+ * Query style options: color=RRGGBB, background=RRGGBB, size=auto|large|medium|small. */
 esp_err_t TextHandler(httpd_req_t* req) {
     char body[kMaxText] = {0};
     size_t total = 0;
@@ -154,7 +156,28 @@ esp_err_t TextHandler(httpd_req_t* req) {
         }
     }
     body[total] = '\0';
-    if (!AirplayService::GetInstance().ShowText(body)) {
+
+    DisplayTextStyle style;
+    char value[kMaxQuery];
+    if (QueryValue(req, "color", value, sizeof(value))) {
+        if (!ParseHexColor(value, &style.color)) {
+            return Reply(req, "{\"ok\":false,\"error\":\"color must be RRGGBB\"}");
+        }
+        style.has_color = true;
+    }
+    if (QueryValue(req, "background", value, sizeof(value))) {
+        if (!ParseHexColor(value, &style.background)) {
+            return Reply(req, "{\"ok\":false,\"error\":\"background must be RRGGBB\"}");
+        }
+        style.has_background = true;
+    }
+    if (QueryValue(req, "size", value, sizeof(value))) {
+        if (!ParseTextSize(value, &style.size)) {
+            return Reply(req, "{\"ok\":false,\"error\":\"size must be auto, large, medium or small\"}");
+        }
+    }
+
+    if (!AirplayService::GetInstance().ShowText(body, style)) {
         return Reply(req, "{\"ok\":false,\"error\":\"no display\"}");
     }
     return Reply(req, total == 0 ? "{\"ok\":true,\"content\":\"chat\"}"
