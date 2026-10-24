@@ -37,8 +37,15 @@ const airplay_live_source_t *media_net_source(void);
 #define MEDIA_NET_AUDIO_PORT_OFFSET 1
 
 /* Pops one encoded audio frame the capture client sent, or returns NULL when
- * none is queued. Zero copy: the frame stays valid until the slot comes round
- * again, which is long after the caller has put it on the wire. */
+ * none is queued. The bytes are handed over in a buffer owned here, valid until
+ * the next call, so the caller's copy cannot be overwritten by the client's
+ * next frame.
+ *
+ * The ring is emptied when a session starts, which throws away the lead the
+ * client had built up. One byte is sent back on the audio connection at that
+ * moment: a client that reads it knows to rebuild the lead instead of letting
+ * the receiver starve on an empty ring. Clients that ignore it see the byte
+ * pile up in their receive buffer and nothing else. */
 const uint8_t *media_net_audio(size_t *len);
 
 /* How many audio frames the client actually delivered since the stream started.

@@ -171,7 +171,7 @@ final class NetworkSink {
         audioFD = audio
         if audio >= 0 {
             setsockopt(audio, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
-            /* One 1415-byte frame every 8 ms: delaying a frame until the previous
+            /* One ~1.4 KB frame every 8 ms: delaying a frame until the previous
              * one is acknowledged reaches the device as a gap in the sound. */
             setsockopt(audio, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
             /* Keep about a fifth of a second in the kernel. The socket buffer is
@@ -338,6 +338,25 @@ final class NetworkSink {
      * here, which is why only the writer thread calls it. */
     func writeAudio(_ data: Data) -> Bool {
         audioFD >= 0 && writeAll(data, to: audioFD)
+    }
+
+    /* One byte comes back on the audio connection when the device starts its
+     * audio channel: it empties the ring at that moment, so the lead this stream
+     * had built up is gone and has to be built again. */
+    enum AudioArm { case arm, none, closed }
+
+    /* Non-blocking for `timeout` 0. Only the pacer thread calls this, and it is
+     * the only reader on the connection. */
+    func pollAudioArm(timeout: TimeInterval) -> AudioArm {
+        guard audioFD >= 0 else { return .closed }
+        var descriptor = pollfd(fd: audioFD, events: Int16(POLLIN), revents: 0)
+        let ready = Darwin.poll(&descriptor, 1, Int32((timeout * 1000).rounded()))
+        if ready < 0 { return errno == EINTR ? .none : .closed }
+        if ready == 0 { return .none }
+        var byte: UInt8 = 0
+        let got = Darwin.recv(audioFD, &byte, 1, 0)
+        if got == 1 { return .arm }
+        return got == 0 ? .closed : .none
     }
 
     private func writeVideo(_ data: Data) -> Bool {
@@ -608,6 +627,11 @@ final class ALACAudioSender {
     static let frameInterval = Double(samplesPerFrame) / Double(sampleRate)
 
     private static let frameBytes = samplesPerFrame * channels * 2
+    /* The 55-bit header plus the samples is 1415 bytes - not a multiple of the
+     * 16-byte AES block. Every frame carries zero padding up to 1424 so the
+     * encrypted payload covers every sample under either receiver decryption
+     * habit. */
+    private static let framePaddedBytes = (frameBytes + 15) / 16 * 16
     private static let bytesPerSecond = sampleRate * channels * 2
     /* How far ahead of the capture clock the schedule runs. The device's ring
      * holds 64 frames (511 ms): 200 ms rides out the drift between two clocks
@@ -628,6 +652,10 @@ final class ALACAudioSender {
      * the link is the bottleneck; eight frames still leave the queue small
      * enough to drop from while a write is in flight. */
     private static let writeBatch = 8
+    /* How long the pacer waits for the device's arm byte. A session normally
+     * starts within seconds of the client; past this the device is assumed to be
+     * an older build that never sends one, and pacing starts as it always did. */
+    private static let armTimeout = 15.0
     /* The converter's output side, fixed by the device's SETUP. */
     private static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                                     sampleRate: Double(sampleRate),
@@ -663,6 +691,9 @@ final class ALACAudioSender {
     private var stopped = false
     private var live = true
     private var overflowing = false
+    /* Whether the device has said its audio channel is live. Until it has, the
+     * pacer holds back, so the queue only needs to keep the lead it will burst. */
+    private var armed = false
     /* Counters, all on the 44100 Hz sample timeline: what capture delivered,
      * what the converter made of it, what reached the socket, and what was
      * thrown away where. */
@@ -843,13 +874,26 @@ final class ALACAudioSender {
 
     /* Frames leave one per frame interval on a schedule anchored to an origin
      * rather than to the previous send, so a late wakeup is caught up instead
-     * of pushing every frame behind it. */
+     * of pushing every frame behind it.
+     *
+     * Nothing leaves before the device says its audio channel is live. Capture
+     * has been running since startup, and only the few hundred milliseconds
+     * leading up to that moment are worth sending: the rest belongs to no
+     * session, and the ring the device drains from is empty right then. */
     private func paceLoop() {
         defer { pacerDone.signal() }
-        waitForPreRoll()
+        waitUntilArmed()
         var origin = Date().addingTimeInterval(-Self.leadSeconds)
         var index = 0
-        while let step = nextFrame() {
+        while true {
+            if takeArm() {
+                /* Another session began and the device emptied its ring: the
+                 * lead has to be rebuilt before the schedule means anything. */
+                rebuildLead()
+                origin = Date().addingTimeInterval(-Self.leadSeconds)
+                index = 0
+            }
+            guard let step = nextFrame() else { break }
             if step.waited {
                 /* Capture ran dry, so this frame is late by definition.
                  * Re-anchor the schedule, or the deadlines it already missed
@@ -896,6 +940,52 @@ final class ALACAudioSender {
         while pcm.count < Self.leadBytes && !stopped && live { condition.wait() }
     }
 
+    /* The device empties its ring when a session starts, which is also the
+     * moment the sound first matters - and precisely then this stream has no
+     * audio older than a frame or two to put into it. Pacing into an empty ring
+     * starves the receiver on every scheduling slip, so wait for the arm byte
+     * and start the schedule from the newest lead's worth of audio instead. */
+    private func waitUntilArmed() {
+        let deadline = Date().addingTimeInterval(Self.armTimeout)
+        while !isStopped {
+            /* Short polls: the device is already draining, so every millisecond
+             * spent here is a slot it has to fill with silence. */
+            switch sink.pollAudioArm(timeout: 0.05) {
+            case .arm:
+                rebuildLead()
+                return
+            case .closed:
+                /* Connection gone; the writer thread reports that. */
+                return
+            case .none:
+                if Date() > deadline {
+                    fputs("audio: 设备没有通知音频通道就绪，直接开始发送\n", stderr)
+                    rebuildLead()
+                    return
+                }
+            }
+        }
+    }
+
+    /* One non-blocking look for an arm byte. */
+    private func takeArm() -> Bool {
+        sink.pollAudioArm(timeout: 0) == .arm
+    }
+
+    /* Keeps the newest lead's worth of converted audio, and waits for it when
+     * capture has not run that far ahead yet. */
+    private func rebuildLead() {
+        condition.lock()
+        armed = true
+        if pcm.count > Self.leadBytes {
+            let excess = pcm.count - Self.leadBytes
+            pcm.removeFirst(excess)
+            samplesDropped += excess / (Self.channels * 2)
+        }
+        condition.unlock()
+        waitForPreRoll()
+    }
+
     /* One frame's worth of PCM, or nil once the thread should exit. `waited`
      * reports that the queue, not the schedule, set the pace. */
     private func nextFrame() -> (frame: [UInt8], waited: Bool)? {
@@ -913,12 +1003,17 @@ final class ALACAudioSender {
      * while dropping part of a frame would garble the bits. Caller holds the
      * lock. */
     private func trimLocked() -> String? {
-        let excess = pcm.count - Self.pcmLimitBytes
+        /* Before the device's channel is live there is nothing to send, so the
+         * queue only keeps the lead the pacer will burst at the arm. Falling
+         * behind a stream that has nowhere to go is not an overflow. */
+        let limit = armed ? Self.pcmLimitBytes : Self.leadBytes
+        let excess = pcm.count - limit
         guard excess > 0 else { return nil }
         let drop = (excess + Self.frameBytes - 1) / Self.frameBytes * Self.frameBytes
-        pcm.removeFirst(drop)
-        samplesDropped += drop / (Self.channels * 2)
-        return overflowWarning("音频发送跟不上采集，丢弃了最旧的音频")
+        let removed = min(drop, pcm.count)
+        pcm.removeFirst(removed)
+        samplesDropped += removed / (Self.channels * 2)
+        return armed ? overflowWarning("音频发送跟不上采集，丢弃了最旧的音频") : nil
     }
 
     /* Overflow warnings are per episode: a link that cannot keep up would
@@ -1068,9 +1163,16 @@ final class ALACAudioSender {
      * libavcodec/alac.c decode_element() reads for a stereo element: the 55-bit
      * header below, then every sample as 16-bit two's complement, interleaved
      * L,R,L,R, MSB first. 55 bits is not a byte boundary, so the header and the
-     * first sample share a byte. */
+     * first sample share a byte.
+     *
+     * The frame is padded with zeros to a 16-byte boundary: the device
+     * encrypts whole AES blocks, and a receiver that decrypts the entire UDP
+     * payload (rather than stopping at the last complete block of the original
+     * length) would otherwise garble the last few samples of every frame - a
+     * periodic crackle at 125 frame/s. Decoders stop after the declared sample
+     * count, so the padding is never heard. */
     private func alacFrame(_ pcm: Data) -> [UInt8] {
-        var writer = BitWriter(capacity: 1415)
+        var writer = BitWriter(capacity: Self.framePaddedBytes)
         writer.write(1, bits: 3)                        /* stereo element (CPE) */
         writer.write(0, bits: 4)                        /* element instance */
         writer.write(0, bits: 12)                       /* unused */
@@ -1084,7 +1186,7 @@ final class ALACAudioSender {
             let value = UInt64(pcm[pcm.startIndex + offset]) | UInt64(pcm[pcm.startIndex + offset + 1]) << 8
             writer.write(value, bits: 16)
         }
-        return writer.finish()
+        return writer.finish(alignedTo: 16)
     }
 
     /* MSB-first bit writer. The 55-bit ALAC header leaves the sample data off a
@@ -1106,11 +1208,18 @@ final class ALACAudioSender {
             accumulator &= (UInt64(1) << UInt64(pending)) - 1
         }
 
-        /* The tail is padded with zeros to the next byte boundary. */
-        mutating func finish() -> [UInt8] {
+        /* The tail is padded with zeros - up to a `alignment`-byte boundary when
+         * asked - so the frame on the wire is what the device encrypts as whole
+         * blocks. */
+        mutating func finish(alignedTo alignment: Int = 1) -> [UInt8] {
             if pending > 0 {
                 bytes.append(UInt8(truncatingIfNeeded: accumulator << UInt64(8 - pending)))
                 pending = 0
+            }
+            if alignment > 1 {
+                while bytes.count % alignment != 0 {
+                    bytes.append(0)
+                }
             }
             return bytes
         }

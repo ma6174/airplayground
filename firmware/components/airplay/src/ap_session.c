@@ -1036,6 +1036,13 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
         AP_LOGE("could not bind the NTP timing port");
         return ESP_FAIL;
     }
+    /* SETUP 2 declares this as the audio controlPort: the receiver's RTCP
+     * receiver reports land there, and they are the only view of what actually
+     * arrived at the speaker. */
+    session->audio_control_fd = ap_ntp_open(&session->audio_control_port);
+    if (session->audio_control_fd < 0) {
+        AP_LOGW("could not bind the audio control port; no RTCP reports");
+    }
     if (ap_ntp_start(session) != 0) {
         return ESP_FAIL;
     }
@@ -1190,6 +1197,57 @@ static esp_err_t legacy_front_half(ap_session_t *session, uint16_t *data_port)
 static volatile bool s_audio_stop;
 static TaskHandle_t s_audio_task;
 
+/* The receiver answers the audio controlPort with RTCP, and the receiver
+ * report says what no local counter can: how many of the packets we sent
+ * actually survived the air. A fraction lost that tracks the video keyframes
+ * means the mirror stream pushes the audio datagrams out of the receiver's
+ * jitter budget; a clean report with noise in the speaker points at the decode
+ * or the receiver itself. */
+static void audio_rtcp_poll(ap_session_t *session)
+{
+    static uint64_t last_log_ms;
+    static uint32_t reports;
+    uint8_t packet[272];
+
+    if (session->audio_control_fd < 0) {
+        return;
+    }
+    for (;;) {
+        int len = recvfrom(session->audio_control_fd, packet, sizeof(packet), MSG_DONTWAIT, NULL, NULL);
+        if (len < 8) {
+            return;
+        }
+        int offset = 0;
+        while (offset + 8 <= len) {
+            uint8_t pt = packet[offset + 1];
+            uint16_t words = (uint16_t)(((uint16_t)packet[offset + 2] << 8) | packet[offset + 3]);
+            int size = ((int)words + 1) * 4;
+            if (size < 8 || offset + size > len) {
+                return;
+            }
+            if (pt == 200 || pt == 201) {
+                /* Report blocks follow the 8-byte header, plus the 20-byte
+                 * sender info of a sender report. */
+                int block = offset + 8 + (pt == 200 ? 20 : 0);
+                int count = packet[offset] & 0x1f;
+                for (int i = 0; i < count && block + 24 <= offset + size; i++, block += 24) {
+                    const uint8_t *r = packet + block;
+                    uint32_t cumulative = ((uint32_t)r[5] << 16) | ((uint32_t)r[6] << 8) | r[7];
+                    uint32_t jitter = ((uint32_t)r[12] << 24) | ((uint32_t)r[13] << 16)
+                                        | ((uint32_t)r[14] << 8) | r[15];
+                    reports++;
+                    if (reports == 1 || ap_millis() - last_log_ms >= 5000) {
+                        AP_LOGI("audio RTCP: fraction lost %.1f%%, cumulative %u, jitter %u",
+                                r[4] / 2.55, (unsigned)cumulative, (unsigned)jitter);
+                        last_log_ms = ap_millis();
+                    }
+                }
+            }
+            offset += size;
+        }
+    }
+}
+
 static void audio_task(void *arg)
 {
     ap_session_t *session = (ap_session_t *)arg;
@@ -1248,6 +1306,7 @@ static void audio_task(void *arg)
             session->legacy_audio_fd = -1;
             break;
         }
+        audio_rtcp_poll(session);
     }
     free(packet);
     s_audio_task = NULL;

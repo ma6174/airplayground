@@ -103,16 +103,26 @@ class BitWriter:
             self.data.append((self.acc >> self.pending) & 0xFF)
         self.acc &= (1 << self.pending) - 1
 
-    def finish(self):
+    def finish(self, aligned_to=1):
         if self.pending:
             self.data.append((self.acc << (8 - self.pending)) & 0xFF)
             self.pending = 0
+        if aligned_to > 1:
+            while len(self.data) % aligned_to:
+                self.data.append(0)
         return bytes(self.data)
 
 
 def alac_frame(pcm):
     """One ALAC frame in its uncompressed form: a stereo element tag, the sample
-    count, then the samples interleaved (libavcodec/alac.c decode_element)."""
+    count, then the samples interleaved (libavcodec/alac.c decode_element).
+
+    The frame is padded with zeros to a 16-byte boundary: the device encrypts
+    whole AES blocks, and a receiver that decrypts the entire UDP payload
+    (rather than stopping at the last complete block of the original length)
+    would otherwise garble the last few samples of every frame - a periodic
+    crackle at 125 frame/s. Decoders stop after the declared sample count, so
+    the padding is never heard."""
     bits = BitWriter()
     bits.write(1, 3)          # element: stereo pair
     bits.write(0, 4)          # element instance tag
@@ -126,7 +136,7 @@ def alac_frame(pcm):
             at = 2 * (sample * AUDIO_CHANNELS + channel)
             value = int.from_bytes(pcm[at:at + 2], "little", signed=True)
             bits.write(value & 0xFFFF, 16)
-    return bits.finish()
+    return bits.finish(aligned_to=16)
 
 
 def read_exactly(stream, count):
