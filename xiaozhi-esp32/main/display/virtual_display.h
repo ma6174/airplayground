@@ -8,6 +8,9 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
+
+#include <esp_timer.h>
 
 /** How the assistant wants its text to look on the TV. */
 struct DisplayTextStyle {
@@ -80,7 +83,15 @@ private:
     /* Applies text_style_ to the content layer: wrapped, centred, and at the
      * largest font the text fits in. */
     void ApplyContentStyle();
+    /* Picks a face that can draw the whole text at one size; a face that lacks a
+     * character would borrow it from the fallback at another size, which shows up
+     * as two text sizes on one line. */
     const lv_font_t* SelectContentFont(const std::string& text, DisplayTextStyle::Size size);
+    /* Splits text that does not fit one screen into pages, so nothing is cut off. */
+    void SplitPages(const std::string& text, const lv_font_t* font);
+    void ShowPage();
+    void UpdatePageTimer();
+    static void PageTimer(void* arg);
 
     uint16_t* framebuffer_ = nullptr;
     std::atomic<uint32_t> frame_counter_{0};
@@ -98,6 +109,10 @@ private:
     lv_font_t small_font_{};
     DisplayTextStyle text_style_{};
     const lv_font_t* content_font_ = nullptr;
+    /* Pages of the current text: one entry unless it was too long for the screen. */
+    std::vector<std::string> pages_;
+    size_t page_index_ = 0;
+    esp_timer_handle_t page_timer_ = nullptr;
     /* True while the content label owns the screen. State updates keep landing in
      * their labels, they are just not visible. */
     bool content_active_ = false;
