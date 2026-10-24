@@ -106,6 +106,13 @@
 #endif
 
 /* Send the SPS/PPS in-band with every legacy sync frame. */
+/* Samples per audio packet: 8 ms of sound, small enough to stay inside one
+ * datagram. The SETUP declares it, because the receiver schedules playback from
+ * the sample count and the RTP timestamps both. */
+#ifndef APP_AUDIO_SPF
+#define APP_AUDIO_SPF 352
+#endif
+
 #ifndef APP_LEGACY_INBAND_SPS
 #define APP_LEGACY_INBAND_SPS 1
 #endif
@@ -113,11 +120,6 @@
 /* Pair before the legacy FairPlay exchange. Apple's own mirroring does not. */
 #ifndef APP_LEGACY_PAIRING
 #define APP_LEGACY_PAIRING 0
-#endif
-
-/* Ask for the audio stream as well (iOS sends one when it mirrors). */
-#ifndef APP_LEGACY_AUDIO
-#define APP_LEGACY_AUDIO 1
 #endif
 
 /* Fallback access point, used when APP_WIFI_SSID is empty. */

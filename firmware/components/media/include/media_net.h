@@ -30,3 +30,18 @@ bool media_net_ready(void);
  * is configured. Geometry tracks the client's configure packet, so call it when
  * the session starts rather than holding on to the pointer across sessions. */
 const airplay_live_source_t *media_net_source(void);
+
+/* Audio arrives on its own connection, one port above the video one: a keyframe
+ * on a shared connection would hold the audio writes back long enough to be
+ * heard. */
+#define MEDIA_NET_AUDIO_PORT_OFFSET 1
+
+/* Pops one encoded audio frame the capture client sent, or returns NULL when
+ * none is queued. Zero copy: the frame stays valid until the slot comes round
+ * again, which is long after the caller has put it on the wire. */
+const uint8_t *media_net_audio(size_t *len);
+
+/* How many audio frames the client actually delivered since the stream started.
+ * Comparing this with the packets we managed to send says whether the sound
+ * starved because the client held back or because we did. */
+uint32_t media_net_audio_received(void);

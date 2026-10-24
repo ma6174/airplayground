@@ -52,6 +52,17 @@ typedef struct {
     void *user;
 } airplay_live_source_t;
 
+/* One encoded audio frame for the legacy audio channel: the payload of a single
+ * RTP packet, in the codec the SETUP declared (ALAC, spf samples per packet). */
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+    /* Receivers either use the stream key as it is or mix it with a secret
+     * first (all zeros when the session never paired), so the source decides
+     * which candidate this frame goes out under. */
+    bool mixed_key;
+} ap_audio_frame_t;
+
 typedef struct {
     const char *host;
     uint16_t port;
@@ -101,9 +112,14 @@ typedef struct {
      * no pairing at all, and receivers that key the stream off the pairing
      * secret break when one did happen. */
     bool legacy_pairing;
-    /* Ask for the type 96 audio stream next to the video one and keep it fed
-     * with silence; some receivers never start rendering video without it. */
+    /* Audio channel: declare a type 96 stream in SETUP 2 with spf samples per
+     * packet, and feed it one frame per packet from audio_frame. A receiver
+     * that gets no frame plays nothing, which beats a made-up payload: the
+     * payload has to be a real encoded frame or the speaker plays noise. */
     bool legacy_audio;
+    uint16_t legacy_audio_spf;
+    size_t (*legacy_audio_frame)(void *ctx, ap_audio_frame_t *frame);
+    void *legacy_audio_ctx;
 } airplay_config_t;
 
 /* Runs one mirroring session: pair, FairPlay, SETUP, stream still images until
@@ -117,6 +133,17 @@ void airplay_request_stop(void);
 
 /* True between airplay_mirror being requested and it returning. */
 bool airplay_is_running(void);
+
+/* What the audio channel did in the session that just ended: packets it sent,
+ * the ones that had no frame to carry, and how late it ran. */
+typedef struct {
+    uint64_t packets;
+    uint64_t gaps;
+    uint64_t late;
+    uint64_t late_max_ms;
+} airplay_audio_stats_t;
+
+void airplay_last_audio_stats(airplay_audio_stats_t *stats);
 
 /* True when the session that just ended delivered at least one frame, i.e. the
  * receiver completed the handshake and took the stream. */

@@ -113,66 +113,6 @@ static void ecb_encrypt_blocks(const uint8_t key[16], const uint8_t *in, uint8_t
 #endif
 }
 
-/* ---------------------------------------------------------- audio packets */
-
-/* One RAOP audio packet: 12-byte RTP header, then a CBC-encrypted payload.
- * Only the 16-byte-aligned head is encrypted; the tail travels in the clear
- * (RPiPlay lib/raop_buffer.c:158-182). */
-int ap_legacy_audio_packet(uint8_t *out, size_t cap, uint16_t seq, uint32_t rtp_time,
-                           const uint8_t key[16], const uint8_t iv[16], size_t payload_len)
-{
-    if (cap < 12 + payload_len) {
-        return -1;
-    }
-    out[0] = 0x80;
-    out[1] = 0x60; /* payload type 96 */
-    out[2] = (uint8_t)(seq >> 8);
-    out[3] = (uint8_t)seq;
-    out[4] = (uint8_t)(rtp_time >> 24);
-    out[5] = (uint8_t)(rtp_time >> 16);
-    out[6] = (uint8_t)(rtp_time >> 8);
-    out[7] = (uint8_t)rtp_time;
-    memset(out + 8, 0, 4); /* SSRC */
-    memset(out + 12, 0, payload_len);
-
-#if defined(AP_HOST_BUILD)
-    /* The host tests only check the framing, not the CBC step. */
-    (void)key;
-    (void)iv;
-#else
-    size_t aligned = payload_len / 16 * 16;
-    if (aligned > 0) {
-        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
-        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
-        psa_set_key_algorithm(&attributes, PSA_ALG_CBC_NO_PADDING);
-        psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
-        psa_set_key_bits(&attributes, 128);
-        psa_key_id_t key_id = 0;
-        if (psa_import_key(&attributes, key, 16, &key_id) != PSA_SUCCESS) {
-            return -1;
-        }
-        psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
-        size_t produced = 0;
-        psa_status_t status = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CBC_NO_PADDING);
-        if (status == PSA_SUCCESS) {
-            status = psa_cipher_set_iv(&op, iv, 16);
-        }
-        if (status == PSA_SUCCESS) {
-            status = psa_cipher_update(&op, out + 12, aligned, out + 12, aligned, &produced);
-        }
-        if (status == PSA_SUCCESS) {
-            status = psa_cipher_finish(&op, out + 12 + produced, cap - 12 - produced, &produced);
-        }
-        psa_cipher_abort(&op);
-        psa_destroy_key(key_id);
-        if (status != PSA_SUCCESS) {
-            return -1;
-        }
-    }
-#endif
-    return (int)(12 + payload_len);
-}
-
 static void counter_increment(uint8_t counter[16])
 {
     for (int i = 15; i >= 0; i--) {
@@ -441,6 +381,69 @@ size_t ap_legacy_build_announce(char *out, size_t cap, const char *session_uuid,
  * from one task, mirroring ap_setup.c's approach. */
 #define AP_LEGACY_VALUE_POOL 72
 #define AP_LEGACY_ENTRY_POOL 52
+void ap_legacy_audio_keys(const uint8_t stream_key[16], uint8_t bare[16], uint8_t mixed[16])
+{
+    static const uint8_t zeros[32];
+    memcpy(bare, stream_key, 16);
+    fp_stream_key(stream_key, zeros, sizeof(zeros), true, mixed);
+}
+
+int ap_legacy_build_audio(uint8_t *out, size_t cap, uint16_t seq, uint32_t timestamp,
+                          const uint8_t *frame, size_t frame_len, const uint8_t key[16],
+                          const uint8_t iv[16])
+{
+    if (frame == NULL || frame_len == 0 || cap < 12 + frame_len) {
+        return -1;
+    }
+    out[0] = 0x80;
+    out[1] = 0x60; /* payload type 96 */
+    out[2] = (uint8_t)(seq >> 8);
+    out[3] = (uint8_t)seq;
+    out[4] = (uint8_t)(timestamp >> 24);
+    out[5] = (uint8_t)(timestamp >> 16);
+    out[6] = (uint8_t)(timestamp >> 8);
+    out[7] = (uint8_t)timestamp;
+    memset(out + 8, 0, 4); /* SSRC */
+    memcpy(out + 12, frame, frame_len);
+
+#if defined(AP_HOST_BUILD)
+    /* The host tests only check the framing, not the CBC step. */
+    (void)key;
+    (void)iv;
+#else
+    size_t aligned = frame_len / 16 * 16;
+    if (aligned > 0) {
+        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+        psa_set_key_algorithm(&attributes, PSA_ALG_CBC_NO_PADDING);
+        psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+        psa_set_key_bits(&attributes, 128);
+        psa_key_id_t key_id = 0;
+        if (psa_import_key(&attributes, key, 16, &key_id) != PSA_SUCCESS) {
+            return -1;
+        }
+        psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
+        size_t produced = 0;
+        psa_status_t status = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CBC_NO_PADDING);
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_set_iv(&op, iv, 16);
+        }
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_update(&op, out + 12, aligned, out + 12, aligned, &produced);
+        }
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_finish(&op, out + 12 + produced, 16, &produced);
+        }
+        psa_cipher_abort(&op);
+        psa_destroy_key(key_id);
+        if (status != PSA_SUCCESS) {
+            return -1;
+        }
+    }
+#endif
+    return (int)(12 + frame_len);
+}
+
 static ap_plist_value_t s_values[AP_LEGACY_VALUE_POOL];
 static ap_plist_entry_t s_entries[AP_LEGACY_ENTRY_POOL];
 static size_t s_value_used;
@@ -581,14 +584,14 @@ size_t ap_legacy_build_setup1(uint8_t *out, size_t cap, const ap_legacy_setup1_t
     return root == NULL ? 0 : ap_plist_encode(root, out, cap);
 }
 
-size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, bool audio,
-                              uint16_t audio_control_port)
+size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, bool with_audio,
+                              uint16_t audio_control_port, uint16_t audio_spf)
 {
     pool_reset();
-    size_t stream_count = audio ? 2 : 1;
+    size_t stream_count = with_audio ? 2 : 1;
     /* Array items must be contiguous values: take both slots before filling. */
     ap_plist_value_t *items = value_slot();
-    if (items == NULL || (audio && value_slot() == NULL)) {
+    if (items == NULL || (with_audio && value_slot() == NULL)) {
         return 0;
     }
 
@@ -634,8 +637,12 @@ size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, 
     }
     items[0] = *video;
 
-    if (audio) {
-        ap_plist_entry_t *audio_entries = entry_slots(6);
+    if (with_audio) {
+        /* The audio stream's own dataPort comes back in the reply. The rest has
+         * to be stated here: without the sample rate the receiver falls back to
+         * its own default and plays the stream at the wrong speed, and without a
+         * buffer window every late packet leaves an audible hole. */
+        ap_plist_entry_t *audio_entries = entry_slots(13);
         if (audio_entries == NULL) {
             return 0;
         }
@@ -643,9 +650,17 @@ size_t ap_legacy_build_setup2(uint8_t *out, size_t cap, uint64_t connection_id, 
         audio_entries[1] = (ap_plist_entry_t){ "streamConnectionID", make_uint(connection_id + 1) };
         audio_entries[2] = (ap_plist_entry_t){ "audioFormat", make_uint(0x40000) };
         audio_entries[3] = (ap_plist_entry_t){ "controlPort", make_uint(audio_control_port) };
-        audio_entries[4] = (ap_plist_entry_t){ "ct", make_uint(1) };
-        audio_entries[5] = (ap_plist_entry_t){ "spf", make_uint(480) };
-        const ap_plist_value_t *audio_stream = make_dict(audio_entries, 6);
+        audio_entries[4] = (ap_plist_entry_t){ "ct", make_uint(2) };
+        audio_entries[5] = (ap_plist_entry_t){ "spf", make_uint(audio_spf) };
+        audio_entries[6] = (ap_plist_entry_t){ "sr", make_uint(44100) };
+        audio_entries[7] = (ap_plist_entry_t){ "ss", make_uint(16) };
+        audio_entries[8] = (ap_plist_entry_t){ "ch", make_uint(2) };
+        audio_entries[9] = (ap_plist_entry_t){ "audioMode", make_string("default") };
+        audio_entries[10] = (ap_plist_entry_t){ "usingScreen", make_bool(true) };
+        /* Buffer window in samples: 100 ms to 400 ms of slack for the receiver. */
+        audio_entries[11] = (ap_plist_entry_t){ "latencyMin", make_uint(4410) };
+        audio_entries[12] = (ap_plist_entry_t){ "latencyMax", make_uint(17640) };
+        const ap_plist_value_t *audio_stream = make_dict(audio_entries, 13);
         if (audio_stream == NULL) {
             return 0;
         }

@@ -19,6 +19,8 @@ static const char *TAG = "media_net";
  *           height 2 | fps 2 | sps_len 2 | pps_len 2 | sps | pps
  *   FRAME   magic 'APVN' | type 2 | version 1 | flags 1 | reserved 2 |
  *           au_len 4 | pts_ms 4 | AVCC access unit
+ *   AUDIO   magic 'APVN' | type 3 | version 1 | flags 0 | reserved 2 |
+ *           frame_len 4 | pts_ms 4 | one encoded audio frame (ALAC, 4096 samples)
  *
  * flags bit 0 marks an IDR access unit. Every access unit carries its own
  * boundaries, so the receiving side never parses H.264 to split TCP reads. */
@@ -26,12 +28,26 @@ static const char *TAG = "media_net";
 #define NET_VERSION 1
 #define NET_TYPE_CONFIG 1
 #define NET_TYPE_FRAME 2
+#define NET_TYPE_AUDIO 3
 #define NET_FLAG_IDR 0x01u
 #define NET_MAX_AU (512u * 1024u)
 /* A frame pointer that is absurdly large means the stream lost sync, not that
  * the encoder went wild; only then is dropping the connection the right move. */
 #define NET_MAX_DRAIN (4u * 1024u * 1024u)
 #define NET_MAX_PARAM 1024u
+/* Audio rides the same connection but in its own ring: a frame is one ALAC
+ * packet of 4096 samples (93 ms), and the session drains exactly one per packet
+ * it sends. Losing an audio frame is a click, so the ring only turns into
+ * "drop the oldest" once the consumer has been idle long enough to mean nobody
+ * is listening. */
+/* Audio shares the connection with video, so one 28 KB picture holds the audio
+ * writes back for tens of milliseconds, and a keyframe can stall the whole
+ * connection for a fifth of a second. The ring covers half a second of sound, so
+ * the client can stay well ahead and neither starve nor overflow. */
+#define NET_AUDIO_DEPTH 64
+/* A 4096-sample stereo 16-bit frame is 16 KB of PCM and the encoder can exceed
+ * that once it adds its own framing, so the slot has to cover the worst case. */
+#define NET_AUDIO_MAX (8u * 1024u)
 #define NET_AVCC_CAP (NET_MAX_PARAM * 2 + 64)
 #define NET_HEADER_MAX 32u
 
@@ -82,6 +98,13 @@ static struct {
     bool need_idr;
     uint32_t dropped;
     uint32_t oversized;
+    /* Audio ring: head plus count, oldest first. */
+    uint8_t *audio_slots[NET_AUDIO_DEPTH];
+    size_t audio_len[NET_AUDIO_DEPTH];
+    uint8_t audio_head;
+    uint8_t audio_count;
+    uint32_t audio_dropped;
+    uint32_t audio_received;
     SemaphoreHandle_t queued;
     SemaphoreHandle_t lock;
 } s_net;
@@ -200,12 +223,50 @@ static bool drain_frame(int fd, uint32_t len)
     return true;
 }
 
+/* One encoded audio frame: queue it for the session, which sends exactly one per
+ * audio packet. */
+static bool handle_audio(int fd, const uint8_t *header)
+{
+    uint32_t len = read_be32(header + 8);
+    if (len == 0 || len > NET_AUDIO_MAX) {
+        ESP_LOGW(TAG, "audio frame of %u bytes is out of range", (unsigned)len);
+        return len == 0 || drain_frame(fd, len);
+    }
+    uint8_t slot = (uint8_t)((s_net.audio_head + s_net.audio_count) % NET_AUDIO_DEPTH);
+    if (s_net.audio_count == NET_AUDIO_DEPTH) {
+        /* Full: keep the newest audio and give up the oldest frame. */
+        s_net.audio_head = (uint8_t)((s_net.audio_head + 1) % NET_AUDIO_DEPTH);
+        s_net.audio_count--;
+        s_net.audio_dropped++;
+        if (s_net.audio_dropped % 50 == 1) {
+            ESP_LOGW(TAG, "audio queue full: dropped %u frame(s)", (unsigned)s_net.audio_dropped);
+        }
+        slot = (uint8_t)((s_net.audio_head + s_net.audio_count) % NET_AUDIO_DEPTH);
+    }
+    if (!recv_all(fd, s_net.audio_slots[slot], len)) {
+        return false;
+    }
+    s_net.audio_received++;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.audio_len[slot] = len;
+    s_net.audio_count++;
+    xSemaphoreGive(s_net.lock);
+    return true;
+}
+
 static bool handle_frame(int fd)
 {
     uint8_t header[NET_HEADER_MAX];
     if (!recv_all(fd, header, 16) || read_be32(header) != NET_MAGIC ||
-        header[4] != NET_TYPE_FRAME || header[5] != NET_VERSION) {
+        header[5] != NET_VERSION) {
         ESP_LOGW(TAG, "malformed frame packet");
+        return false;
+    }
+    if (header[4] == NET_TYPE_AUDIO) {
+        return handle_audio(fd, header);
+    }
+    if (header[4] != NET_TYPE_FRAME) {
+        ESP_LOGW(TAG, "unknown packet type %u", (unsigned)header[4]);
         return false;
     }
     uint32_t au_len = read_be32(header + 8);
@@ -317,16 +378,79 @@ static void capture_task(void *arg)
         xSemaphoreTake(s_net.lock, portMAX_DELAY);
         s_net.head = 0;
         s_net.count = 0;
+        s_net.audio_head = 0;
+        s_net.audio_count = 0;
         xSemaphoreGive(s_net.lock);
         while (xSemaphoreTake(s_net.queued, 0) == pdTRUE) {
         }
         ESP_LOGW(TAG, "capture client disconnected (%u frame(s) dropped, %u before an IDR, "
-                  "%u oversized)",
+                  "%u oversized, %u audio)",
                  (unsigned)s_net.dropped_overflow, (unsigned)s_net.dropped,
-                 (unsigned)s_net.oversized);
+                 (unsigned)s_net.oversized, (unsigned)s_net.audio_dropped);
         s_net.dropped_overflow = 0;
         s_net.dropped = 0;
         s_net.oversized = 0;
+        s_net.audio_dropped = 0;
+    }
+}
+
+/* Audio gets its own connection: on a shared one, a 28 KB keyframe holds the
+ * audio writes back for a fifth of a second, which is long enough to starve the
+ * receiver and be heard as a click. */
+void audio_capture_task(void *arg)
+{
+    (void)arg;
+    const uint16_t port = (uint16_t)(s_net.port + 1);
+    for (;;) {
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(port),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (listener < 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        int reuse = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+            listen(listener, 1) != 0) {
+            ESP_LOGE(TAG, "cannot listen on TCP %u", (unsigned)port);
+            close(listener);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        ESP_LOGI(TAG, "waiting for an audio client on TCP %u", (unsigned)port);
+        int client = accept(listener, NULL, NULL);
+        close(listener);
+        if (client < 0) {
+            continue;
+        }
+        int window = 64 * 1024;
+        setsockopt(client, SOL_SOCKET, SO_RCVBUF, &window, sizeof(window));
+        /* A new audio client means a new run: the counters describe it alone. */
+        s_net.audio_received = 0;
+        ESP_LOGI(TAG, "audio client connected");
+        for (;;) {
+            uint8_t header[NET_HEADER_MAX];
+            if (!recv_all(client, header, 16) || read_be32(header) != NET_MAGIC ||
+                header[4] != NET_TYPE_AUDIO || header[5] != NET_VERSION) {
+                ESP_LOGW(TAG, "malformed audio packet");
+                break;
+            }
+            if (!handle_audio(client, header)) {
+                break;
+            }
+        }
+        close(client);
+        ESP_LOGW(TAG, "audio client disconnected (%u frame(s) dropped)",
+                 (unsigned)s_net.audio_dropped);
+        s_net.audio_dropped = 0;
+        xSemaphoreTake(s_net.lock, portMAX_DELAY);
+        s_net.audio_head = 0;
+        s_net.audio_count = 0;
+        xSemaphoreGive(s_net.lock);
     }
 }
 
@@ -336,6 +460,12 @@ static const uint8_t *net_codec_record(void *user, size_t *len)
     if (!s_net.configured) {
         return NULL;
     }
+    /* A session starts here. Audio queued before it belongs to nobody's
+     * timeline, and letting that backlog drain would clip the first seconds. */
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.audio_head = 0;
+    s_net.audio_count = 0;
+    xSemaphoreGive(s_net.lock);
     /* A session starts here. Whatever is already queued was produced for a
      * previous session - or before the encoder's last IDR - and a P frame it
      * cannot reference leaves the receiver showing nothing at all. */
@@ -411,6 +541,13 @@ bool media_net_init(uint16_t port)
             return false;
         }
     }
+    for (int i = 0; i < NET_AUDIO_DEPTH; i++) {
+        s_net.audio_slots[i] = big_alloc(NET_AUDIO_MAX);
+        if (s_net.audio_slots[i] == NULL) {
+            ESP_LOGE(TAG, "no memory for an audio buffer");
+            return false;
+        }
+    }
     s_net.queued = xSemaphoreCreateCounting(NET_QUEUE_DEPTH, 0);
     s_net.lock = xSemaphoreCreateMutex();
     if (s_net.queued == NULL || s_net.lock == NULL) {
@@ -446,6 +583,12 @@ bool media_net_start(void)
         s_net.started = false;
         return false;
     }
+    /* The audio reader outranks everything else here: while the session task is
+     * busy pushing a 30 KB keyframe to the receiver, a delayed read backs up into
+     * the client's socket and the sound starves. */
+    if (xTaskCreate(audio_capture_task, "media_net_audio", 4096, NULL, 7, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "no audio listener; audio has to share the video connection");
+    }
     return true;
 }
 
@@ -454,10 +597,38 @@ bool media_net_ready(void)
     return s_net.configured;
 }
 
+const uint8_t *media_net_audio(size_t *len)
+{
+    const uint8_t *frame = NULL;
+    if (xSemaphoreTake(s_net.lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        if (len != NULL) {
+            *len = 0;
+        }
+        return NULL;
+    }
+    if (s_net.audio_count != 0) {
+        frame = s_net.audio_slots[s_net.audio_head];
+        if (len != NULL) {
+            *len = s_net.audio_len[s_net.audio_head];
+        }
+        s_net.audio_head = (uint8_t)((s_net.audio_head + 1) % NET_AUDIO_DEPTH);
+        s_net.audio_count--;
+    } else if (len != NULL) {
+        *len = 0;
+    }
+    xSemaphoreGive(s_net.lock);
+    return frame;
+}
+
 const airplay_live_source_t *media_net_source(void)
 {
     if (!s_net.configured) {
         return NULL;
     }
     return &s_source;
+}
+
+uint32_t media_net_audio_received(void)
+{
+    return s_net.audio_received;
 }

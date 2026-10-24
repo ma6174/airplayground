@@ -27,6 +27,7 @@ typedef struct {
     int sps;
     int pair;
     int audio;
+    int amix;
     int stream_port;
 } pin_start_request_t;
 

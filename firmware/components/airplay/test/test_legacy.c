@@ -201,7 +201,7 @@ int main(void)
     expect(ap_plist_dict_get(&reader, ap_plist_root(&reader), "eiv", &field), "setup1 has eiv");
     expect(ap_plist_dict_get(&reader, ap_plist_root(&reader), "ekey", &field), "setup1 has ekey");
 
-    body_len = ap_legacy_build_setup2(body, sizeof(body), 0x0123456789ULL, false, 0);
+    body_len = ap_legacy_build_setup2(body, sizeof(body), 0x0123456789ULL, false, 0, 0);
     expect(body_len > 0, "setup2 encodes");
     expect(ap_plist_decode(&reader, body, body_len), "setup2 decodes");
     uint64_t streams = 0;
@@ -234,6 +234,29 @@ int main(void)
         searched = (size_t)(hit - body) + 5;
     }
     expect(stamps_ok, "setup2 timestampInfo names in order");
+
+    /* Audio packets: RTP header, then the encoded frame with its aligned head
+     * encrypted. The host build skips the CBC step, so the framing is what the
+     * test can pin down; the key candidates matter because a receiver that never
+     * paired derives the mixed one. */
+    uint8_t bare_key[16] = { 0 };
+    uint8_t mixed_key[16] = { 0 };
+    uint8_t stream_key[16];
+    unhex(AESKEY_HEX, stream_key, sizeof(stream_key));
+    ap_legacy_audio_keys(stream_key, bare_key, mixed_key);
+    expect(memcmp(bare_key, stream_key, 16) == 0, "audio bare key is the stream key");
+    expect(memcmp(mixed_key, stream_key, 16) != 0, "audio mixed key is derived");
+
+    uint8_t frame[32];
+    memset(frame, 0xa5, sizeof(frame));
+    uint8_t packet[12 + sizeof(frame)];
+    int packet_len = ap_legacy_build_audio(packet, sizeof(packet), 7, 0x11223344u, frame,
+                                           sizeof(frame), bare_key, bare_key);
+    expect(packet_len == (int)sizeof(packet), "audio packet carries header and frame");
+    expect(packet[0] == 0x80 && packet[1] == 0x60, "audio RTP version and payload type 96");
+    expect(packet[3] == 7 && packet[7] == 0x44, "audio sequence and timestamp");
+    expect(memcmp(packet + 12, frame, sizeof(frame)) == 0,
+           "host build leaves the frame in the clear");
 
     if (failures == 0) {
         printf("all legacy checks passed\n");
