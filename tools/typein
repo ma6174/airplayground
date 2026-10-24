@@ -1,0 +1,277 @@
+#!/bin/bash
+# typein — 把文字输入到指定 macOS 应用当前聚焦的输入框，可选按回车（仅 macOS）
+#
+# 双引擎，auto 模式自动选择：
+#   osascript  零外部依赖。要求运行本命令的宿主 App（终端等）持有
+#              「辅助功能」授权（系统设置 → 隐私与安全性 → 辅助功能）。
+#   hs         Hammerspoon CLI。Hammerspoon 自身已带辅助功能授权，
+#              宿主无需任何设置。
+#   auto       先试 osascript；因权限失败且本机装有 hs 时自动回退。
+#
+# 键盘注入在 macOS 上必须由持「辅助功能」授权的进程执行，这是系统层面的
+# 限制，没有免权限的实现方式；本工具只是把两种持权路径都接上。
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+typein — 把文字输入到指定 macOS 应用当前聚焦的输入框，可选按回车
+
+用法:
+  typein --app <应用名> [--text <文字>] [--enter] [选项]
+  typein --apps          # 列出正在运行的应用名（用来确定 --app 怎么写）
+
+选项:
+  --app <名>      目标应用（应用名，大小写不敏感，支持唯一子串匹配）
+  --text <文>     要输入的文字（默认经剪贴板粘贴：支持中文/多行，不受输入法影响）
+  --enter         输入完成后按一次 Return
+  --delay <秒>    聚焦后等待秒数，默认 0.6（应用聚焦慢就调大）
+  --mode type     逐键模拟真实打字（默认 paste；type 会受当前输入法状态影响）
+  --engine <e>    osascript | hs | auto（默认 auto：先 osascript，权限不足回退 hs）
+  -h, --help      显示本帮助
+
+说明:
+  输入打的是目标应用获得焦点后的那个输入框（多数聊天/编辑类应用聚焦后
+  光标自动落在输入框）。聚焦确认失败时拒绝输入，不会把文字打到别的应用。
+  paste 模式会临时占用剪贴板并在结束后尽量还原（非文本剪贴板内容无法还原）。
+
+权限:
+  osascript 引擎需要给运行本命令的宿主 App 授「辅助功能」权限：
+  系统设置 → 隐私与安全性 → 辅助功能 → 添加并勾选对应 App。
+  未授权且装有 Hammerspoon（hs CLI）时会自动改走 hs 引擎。
+
+示例:
+  typein --app WeChat --text "晚上吃饭吗" --enter
+  typein --app TextEdit --text $'第一行\n第二行'
+EOF
+}
+
+APP=""; TEXT=""; ENTER=0; DELAY="0.6"; MODE="paste"; ENGINE="auto"; LIST=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app)     APP="$2"; shift 2 ;;
+    --text)    TEXT="$2"; shift 2 ;;
+    --enter)   ENTER=1; shift ;;
+    --delay)   DELAY="$2"; shift 2 ;;
+    --mode)    MODE="${2-}"; shift 2 ;;
+    --engine)  ENGINE="${2-}"; shift 2 ;;
+    --apps)    LIST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "typein: 未知参数: $1（--help 查看用法）" >&2; exit 2 ;;
+  esac
+done
+
+grant_help() {
+  cat >&2 <<'EOF'
+typein: 当前环境没有发送按键的「辅助功能」授权。两种解法：
+  1. 给运行本命令的 App 授权：系统设置 → 隐私与安全性 → 辅助功能 →
+     添加并勾选运行脚本的 App（如 kitty、Terminal、iTerm），无需重启。
+  2. 安装并运行 Hammerspoon（hs CLI），typein 会自动改走 hs 引擎。
+EOF
+}
+
+if [[ $LIST -eq 1 ]]; then
+  osascript -e 'tell application "System Events" to get name of every process whose background only is false' \
+    | tr ',' '\n' | sed 's/^ *//'
+  exit 0
+fi
+
+[[ -z "$APP" ]] && { echo "typein: --app 必填（--apps 可列出应用名）" >&2; exit 2; }
+[[ -z "$TEXT" && $ENTER -eq 0 ]] && { echo "typein: --text 与 --enter 至少要给一个" >&2; exit 2; }
+[[ "$MODE" != "paste" && "$MODE" != "type" ]] && { echo "typein: --mode 只支持 paste|type" >&2; exit 2; }
+[[ "$ENGINE" != "auto" && "$ENGINE" != "osascript" && "$ENGINE" != "hs" ]] && {
+  echo "typein: --engine 只支持 auto|osascript|hs" >&2; exit 2; }
+[[ "$ENGINE" == "hs" ]] && ! command -v hs >/dev/null && {
+  echo "typein: 找不到 hs 命令，请确认 Hammerspoon 已运行且安装了 hs CLI" >&2; exit 1; }
+
+# 两种引擎共用同一份参数文件。app/text 走临时文件而不是命令行内嵌：
+# Lua（hs -c 在 Hammerspoon 守护进程里执行，不继承 shell 环境变量）和
+# AppleScript 都直接读文件，任何字符（引号、反斜杠、换行）都无需转义。
+APPF=$(mktemp) || exit 1
+TEXTF=$(mktemp) || exit 1
+trap 'rm -f "$APPF" "$TEXTF"' EXIT
+printf '%s' "$APP" > "$APPF"
+printf '%s' "$TEXT" > "$TEXTF"
+
+# osascript 引擎：找应用（精确优先、唯一子串兜底）→ 聚焦并确认前台 → 输入 → 回车。
+# 聚焦确认失败绝不输入，避免文字落到别的应用里。
+run_osascript_engine() {
+  osascript - "$APPF" "$TEXTF" "$ENTER" "$DELAY" "$MODE" <<'AS'
+on run argv
+	set appPat to (read POSIX file (item 1 of argv) as «class utf8»)
+	set textToType to ""
+	try
+		set textToType to (read POSIX file (item 2 of argv) as «class utf8»)
+	end try
+	set wantEnter to (item 3 of argv) as integer
+	set waitSec to (item 4 of argv) as real
+	set pasteMode to (item 5 of argv is "paste")
+
+	tell application "System Events"
+		set exacts to (name of every process whose name is appPat and background only is false)
+	end tell
+	set procName to ""
+	if (count of exacts) > 0 then
+		set procName to item 1 of exacts
+	else
+		tell application "System Events" to ¬
+			set partials to (name of every process whose name contains appPat and background only is false)
+		if (count of partials) is 0 then
+			error "应用未运行: " & appPat & "（typein --apps 可列出应用名）"
+		else if (count of partials) > 1 then
+			set AppleScript's text item delimiters to ", "
+			error "匹配到多个应用: " & (partials as text) & "，请写更精确的名字"
+		end if
+		set procName to item 1 of partials
+	end if
+
+	tell application "System Events" to set frontmost of process procName to true
+	delay waitSec
+	tell application "System Events" to set frontOK to (frontmost of process procName)
+	if not frontOK then
+		activate application procName
+		delay waitSec
+		tell application "System Events" to set frontOK to (frontmost of process procName)
+		if not frontOK then
+			error "无法把焦点交给 " & procName & "，为安全起见本次不输入"
+		end if
+	end if
+
+	if (length of textToType) > 0 then
+		if pasteMode then
+			set savedClip to missing value
+			try
+				set savedClip to the clipboard
+			end try
+			set the clipboard to textToType
+			delay 0.05
+			tell application "System Events" to keystroke "v" using command down
+			delay 0.15
+			if savedClip is not missing value then set the clipboard to savedClip
+		else
+			tell application "System Events" to keystroke textToType
+		end if
+	end if
+
+	if wantEnter is 1 then
+		delay 0.1
+		tell application "System Events" to key code 36
+	end if
+	return "ok → " & procName
+end run
+AS
+}
+
+# Hammerspoon 引擎：同样的流程，Lua 跑在 Hammerspoon 守护进程里（持辅助功能授权）。
+run_hs_engine() {
+  local LUA
+  LUA=$(cat <<'LUA'
+local function rd(p)
+  if not p or p == "" then return "" end
+  local f = io.open(p, "r")
+  if not f then return "" end
+  local s = f:read("*a")
+  f:close()
+  return s or ""
+end
+local appPat = rd("APPF_PATH"):gsub("%s+$", "")
+local text   = rd("TEXTF_PATH")
+local wantEnter = "ENTER_FLAG" == "1"
+local waitSec   = tonumber("DELAY_SEC") or 0.6
+local pasteMode = "MODE_NAME" == "paste"
+
+local target, candidates = nil, {}
+for _, a in ipairs(hs.application.runningApplications()) do
+  local t = a:title()
+  if a:kind() > 0 and t and t ~= "" then
+    if t:lower() == appPat:lower() then target = a break
+    elseif t:lower():find(appPat:lower(), 1, true) then table.insert(candidates, a) end
+  end
+end
+if not target then
+  if #candidates == 0 then error("应用未运行: " .. appPat .. "（typein --apps 可列出应用名）") end
+  if #candidates > 1 then
+    local names = {}
+    for _, a in ipairs(candidates) do table.insert(names, a:title()) end
+    error("匹配到多个应用: " .. table.concat(names, ", ") .. "，请写更精确的名字")
+  end
+  target = candidates[1]
+end
+
+local function isFront()
+  local f = hs.application.frontmostApplication()
+  return f ~= nil and f:pid() == target:pid()
+end
+
+target:activate()
+hs.timer.usleep(waitSec * 1000000)
+if not isFront() then
+  target:activate()
+  hs.timer.usleep(waitSec * 1000000)
+  if not isFront() then
+    error("无法把焦点交给 " .. target:title() .. "，为安全起见本次不输入")
+  end
+end
+
+if #text > 0 then
+  if pasteMode then
+    local saved = hs.pasteboard.getContents()
+    hs.pasteboard.setContents(text)
+    hs.timer.usleep(50000)
+    hs.eventtap.keyStroke({"cmd"}, "v")
+    hs.timer.usleep(150000)
+    if saved then hs.pasteboard.setContents(saved) end
+  else
+    hs.eventtap.keyStrokes(text)
+  end
+end
+
+if wantEnter then
+  hs.timer.usleep(100000)
+  hs.eventtap.keyStroke({}, "return")
+end
+
+return "ok → " .. target:title()
+LUA
+  )
+  LUA=${LUA//APPF_PATH/$APPF}
+  LUA=${LUA//TEXTF_PATH/$TEXTF}
+  LUA=${LUA//ENTER_FLAG/$ENTER}
+  LUA=${LUA//DELAY_SEC/$DELAY}
+  LUA=${LUA//MODE_NAME/$MODE}
+  hs -c "$LUA"
+}
+
+is_permission_error() {
+  grep -qE 'not allowed to send keystrokes|not allowed assistive access|\(1002\)|error -25211|error -1719'
+}
+
+if [[ "$ENGINE" == "osascript" ]]; then
+  if ! OUT=$(run_osascript_engine 2>&1); then
+    printf '%s\n' "$OUT" >&2
+    is_permission_error <<<"$OUT" && grant_help
+    exit 1
+  fi
+  printf '%s\n' "$OUT"
+  exit 0
+fi
+
+if [[ "$ENGINE" == "hs" ]]; then
+  run_hs_engine
+  exit 0
+fi
+
+# auto：先 osascript，权限类失败且装有 hs 时回退
+if OUT=$(run_osascript_engine 2>&1); then
+  printf '%s\n' "$OUT"
+  exit 0
+fi
+RC=$?
+if is_permission_error <<<"$OUT" && command -v hs >/dev/null; then
+  echo "typein: 宿主缺少辅助功能授权，回退 Hammerspoon 引擎" >&2
+  run_hs_engine
+  exit 0
+fi
+printf '%s\n' "$OUT" >&2
+is_permission_error <<<"$OUT" && grant_help
+exit "$RC"
