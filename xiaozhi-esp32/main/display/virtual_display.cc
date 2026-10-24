@@ -19,10 +19,73 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_material_symbols_30_4);
 LV_FONT_DECLARE(font_noto_emoji_30_4);
+LV_FONT_DECLARE(font_noto_sans_basic_20_4);
+LV_FONT_DECLARE(font_noto_sans_basic_14_1);
+
+/* Content layer layout: the text never touches the edges, and that margin is
+ * also what the font fitting below measures against. */
+static constexpr int kContentMarginX = 32;
+static constexpr int kContentMarginY = 20;
+static constexpr int kContentLineSpace = 4;
+
+bool ParseHexColor(const char* text, lv_color_t* color) {
+    if (text == nullptr || color == nullptr) {
+        return false;
+    }
+    if (text[0] == '#') {
+        text++;
+    }
+    uint32_t value = 0;
+    int digits = 0;
+    for (; text[digits] != '\0'; digits++) {
+        const char c = text[digits];
+        uint32_t nibble;
+        if (c >= '0' && c <= '9') {
+            nibble = static_cast<uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            nibble = static_cast<uint32_t>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            nibble = static_cast<uint32_t>(c - 'A' + 10);
+        } else {
+            return false;
+        }
+        if (digits >= 6) {
+            return false;
+        }
+        value = (value << 4) | nibble;
+    }
+    if (digits != 6) {
+        return false;
+    }
+    *color = lv_color_hex(value);
+    return true;
+}
+
+bool ParseTextSize(const char* name, DisplayTextStyle::Size* size) {
+    if (name == nullptr || size == nullptr) {
+        return false;
+    }
+    if (strcmp(name, "auto") == 0) {
+        *size = DisplayTextStyle::kAuto;
+    } else if (strcmp(name, "large") == 0) {
+        *size = DisplayTextStyle::kLarge;
+    } else if (strcmp(name, "medium") == 0) {
+        *size = DisplayTextStyle::kMedium;
+    } else if (strcmp(name, "small") == 0) {
+        *size = DisplayTextStyle::kSmall;
+    } else {
+        return false;
+    }
+    return true;
+}
 
 VirtualDisplay::VirtualDisplay(int width, int height, int fps) : fps_(fps) {
     width_ = width;
     height_ = height;
+    /* Copies of the smaller built-in faces: the theme font is the large one, and
+     * the content layer shrinks to these when the text is long. */
+    medium_font_ = font_noto_sans_basic_20_4;
+    small_font_ = font_noto_sans_basic_14_1;
     InitializeLvgl();
     InitializeThemes();
 
@@ -164,7 +227,7 @@ void VirtualDisplay::ApplyTheme() {
     if (theme->text_font() != nullptr) {
         lv_obj_set_style_text_font(screen, theme->text_font()->font(), 0);
     }
-    for (auto* label : {status_label_, notification_label_, chat_message_label_, content_label_}) {
+    for (auto* label : {status_label_, notification_label_, chat_message_label_}) {
         if (label == nullptr) {
             continue;
         }
@@ -173,6 +236,12 @@ void VirtualDisplay::ApplyTheme() {
             lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
         }
     }
+    /* Rare characters fall back to whatever the theme ended up with (the assets
+     * partition replaces it with a wider face once online). */
+    const lv_font_t* theme_font = theme->text_font() != nullptr ? theme->text_font()->font() : nullptr;
+    medium_font_.fallback = theme_font;
+    small_font_.fallback = theme_font;
+    ApplyContentStyle();
     if (emoji_label_ != nullptr && theme->emoji_font() != nullptr) {
         lv_obj_set_style_text_font(emoji_label_, theme->emoji_font()->font(), 0);
     }
@@ -212,26 +281,91 @@ void VirtualDisplay::SetupUI() {
     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(chat_message_label_, LV_ALIGN_BOTTOM_MID, 0, -16);
 
-    content_label_ = lv_label_create(screen);
+    content_area_ = lv_obj_create(screen);
+    lv_obj_remove_style_all(content_area_);
+    lv_obj_set_size(content_area_, width_, height_);
+    lv_obj_center(content_area_);
+    lv_obj_remove_flag(content_area_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
+
+    content_label_ = lv_label_create(content_area_);
     lv_label_set_text(content_label_, "");
-    lv_obj_set_width(content_label_, width_ - 64);
+    lv_obj_set_width(content_label_, width_ - 2 * kContentMarginX);
     lv_label_set_long_mode(content_label_, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(content_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(content_label_, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_text_line_space(content_label_, kContentLineSpace, 0);
+    lv_obj_center(content_label_);
 
     ApplyTheme();
 }
 
-void VirtualDisplay::ShowText(const std::string& text) {
+const lv_font_t* VirtualDisplay::SelectContentFont(const std::string& text,
+                                                  DisplayTextStyle::Size size) {
+    const lv_font_t* large = nullptr;
+    if (current_theme_ != nullptr) {
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        large = theme->text_font() != nullptr ? theme->text_font()->font() : nullptr;
+    }
+    if (large == nullptr) {
+        large = &medium_font_;
+    }
+    switch (size) {
+        case DisplayTextStyle::kLarge:
+            return large;
+        case DisplayTextStyle::kMedium:
+            return &medium_font_;
+        case DisplayTextStyle::kSmall:
+            return &small_font_;
+        case DisplayTextStyle::kAuto:
+        default:
+            break;
+    }
+    /* Auto: the largest face whose wrapped text still fits the screen. */
+    const lv_font_t* candidates[] = {large, &medium_font_, &small_font_};
+    for (const lv_font_t* candidate : candidates) {
+        lv_point_t measured{};
+        lv_txt_get_size(&measured, text.c_str(), candidate, 0, kContentLineSpace,
+                        width_ - 2 * kContentMarginX, LV_TEXT_FLAG_NONE);
+        if (measured.y <= height_ - 2 * kContentMarginY) {
+            return candidate;
+        }
+    }
+    return &small_font_;
+}
+
+void VirtualDisplay::ApplyContentStyle() {
+    if (content_area_ == nullptr || content_label_ == nullptr) {
+        return;
+    }
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    const lv_color_t text_color =
+        text_style_.has_color ? text_style_.color : theme->text_color();
+    lv_obj_set_style_text_color(content_label_, text_color, 0);
+    if (content_font_ != nullptr) {
+        lv_obj_set_style_text_font(content_label_, content_font_, 0);
+    }
+    if (text_style_.has_background) {
+        lv_obj_set_style_bg_color(content_area_, text_style_.background, 0);
+        lv_obj_set_style_bg_opa(content_area_, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_set_style_bg_opa(content_area_, LV_OPA_TRANSP, 0);
+    }
+}
+
+void VirtualDisplay::ShowText(const std::string& text) { ShowText(text, DisplayTextStyle()); }
+
+void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& style) {
     if (!lvgl_ready_ || content_label_ == nullptr) {
         return;
     }
     DisplayLockGuard lock(this);
+    text_style_ = style;
     content_active_ = !text.empty();
     if (content_active_) {
+        content_font_ = SelectContentFont(text, style.size);
         lv_label_set_text(content_label_, text.c_str());
-        lv_obj_remove_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+        ApplyContentStyle();
+        lv_obj_remove_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
         for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
             if (label != nullptr) {
                 lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
@@ -240,7 +374,7 @@ void VirtualDisplay::ShowText(const std::string& text) {
         return;
     }
 
-    lv_obj_add_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
     for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
         if (label != nullptr) {
             lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);

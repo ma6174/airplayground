@@ -252,12 +252,56 @@ static void test_decode_python_samples(const char *directory)
     CHECK(setup.has_audio_data_port && setup.audio_data_port == 7200);
 }
 
+static void test_utf8_name(const char *directory)
+{
+    printf("test_utf8_name\n");
+
+    uint8_t shk[16] = {0};
+    uint8_t shiv[16] = {0};
+    ap_setup_params_t params = {
+        .device_id = "02:11:22:33:44:55",
+        .session_uuid = "0F0E0D0C-0B0A-4908-8706-050403020100",
+        .name = "小智 TV",
+        .timing_port = 50000,
+        .audio_control_port = 50001,
+        .audio_stream_id = 1111111111111111111ULL,
+        .video_stream_id = 2222222222222222222ULL,
+        .shk = shk,
+        .shiv = shiv,
+    };
+
+    uint8_t buffer[1024];
+    size_t len = ap_setup_build_control(&params, buffer, sizeof(buffer));
+    CHECK(len > 0);
+    write_file(directory, "control_utf8.bplist", buffer, len);
+
+    /* "小智 TV" is 5 UTF-16 code units: marker 0x65 followed by the code units
+     * in big endian. Written as ASCII bytes the receiver reads mojibake. */
+    static const uint8_t expected[] = {0x65, 0x5c, 0x0f, 0x66, 0x7a,
+                                       0x00, 0x20, 0x00, 0x54, 0x00, 0x56};
+    bool found = false;
+    for (size_t i = 0; i + sizeof(expected) <= len; i++) {
+        if (memcmp(buffer + i, expected, sizeof(expected)) == 0) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+
+    /* The name must not leak through as raw UTF-8 either. */
+    static const uint8_t raw_utf8[] = {0xe5, 0xb0, 0x8f, 0xe6, 0x99, 0xba};
+    for (size_t i = 0; i + sizeof(raw_utf8) <= len; i++) {
+        CHECK(memcmp(buffer + i, raw_utf8, sizeof(raw_utf8)) != 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *directory = argc > 1 ? argv[1] : "out";
 
     test_encode_all_types(directory);
     test_setup_bodies(directory);
+    test_utf8_name(directory);
     test_decode_python_samples(directory);
 
     if (failures != 0) {

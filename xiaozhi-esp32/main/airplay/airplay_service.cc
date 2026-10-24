@@ -687,11 +687,11 @@ std::string AirplayService::DiscoverJson() {
     return result;
 }
 
-bool AirplayService::ShowText(const std::string& text) {
+bool AirplayService::ShowText(const std::string& text, const DisplayTextStyle& style) {
     if (display_ == nullptr) {
         return false;
     }
-    display_->ShowText(text);
+    display_->ShowText(text, style);
     return true;
 }
 

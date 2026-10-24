@@ -155,20 +155,51 @@ private:
             "Show text on the screen people are looking at (the TV this device mirrors to).\n"
             "The text takes the whole screen and stays until an empty string is passed; the chat "
             "user interface comes back then.\n"
+            "Long text wraps and shrinks on its own; pass `size` only to override that.\n"
             "Args:\n"
-            "  `text`: the text to show, short enough to fit one screen\n"
+            "  `text`: the text to show. Newlines start a new line.\n"
+            "  `color`: text colour as RRGGBB, e.g. \"FF8800\". Optional.\n"
+            "  `background`: screen colour as RRGGBB, e.g. \"000000\". Optional.\n"
+            "  `size`: auto, large, medium or small. Optional, defaults to auto.\n"
             "Return:\n"
             "  Whether the screen is now showing it.",
             PropertyList({
                 Property("text", kPropertyTypeString),
+                Property("color", kPropertyTypeString, ""),
+                Property("background", kPropertyTypeString, ""),
+                Property("size", kPropertyTypeString, "auto"),
             }),
             [this](const PropertyList& properties) -> ReturnValue {
                 auto text = properties["text"].value<std::string>();
                 if (display_ == nullptr) {
                     return std::string("no screen");
                 }
-                display_->ShowText(text);
-                return text.empty() ? std::string("chat user interface restored") : std::string("shown");
+                if (text.empty()) {
+                    display_->ShowText("");
+                    return std::string("chat user interface restored");
+                }
+
+                DisplayTextStyle style;
+                const std::string color = properties["color"].value<std::string>();
+                if (!color.empty()) {
+                    if (!ParseHexColor(color.c_str(), &style.color)) {
+                        return std::string("color must be six hex digits, e.g. FF8800");
+                    }
+                    style.has_color = true;
+                }
+                const std::string background = properties["background"].value<std::string>();
+                if (!background.empty()) {
+                    if (!ParseHexColor(background.c_str(), &style.background)) {
+                        return std::string("background must be six hex digits, e.g. 000000");
+                    }
+                    style.has_background = true;
+                }
+                const std::string size = properties["size"].value<std::string>();
+                if (!ParseTextSize(size.c_str(), &style.size)) {
+                    return std::string("size must be auto, large, medium or small");
+                }
+                display_->ShowText(text, style);
+                return std::string("shown");
             });
     }
 
