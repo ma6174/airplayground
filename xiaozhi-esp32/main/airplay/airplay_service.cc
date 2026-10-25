@@ -962,7 +962,23 @@ void AirplayService::SessionTask(void* arg) {
         /* Only a target that actually put frames on a screen is worth keeping:
          * Start() used to store it before dialling, so a typo or a wrong port
          * overwrote the receiver every caller falls back to. */
-        self->Remember(self->host_ + ":" + std::to_string(self->port_), self->legacy_);
+        /* Keep the receiver's advertised name rather than its address: DHCP
+         * moves the address, and the name still resolves through the discovery
+         * list, so "the TV used last time" keeps working after a renumbering. */
+        std::string remembered = self->host_ + ":" + std::to_string(self->port_);
+        if (!self->name_.empty()) {
+            remembered = self->name_;
+        } else {
+            airplay_target_t targets[AP_DISCOVERY_MAX_TARGETS];
+            const int found = ap_discovery_snapshot(targets, AP_DISCOVERY_MAX_TARGETS);
+            for (int i = 0; i < found; i++) {
+                if (strcmp(targets[i].host, self->host_.c_str()) == 0 && targets[i].name[0] != '\0') {
+                    remembered = targets[i].name;
+                    break;
+                }
+            }
+        }
+        self->Remember(remembered, self->legacy_);
         /* Receivers behind a network that swallows their multicast, or that only
          * announce once per power cycle, never answer a browse: frames actually
          * reaching a screen is the only evidence the list will ever get. */
