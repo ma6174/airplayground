@@ -73,6 +73,7 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         auto& airplay = AirplayService::GetInstance();
+        auto& webcast = WebcastClient::GetInstance();
 
         mcp_server.AddTool(
             "self.airplay.discover",
@@ -104,9 +105,24 @@ private:
                 Property("host", kPropertyTypeString, std::string("")),
                 Property("legacy", kPropertyTypeBoolean, false),
             }),
-            [&airplay](const PropertyList& properties) -> ReturnValue {
+            [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
                 auto host = properties["host"].value<std::string>();
                 auto legacy = properties["legacy"].value<bool>();
+                /* This tool is "the assistant's own screen". Any capture stream
+                 * that is up (pushed here or pulled from another machine) wins
+                 * the source pick, so the TV would show that machine instead -
+                 * let it go before mirroring this device's UI. */
+                media_net_pull_stop();
+                media_net_drop_client();
+                webcast.Stop();
+                /* A session picks its source when it starts, so a live one has
+                 * to be rebuilt for the device UI to come back. */
+                if (airplay.running()) {
+                    airplay.Stop();
+                    for (int i = 0; i < 100 && airplay.running(); i++) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+                }
                 if (!airplay.Start(host, legacy)) {
                     return std::string("not started: a session is already running, or no receiver by that "
                                        "name (self.airplay.discover lists them)");
@@ -189,7 +205,6 @@ private:
                 }
             });
 
-        auto& webcast = WebcastClient::GetInstance();
 
         /* Distinct from self.airplay.start: that mirrors this device's own
          * screen, while the webcast tools put a browser page from the server on
