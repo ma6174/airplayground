@@ -26,6 +26,7 @@ port" 时先 `open -a Hammerspoon`）。
 """
 
 import base64
+import functools
 import json
 import os
 import subprocess
@@ -58,11 +59,45 @@ mcp = FastMCP(
     instructions=(
         "操作用户 macOS 电脑的工具集。输入文字前先 open_app 打开/聚焦目标应用；"
         "应用名不确定时用 list_running_apps 查（很多应用实际是英文名，如 TextEdit）；"
-        "不确定屏幕上发生了什么时调 screenshot 看一眼。"
+        "看屏幕内容（截屏/看看屏幕/屏幕上有什么）必须用 screen_look：它返回文字；"
+        "screenshot_image 只返回图片，语音对话里看不到。"
     ),
     # 无状态 HTTP：服务重启后旧会话不失效，经公网隧道接入也不需要粘性会话
     stateless_http=True,
 )
+
+LOG_FILE = SHOT_DIR / "hs-mcp.log"
+
+
+def _log(msg: str) -> None:
+    try:
+        SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def tool():
+    """注册 MCP 工具，并把每次调用落一行日志（排障：客户端到底调了哪个工具）。"""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            args_txt = ", ".join(f"{k}={str(v)[:80]!r}" for k, v in kwargs.items()) \
+                or ", ".join(str(a)[:80] for a in args)
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                _log(f"{fn.__name__}({args_txt}) ERROR {e}")
+                raise
+            brief = str(getattr(result, "path", result))[:160].replace("\n", " ")
+            _log(f"{fn.__name__}({args_txt}) -> {brief}")
+            return result
+
+        return mcp.tool()(wrapper)
+
+    return deco
 
 
 def hs(lua: str, timeout: float = 10.0) -> str:
@@ -112,7 +147,7 @@ def run(cmd: list[str], timeout: float = 15.0) -> str:
     return p.stdout.strip()
 
 
-@mcp.tool()
+@tool()
 def list_running_apps() -> str:
     """列出当前正在运行的图形应用（本机本地化名称）。输入/操作某个应用前，用它确认应用名怎么写。"""
     return hs(
@@ -122,7 +157,7 @@ def list_running_apps() -> str:
     )
 
 
-@mcp.tool()
+@tool()
 def front_app() -> str:
     """查看当前前台应用名和它的窗口标题，用于确认焦点在哪。"""
     return hs(
@@ -184,7 +219,7 @@ def _focus_app(name: str) -> str:
     raise RuntimeError(f"已尝试启动 {name}，但未能把它带到前台，可用 front_app 确认当前状态。")
 
 
-@mcp.tool()
+@tool()
 def open_app(name: str) -> str:
     """打开或聚焦一个应用（没在运行则启动）。返回聚焦后的前台应用名。
 
@@ -194,7 +229,7 @@ def open_app(name: str) -> str:
     return "已聚焦: " + _focus_app(name)
 
 
-@mcp.tool()
+@tool()
 def type_text(app: str, text: str, enter: bool = False) -> str:
     """把文字输入到指定应用当前聚焦的输入框（粘贴方式，支持中文、多行，不受输入法影响）。会先把 app 聚焦；聚焦确认失败会拒绝输入。enter=true 时输入后按一次回车。务必先用 open_app 打开目标应用。"""
     cmd = [str(TYPEIN), "--app", app, "--text", text]
@@ -209,7 +244,7 @@ def type_text(app: str, text: str, enter: bool = False) -> str:
 _KEY_RE = __import__("re").compile(r"^[a-z0-9_]+$")
 
 
-@mcp.tool()
+@tool()
 def press_key(key: str, app: str = "") -> str:
     """按一次组合键，如 'return' 'cmd+s' 'cmd+shift+t'。默认发给当前前台应用；app 给定时先聚焦该应用再按键（推荐，避免打错目标）。"""
     if app:
@@ -222,7 +257,7 @@ def press_key(key: str, app: str = "") -> str:
     return hs(f"hs.eventtap.keyStroke({mod_table},'{k}') return 'ok'")
 
 
-@mcp.tool()
+@tool()
 def click_menu(app: str, path: str) -> str:
     """点击应用的菜单栏菜单项，path 用 / 分隔，如 '文件/新建' 或 'File/New Window'。应用必须在运行。"""
     items = ", ".join(lua_q(x) for x in path.split("/") if x)
@@ -232,7 +267,7 @@ def click_menu(app: str, path: str) -> str:
     )
 
 
-@mcp.tool()
+@tool()
 def open_url(url: str) -> str:
     """用系统默认程序打开一个 http(s) 网址（会在浏览器里打开）。"""
     if not url.startswith(("http://", "https://")):
@@ -240,9 +275,9 @@ def open_url(url: str) -> str:
     return run(["open", url]) or f"已打开 {url}"
 
 
-@mcp.tool()
-def screenshot(app: str = "") -> Image:
-    """截屏返回 JPEG 图片。注意：返回的是图片，部分客户端（如小智语音链路）不消费工具返回的图片——要看屏幕内容请用 screen_look，它返回视觉模型的文字描述。app 给定时只截该应用的当前窗口（更快更聚焦）；否则截整个屏幕。"""
+@tool()
+def screenshot_image(app: str = "") -> Image:
+    """截屏并以图片（MCP image content）返回。注意：语音/小智对话**看不到图片内容**，看屏幕请用 screen_look（返回文字）。app 给定时只截该应用的当前窗口，否则截整个屏幕。"""
     jpg = _shot_jpeg(app)
     return Image(path=str(jpg))
 
@@ -288,11 +323,15 @@ def _shot_jpeg(app: str = "") -> Path:
     return jpg
 
 
-@mcp.tool()
+@tool()
 def screen_look(question: str, app: str = "") -> str:
-    """看一眼电脑屏幕并回答问题：把屏幕截图交给视觉模型，返回文字描述。想知道屏幕上有什么、文档里写了什么、刚才操作的结果如何时用它（小智语音场景请用它而不是 screenshot）。
-    question 传具体问题，如“屏幕上显示了什么文字”。
-    app 给定时只看该应用的窗口（如 app="TextEdit"）；否则看整个屏幕。需要小智固件设备的 /vision/explain 端点。"""
+    """看电脑屏幕并回答问题：截图交给视觉模型，返回文字描述。
+
+    只要是「截屏」「截图」「看看屏幕」「屏幕上有什么」「写的什么内容」「刚才操作的结果如何」
+    都用这个工具（语音/小智场景唯一能看到屏幕的途径，不要用 screenshot_image）。
+    question 传具体问题，如“屏幕上显示了什么文字”；
+    app 给定时只看该应用的窗口（如 app="TextEdit"），否则看整个屏幕。
+    """
     jpg = _shot_jpeg(app)
     body = json.dumps({
         "question": question,
@@ -303,31 +342,43 @@ def screen_look(question: str, app: str = "") -> str:
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:  # 设备上传视觉模型需数秒
-            return resp.read().decode("utf-8", "replace")
+            raw = resp.read().decode("utf-8", "replace")
     except Exception as e:
         raise RuntimeError(
             f"视觉请求失败（设备 {DEVICE}）：{e}。确认设备在线且固件含 /vision/explain 端点")
+    # 设备返回 {"success":true,"filename":…,"text":"<答案>"}：只把答案文本交给模型，
+    # 否则语音助手会念出整包 JSON，或者把 JSON 当成“看不到”
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(data, dict):
+        if data.get("text"):
+            return str(data["text"])
+        if data.get("error"):
+            raise RuntimeError(f"视觉服务拒绝：{data['error']}")
+    return raw
 
 
-@mcp.tool()
+@tool()
 def clipboard_set(text: str) -> str:
     """把文字写入系统剪贴板。"""
     return hs(f"hs.pasteboard.setContents({lua_q(text)}) return 'ok'")
 
 
-@mcp.tool()
+@tool()
 def clipboard_get() -> str:
     """读取系统剪贴板里的文字。"""
     return hs("return hs.pasteboard.getContents() or ''")
 
 
-@mcp.tool()
+@tool()
 def say(text: str) -> str:
     """用语音合成（TTS）在电脑上朗读一段文字。"""
     return hs(f"hs.speech.new():speak({lua_q(text)}) return 'ok'")
 
 
-@mcp.tool()
+@tool()
 def notify(text: str) -> str:
     """在电脑屏幕上发一条系统通知横幅。"""
     return hs(
