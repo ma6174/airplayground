@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["mcp>=1.10,<2", "uvicorn>=0.30"]
+# dependencies = ["mcp>=1.10,<2", "uvicorn>=0.30", "websockets>=12"]
 # ///
 """hs-mcp — 把 hammerspoon 技能封装成 MCP 服务器，让小智等 MCP 客户端操控 macOS。
 
@@ -10,6 +10,9 @@
 仓库里的 tools/typein（剪贴板粘贴模式，支持中文/多行）。
 
 运行方式：
+
+  # 小智模式（一个参数接入：进程内实现 WebSocket 传输的 MCP server，断线自动重连）
+  uv run tools/hs_mcp/server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的token'
 
   # stdio 模式：给 Claude / aimux 等本地 MCP 客户端
   uv run tools/hs_mcp/server.py
@@ -123,15 +126,20 @@ def front_app() -> str:
     )
 
 
-@mcp.tool()
-def open_app(name: str) -> str:
-    """打开或聚焦一个应用（没在运行则启动）。返回聚焦后的前台应用名。
+_FIND_APP = (
+    "for _,a in ipairs(hs.application.runningApplications()) do "
+    "if a:kind()>0 then local n=(a:name() or ''):lower() local t=(a:title() or ''):lower() "
+    "if n==want or t==want then app=a break end end end "
+    "if not app then "
+    "for _,a in ipairs(hs.application.runningApplications()) do "
+    "if a:kind()>0 then local n=(a:name() or ''):lower() local t=(a:title() or ''):lower() "
+    "if (n~='' and n:find(want,1,true)) or (t~='' and t:find(want,1,true)) then app=a break end end end end "
+)
 
-    注意：中文系统上很多应用实际名仍是英文（如 TextEdit、Calculator），
-    不确定时先用 list_running_apps 查。找不到中文名时会自动尝试系统 open -a。
-    """
-    want = name.lower()
-    wq = lua_q(want)
+
+def _focus_app(name: str) -> str:
+    """把应用带到前台，成功返回其显示名；找不到/失败抛 RuntimeError。"""
+    wq = lua_q(name.lower())
     # 事实：get()/launchOrFocus 对已运行应用的匹配不可靠（中英文名不一致），
     # 可靠锚点是遍历 runningApplications 双字段（title 本地化名/ name 进程名）；
     # 某些应用（如 TextEdit）连本地化名都是英文，「中文名」只有 LaunchServices 认识，
@@ -139,14 +147,7 @@ def open_app(name: str) -> str:
     # 等待循环放 Python 侧：hs CLI 的 IPC 有内部接收超时，单个 Lua 块不能跑秒级轮询。
     hs(f"hs.application.launchOrFocus({wq}) return 'ok'", timeout=5.0)  # 冷启动场景，返回值不代表成败
     find_and_activate = (
-        f"local want={wq} local app "
-        "for _,a in ipairs(hs.application.runningApplications()) do "
-        "if a:kind()>0 then local n=(a:name() or ''):lower() local t=(a:title() or ''):lower() "
-        "if n==want or t==want then app=a break end end end "
-        "if not app then "
-        "for _,a in ipairs(hs.application.runningApplications()) do "
-        "if a:kind()>0 then local n=(a:name() or ''):lower() local t=(a:title() or ''):lower() "
-        "if (n~='' and n:find(want,1,true)) or (t~='' and t:find(want,1,true)) then app=a break end end end end "
+        f"local want={wq} local app " + _FIND_APP +
         "if not app then return 'NOAPP' end "
         "if not app:isFrontmost() then app:activate() end "
         "if app:isFrontmost() then return 'FRONT|'..(app:title() or app:name()) end "
@@ -156,7 +157,7 @@ def open_app(name: str) -> str:
         time.sleep(0.3)
         out = hs(find_and_activate, timeout=5.0)
         if out.startswith("FRONT|"):
-            return "已聚焦: " + out.split("|", 1)[1]
+            return out.split("|", 1)[1]
         if out != "NOAPP":
             break
     else:
@@ -165,17 +166,27 @@ def open_app(name: str) -> str:
         try:
             run(["open", "-a", name], timeout=8.0)  # LaunchServices 认注册名（含部分中文别名）
         except RuntimeError:
-            return (
+            raise RuntimeError(
                 f"找不到应用 {name}。可先调 list_running_apps 查看正在运行的应用名再重试。"
             )
     for _ in range(10):
         time.sleep(0.3)
         out = hs(find_and_activate, timeout=5.0)
         if out.startswith("FRONT|"):
-            return "已聚焦: " + out.split("|", 1)[1]
+            return out.split("|", 1)[1]
         if out == "NOAPP":
             break
-    return f"已尝试启动 {name}，但未能确认它到前台。可用 screenshot 或 front_app 确认实际状态。"
+    raise RuntimeError(f"已尝试启动 {name}，但未能把它带到前台，可用 front_app 确认当前状态。")
+
+
+@mcp.tool()
+def open_app(name: str) -> str:
+    """打开或聚焦一个应用（没在运行则启动）。返回聚焦后的前台应用名。
+
+    注意：中文系统上很多应用实际名仍是英文（如 TextEdit、Calculator），
+    不确定时先用 list_running_apps 查。找不到中文名时会自动尝试系统 open -a。
+    """
+    return "已聚焦: " + _focus_app(name)
 
 
 @mcp.tool()
@@ -194,8 +205,10 @@ _KEY_RE = __import__("re").compile(r"^[a-z0-9_]+$")
 
 
 @mcp.tool()
-def press_key(key: str) -> str:
-    """按一次组合键，发给当前前台应用。格式小写加号连接，如 'return' 'cmd+s' 'cmd+shift+t'。"""
+def press_key(key: str, app: str = "") -> str:
+    """按一次组合键，如 'return' 'cmd+s' 'cmd+shift+t'。默认发给当前前台应用；app 给定时先聚焦该应用再按键（推荐，避免打错目标）。"""
+    if app:
+        _focus_app(app)
     parts = [p for p in key.lower().split("+") if p]
     if not parts or not all(_KEY_RE.match(p) for p in parts):
         raise RuntimeError(f"非法按键: {key}")
@@ -223,19 +236,33 @@ def open_url(url: str) -> str:
 
 
 @mcp.tool()
-def screenshot() -> Image:
-    """截取整个屏幕，返回 JPEG 图片。想确认操作结果、看屏幕上有什么时调用。"""
+def screenshot(app: str = "") -> Image:
+    """截屏返回 JPEG。app 给定时只截该应用的当前窗口（推荐：更快、画面更聚焦，如 app='TextEdit'）；否则截整个屏幕。"""
     SHOT_DIR.mkdir(parents=True, exist_ok=True)
     png = SHOT_DIR / "screen.png"
     jpg = SHOT_DIR / "screen.jpg"
     png.unlink(missing_ok=True)
     # 5K 屏 snapshot+saveToFile 约 4 秒，超过 hs CLI 的 IPC 接收超时，
     # 所以用 doAfter(0) 做成 fire-and-forget，Python 侧轮询文件落盘
-    hs(
-        f"hs.timer.doAfter(0, function() local i=hs.screen.mainScreen():snapshot() "
-        f"i:saveToFile('{png}') end) return 'ok'",
-        timeout=5.0,
-    )
+    if app:
+        # 先同步确认窗口存在（毫秒级），再异步截图；避免白等
+        check = hs(
+            f"local want={lua_q(app.lower())} local app " + _FIND_APP +
+            "if not app or not app:mainWindow() then return 'NOWIN' end return 'OK'",
+            timeout=5.0,
+        )
+        if check != "OK":
+            raise RuntimeError(f"{app} 没有可截取的窗口（应用未运行或无窗口）")
+        snap = (
+            f"local want={lua_q(app.lower())} local app " + _FIND_APP +
+            "if not app then return end local w=app:mainWindow() if not w then return end "
+            f"local i=w:snapshot() if i then i:saveToFile('{png}') end"
+        )
+    else:
+        snap = (
+            f"local i=hs.screen.mainScreen():snapshot() i:saveToFile('{png}')"
+        )
+    hs(f"hs.timer.doAfter(0, function() {snap} end) return 'ok'", timeout=5.0)
     for _ in range(50):
         time.sleep(0.2)
         if png.exists() and png.stat().st_size > 0:
@@ -290,14 +317,99 @@ def build_http_app() -> Starlette:
     return Starlette(routes=[*sse_app.routes, *http_app.routes], lifespan=lifespan)
 
 
+def mask_url(url: str) -> str:
+    """把 URL 里的 query 掩掉（含 token，不进日志）。"""
+    from urllib.parse import urlsplit, urlunsplit
+    s = urlsplit(url)
+    if s.query:
+        s = s._replace(query="token=***")
+    return urlunsplit(s)
+
+
+async def run_xiaozhi(url: str) -> None:
+    """小智 MCP 接入点模式：连 wss://api.xiaozhi.me/mcp/?token=…，
+
+    帧协议是裸 JSON-RPC（MCP 消息逐帧收发）。进程内把 WebSocket 帧桥接到
+    FastMCP 内部的 lowlevel Server（与 stdio 模式同一套工具逻辑），
+    断线自动重连。
+    """
+    import anyio
+    import websockets
+    from mcp.shared.session import SessionMessage
+    from mcp.types import JSONRPCMessage
+
+    server = mcp._mcp_server  # FastMCP 内部的 lowlevel Server；已 pin mcp<2
+    init_opts = server.create_initialization_options()
+    backoff = 2
+
+    while True:
+        try:
+            print(f"[xiaozhi] 连接 {mask_url(url)} …", file=sys.stderr, flush=True)
+            async with websockets.connect(url, open_timeout=10) as ws:
+                print("[xiaozhi] 已连接，等待云端初始化", file=sys.stderr, flush=True)
+                rx_send, rx = anyio.create_memory_object_stream(64)
+                tx, tx_recv = anyio.create_memory_object_stream(64)
+
+                async def incoming():
+                    try:
+                        async for raw in ws:
+                            try:
+                                # 与 SDK stdio reader 相同：SessionMessage 是 dataclass，
+                                # 真正的 pydantic 解析在内层 JSONRPCMessage 上
+                                await rx_send.send(SessionMessage(
+                                    message=JSONRPCMessage.model_validate_json(raw)))
+                            except Exception as e:
+                                print(f"[xiaozhi] 丢弃无法解析的消息: {e}",
+                                      file=sys.stderr, flush=True)
+                    except websockets.ConnectionClosed:
+                        pass
+                    finally:
+                        rx_send.close()
+
+                async def outgoing():
+                    try:
+                        async for msg in tx_recv:
+                            await ws.send(
+                                msg.message.model_dump_json(by_alias=True, exclude_none=True))
+                    except websockets.ConnectionClosed:
+                        pass
+                    finally:
+                        tx_recv.close()
+
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(incoming)
+                    tg.start_soon(outgoing)
+                    try:
+                        await server.run(rx, tx, init_opts, raise_exceptions=False)
+                    except Exception as e:
+                        print(f"[xiaozhi] 会话结束: {e!r}", file=sys.stderr, flush=True)
+                    tg.cancel_scope.cancel()
+            backoff = 2
+            print("[xiaozhi] 连接断开，2 秒后重连", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[xiaozhi] 连接失败: {e}，{backoff} 秒后重试",
+                  file=sys.stderr, flush=True)
+        await anyio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
 def main() -> None:
-    if "--http" in sys.argv:
+    argv = sys.argv[1:]
+    if "--http" in argv:
         uvicorn.run(
             build_http_app(),
             host=os.environ.get("HS_MCP_HOST", "127.0.0.1"),
             port=int(os.environ.get("HS_MCP_PORT", "8390")),
             log_level="info",
         )
+    elif "--xiaozhi" in argv:
+        i = argv.index("--xiaozhi")
+        if i + 1 >= len(argv):
+            print("用法: server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的token'",
+                  file=sys.stderr)
+            sys.exit(2)
+        import anyio
+        anyio.run(run_xiaozhi, argv[i + 1])
     else:
         mcp.run()  # stdio
 
