@@ -79,7 +79,10 @@ private:
 
         mcp_server.AddTool(
             "self.airplay.start",
-            "Mirror this device's screen to an AirPlay receiver such as a TV.\n"
+            "Mirror this device's own screen (its chat UI) to an AirPlay receiver such as a TV.\n"
+            "This device has no access to any computer's screen: to put a computer window on the TV, "
+            "the computer has to send it itself (its own MCP tool, cast_to_tv) — do not use this one "
+            "for that; the user would see the device UI instead of what they asked for.\n"
             "Args:\n"
             "  `host`: receiver address, or a receiver name from `self.airplay.discover` "
             "  (empty = the receiver used last time)\n"
