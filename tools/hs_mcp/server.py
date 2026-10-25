@@ -837,11 +837,52 @@ def _cast_state_read() -> dict:
 
 
 def _cast_state_write(state: dict) -> None:
+    """记下这次投屏。owner 是本进程的 pid：状态文件只对写出它的进程有效。"""
     try:
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
-        CAST_STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        CAST_STATE.write_text(json.dumps({**state, "owner": os.getpid()},
+                                         ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _drop_orphan_cast() -> None:
+    """上一次进程留下的投屏不接管。
+
+    投屏是“用户这一刻要求的动作”，进程重启后不该自己接回去，否则改完代码
+    重启 --xiaozhi，电视会自己亮起来（拉流目标还留在设备 NVS 里、推流进程
+    也还在跑）。落单的推流进程直接杀，拉流目标顺手清掉。
+
+    owner 还活着的状态不碰：那是同一台机器上另一个 hs-mcp 正在投屏，
+    杀掉它的采集进程会把别人的画面掐断。
+    """
+    state = _cast_state_read()
+    if not state.get("args"):
+        return
+    owner = state.get("owner")
+    if isinstance(owner, int) and _pid_alive(owner):
+        _log(f"another hs-mcp (pid {owner}) is casting, leaving it alone")
+        return
+    CAST_STATE.unlink(missing_ok=True)
+    if _capture_pids():
+        _kill_capture()
+    _log("dropped the cast left over from a previous process")
+    if state.get("pull"):
+        # 设备记在 NVS 里的拉流目标会让它一直重连回来
+        def _clear() -> None:
+            try:
+                _set_pull("")
+            except RuntimeError:
+                pass
+        threading.Thread(target=_clear, daemon=True).start()
 
 
 _watchdog_lock = threading.Lock()
@@ -904,7 +945,8 @@ def _watchdog_loop() -> None:
         time.sleep(5)
         try:
             state = _cast_state_read()
-            if not state.get("args"):
+            # 只接管本进程写下的投屏：重启后旧状态不该让电视自己亮起来
+            if not state.get("args") or state.get("owner") != os.getpid():
                 _stream_idle = 0
                 continue
             if _cast_pid() is None:
@@ -938,8 +980,8 @@ def _watchdog_loop() -> None:
 def _reopen_session(state: dict) -> None:
     """把丢掉的投屏会话接回去。
 
-    重启、电视断电回来都不该再让用户说一遍——停机的意思是 stop_cast，它会先把
-    拉流目标清掉并把状态文件删了，watchdog 就不再插手。
+    投屏进行中设备重启、电视断电回来都不该再让用户说一遍——停机的意思是
+    stop_cast，它会先把拉流目标清掉并把状态文件删了，watchdog 就不再插手。
     """
     global _last_reopen
     if time.time() - _last_reopen < 20:
@@ -1205,6 +1247,7 @@ async def run_xiaozhi(url: str) -> None:
 
 
 def main() -> None:
+    _drop_orphan_cast()
     _start_watchdog()
     argv = sys.argv[1:]
     if "--http" in argv:
