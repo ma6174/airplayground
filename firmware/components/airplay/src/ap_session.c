@@ -162,6 +162,18 @@ static esp_err_t discover(ap_session_t *session)
     if (session->prefers_legacy_pairing) {
         AP_LOGI("receiver prefers the legacy pairing type (no screen-capture ACL)");
     }
+    /* Time HAP sessions with NTP, on our own boot clock: the receiver measures
+     * us through the NTP responder and presents against that, so no shared
+     * clock domain is needed. The PTP path cannot be used as implemented: it
+     * anchors once on the SETUP reply's clock headers and extrapolates them
+     * forever, but macOS presents against a network gPTP domain that sits a
+     * large constant offset away from the domain those headers report
+     * (-14165 s measured on 2026-10-26). Every frame then lands far in the
+     * future, the decoder queues them all (sbuf grew to 25 s) and nothing
+     * past the first frame is ever presented - the classic "picture frozen
+     * on the first frame" report. Real gPTP sync is not implemented; NTP
+     * gives the receiver everything it needs to follow us instead. */
+    session->force_ntp = true;
     session->use_ptp = !session->force_ntp && info.has_features && (info.features & (1ULL << 41)) != 0;
     session->timing_protocol = session->use_ptp ? "PTP" : "NTP";
     AP_LOGI("timing protocol: %s", session->timing_protocol);
