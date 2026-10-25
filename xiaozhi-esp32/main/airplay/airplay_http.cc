@@ -8,6 +8,9 @@
 #include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include <mbedtls/base64.h>
+
+#include <cJSON.h>
 
 #include "airplay_service.h"
 #include "display/virtual_display.h"
@@ -20,6 +23,9 @@ constexpr int kMaxQuery = 96;
 /* One screen of text; the POST body carries it raw so the model can send any
  * UTF-8 without percent-encoding games. */
 constexpr size_t kMaxText = 512;
+/* /vision/explain JSON body cap: base64 of a 1600px JPEG plus the question.
+ * One megabyte covers it with room to spare and stays PSRAM-friendly. */
+constexpr size_t kMaxVisionBody = 1024 * 1024;
 
 /* esp_http_server hands the query string over verbatim, so percent-escapes and
  * '+' for space are still in it. Receiver names are UTF-8 here: the projector
@@ -186,6 +192,74 @@ esp_err_t TextHandler(httpd_req_t* req) {
 
 }  // namespace
 
+static httpd_handle_t s_server = nullptr;
+static VisionExplainFn s_vision_explain;
+
+void AirplayHttpSetVisionExplain(VisionExplainFn fn) { s_vision_explain = std::move(fn); }
+
+/* Body: {"question": "...", "image": "<base64 JPEG>"}. Forwards the image to
+ * the cloud vision pipeline and returns its answer text. The upload inside
+ * takes seconds, so callers should keep generous HTTP timeouts. */
+esp_err_t VisionExplainHandler(httpd_req_t* req) {
+    if (!s_vision_explain) {
+        return Reply(req, "{\"ok\":false,\"error\":\"vision explain not wired on this board\"}");
+    }
+    const int content_len = req->content_len;
+    if (content_len <= 0 || static_cast<size_t>(content_len) > kMaxVisionBody) {
+        return Reply(req, "{\"ok\":false,\"error\":\"body missing or too large\"}");
+    }
+    auto* body = static_cast<char*>(heap_caps_malloc(content_len + 1, MALLOC_CAP_SPIRAM));
+    if (body == nullptr) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no memory\"}");
+    }
+    size_t total = 0;
+    while (total < static_cast<size_t>(content_len)) {
+        const int want = content_len - static_cast<int>(total);
+        const int got = httpd_req_recv(req, body + total, want);
+        if (got <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(got);
+    }
+    body[total] = '\0';
+
+    std::string reply;
+    cJSON* json = cJSON_Parse(body);
+    heap_caps_free(body);
+    const cJSON* question = json ? cJSON_GetObjectItem(json, "question") : nullptr;
+    const cJSON* image = json ? cJSON_GetObjectItem(json, "image") : nullptr;
+    if (!cJSON_IsString(question) || !cJSON_IsString(image)) {
+        reply = "{\"ok\":false,\"error\":\"question and image (base64 JPEG) required\"}";
+    } else {
+        const size_t b64_len = strlen(image->valuestring);
+        const size_t jpeg_cap = b64_len / 4 * 3 + 3;
+        auto* jpeg = static_cast<uint8_t*>(heap_caps_malloc(jpeg_cap, MALLOC_CAP_SPIRAM));
+        size_t jpeg_len = 0;
+        if (jpeg == nullptr ||
+            mbedtls_base64_decode(jpeg, jpeg_cap, &jpeg_len,
+                                  reinterpret_cast<const unsigned char*>(image->valuestring),
+                                  b64_len) != 0 ||
+            jpeg_len == 0) {
+            reply = "{\"ok\":false,\"error\":\"invalid base64 image\"}";
+        } else {
+            auto result = s_vision_explain(jpeg, jpeg_len, question->valuestring);
+            if (result) {
+                reply = std::move(*result);
+            } else {
+                std::string escaped;
+                for (char c : result.error()) {
+                    if (c == '"' || c == '\\') escaped += '\\';
+                    escaped += c;
+                }
+                reply = "{\"ok\":false,\"error\":\"" + escaped + "\"}";
+            }
+        }
+        heap_caps_free(jpeg);
+    }
+    cJSON_Delete(json);
+    return Reply(req, reply.c_str());
+}
+
 void AirplayHttpStart() {
     static bool started = false;
     if (started) {
@@ -198,12 +272,16 @@ void AirplayHttpStart() {
     config.lru_purge_enable = true;
     /* The screenshot endpoint runs the software H.264 encoder in the handler. */
     config.stack_size = 32768;
+    /* Built-ins plus board-registered endpoints; over the default 8 new URIs
+     * would silently 404. */
+    config.max_uri_handlers = 16;
 
     httpd_handle_t server = nullptr;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "cannot start the debug HTTP server");
         return;
     }
+    s_server = server;
 
     const httpd_uri_t uris[] = {
         {.uri = "/airplay/status", .method = HTTP_GET, .handler = StatusHandler, .user_ctx = nullptr},
@@ -214,11 +292,12 @@ void AirplayHttpStart() {
         {.uri = "/airplay/frame.h264", .method = HTTP_GET, .handler = FrameHandler, .user_ctx = nullptr},
         {.uri = "/airplay/discover", .method = HTTP_GET, .handler = DiscoverHandler, .user_ctx = nullptr},
         {.uri = "/airplay/text", .method = HTTP_POST, .handler = TextHandler, .user_ctx = nullptr},
+        {.uri = "/vision/explain", .method = HTTP_POST, .handler = VisionExplainHandler, .user_ctx = nullptr},
     };
     for (const auto& uri : uris) {
         httpd_register_uri_handler(server, &uri);
     }
     ESP_LOGI(TAG,
              "bench API on http://<device>:8080/airplay/"
-             "{status,start,stop,pin,screen.raw,frame.h264,discover,text}");
+             "{status,start,stop,pin,screen.raw,frame.h264,discover,text} + /vision/explain");
 }

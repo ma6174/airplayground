@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 
+#include "airplay/airplay_http.h"
 #include "airplay/airplay_service.h"
 #include "airplay_screen_camera.h"
 #include "application.h"
@@ -256,6 +257,14 @@ private:
                     return std::unexpected(std::move(result.error()));
                 }
                 return std::move(*result);
+            });
+
+        /* Let the bench API (/vision/explain) ask the cloud vision service
+         * about screenshots pushed from the computer, reusing the same
+         * explain URL/token as self.screen.look. */
+        AirplayHttpSetVisionExplain(
+            [this](const uint8_t* jpeg, size_t jpeg_len, const std::string& question) {
+                return ScreenCamera()->ExplainJpeg(jpeg, jpeg_len, question);
             });
     }
 

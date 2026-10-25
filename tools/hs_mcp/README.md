@@ -23,7 +23,8 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 
 环境变量：`HS_MCP_HOST`/`HS_MCP_PORT`（HTTP 监听，默认 127.0.0.1:8390）、
 `HS_MCP_HS`（hs 命令路径，默认 ~/bin/hs）、`HS_MCP_TYPEIN`（默认锚定仓库内 tools/typein）、
-`HS_MCP_SHOT_DIR`（截图临时目录，默认 /tmp/hs-mcp）。
+`HS_MCP_SHOT_DIR`（截图临时目录，默认 /tmp/hs-mcp）、
+`HS_MCP_DEVICE`（小智固件设备 8080 地址，默认 http://192.168.1.137:8080，供 `screen_look` 用）。
 
 前置条件：Hammerspoon.app 正在运行（报 "can't access Hammerspoon message port"
 时先 `open -a Hammerspoon`）。`typein` 需要运行本服务的宿主 App 持有「辅助功能」授权
@@ -40,12 +41,21 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 | `press_key` | 组合键如 `cmd+s`；可选 `app` 参数：先聚焦该应用再按键 |
 | `click_menu` | 点击菜单栏菜单项，如 `编辑/全选` |
 | `open_url` | 用默认程序打开 http(s) 网址 |
-| `screenshot` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口（推荐，更快更聚焦），否则全屏 |
+| `screenshot` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
+| `screen_look` | **看屏幕并回答问题（小智场景用这个）**：截图 → 推给小智固件的 `/vision/explain` → 走云端视觉模型 → 返回文字描述。可选 `app` 参数 |
 | `clipboard_set` / `clipboard_get` | 写/读系统剪贴板 |
 | `say` | TTS 朗读 |
 | `notify` | 系统通知横幅 |
 
 应用名注意：很多应用实际名是英文（TextEdit、Calculator），不确定先 `list_running_apps`。
+
+### 为什么小智看不到 screenshot
+
+小智 LLM 不消费 MCP 工具返回的图片（image content 会丢），它的视觉走设备侧链路：
+图片 → 云端视觉接口 → **文字回答** → 进对话。所以给小智用的是 `screen_look`：
+Mac 截图后推给小智固件设备的 `/vision/explain` 端点（`HS_MCP_DEVICE`，默认
+`http://192.168.1.137:8080`），设备用自己的 explain URL/token（MCP initialize 时
+云端下发的 vision 能力）上传视觉模型，把文字答案原路返回。要求固件包含该端点。
 
 ## 接入小智
 
@@ -55,7 +65,7 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 uv run tools/hs_mcp/server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的token'
 ```
 
-进程内实现 WebSocket 传输的 MCP server（逐帧 JSON-RPC），连上后 12 个工具即注册到
+进程内实现 WebSocket 传输的 MCP server（逐帧 JSON-RPC），连上后 13 个工具即注册到
 小智，对话里直接说「打开文本编辑器写点内容」就能用；断网/断线每 2 秒起自动重连
 （指数退避到 30 秒）。想开机常驻就包一层 launchd/`nohup`，本仓库不内置。
 
@@ -78,3 +88,11 @@ uv run tools/hs_mcp/server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的t
   会撑爆部分 MCP 客户端。
 - 小智接入点消息是**逐帧裸 JSON-RPC**；mcp SDK 里 `SessionMessage` 是
   dataclass，pydantic 解析在内层 `JSONRPCMessage` 上（与 stdio reader 同款写法）。
+
+## 固件侧：`POST /vision/explain`
+
+台架 8080 端点，body 为 JSON `{"question": "…", "image": "<base64 JPEG>"}`，
+返回值是云端视觉服务的答案文本（与 `self.screen.look` 同一链路，复用设备持有的
+explain URL/token，设备自己完成上传鉴权）。实现：`airplay_http.cc` 里注册 URI、
+板级注回调（`AirplayHttpSetVisionExplain` → `AirplayScreenCamera::ExplainJpeg`）。
+注意 httpd 在 handler 里会阻塞数秒上传视觉模型，以及 `max_uri_handlers` 已调到 16。

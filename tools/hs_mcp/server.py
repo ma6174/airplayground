@@ -25,10 +25,13 @@
 port" 时先 `open -a Hammerspoon`）。
 """
 
+import base64
+import json
 import os
 import subprocess
 import sys
 import time
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -47,6 +50,8 @@ HS = os.environ.get("HS_MCP_HS", str(Path.home() / "bin/hs"))
 _TYPEIN_DEFAULT = Path(__file__).resolve().parent.parent / "typein"
 TYPEIN = Path(os.environ.get("HS_MCP_TYPEIN", _TYPEIN_DEFAULT))
 SHOT_DIR = Path(os.environ.get("HS_MCP_SHOT_DIR", "/tmp/hs-mcp"))
+# 小智固件设备的台架地址（/vision/explain 端点，见 tools/hs_mcp/README）
+DEVICE = os.environ.get("HS_MCP_DEVICE", "http://192.168.1.137:8080").rstrip("/")
 
 mcp = FastMCP(
     "hammerspoon",
@@ -237,7 +242,13 @@ def open_url(url: str) -> str:
 
 @mcp.tool()
 def screenshot(app: str = "") -> Image:
-    """截屏返回 JPEG。app 给定时只截该应用的当前窗口（推荐：更快、画面更聚焦，如 app='TextEdit'）；否则截整个屏幕。"""
+    """截屏返回 JPEG 图片。注意：返回的是图片，部分客户端（如小智语音链路）不消费工具返回的图片——要看屏幕内容请用 screen_look，它返回视觉模型的文字描述。app 给定时只截该应用的当前窗口（更快更聚焦）；否则截整个屏幕。"""
+    jpg = _shot_jpeg(app)
+    return Image(path=str(jpg))
+
+
+def _shot_jpeg(app: str = "") -> Path:
+    """截屏（app 可选限定窗口），缩放转 JPEG，返回文件路径。"""
     SHOT_DIR.mkdir(parents=True, exist_ok=True)
     png = SHOT_DIR / "screen.png"
     jpg = SHOT_DIR / "screen.jpg"
@@ -274,7 +285,28 @@ def screenshot(app: str = "") -> Image:
     # 会撑爆部分 MCP 客户端；缩图对视觉模型也足够
     run(["sips", "-Z", "1600", "-s", "format", "jpeg", "-s", "formatOptions", "70",
          str(png), "--out", str(jpg)], timeout=15)
-    return Image(path=str(jpg))
+    return jpg
+
+
+@mcp.tool()
+def screen_look(question: str, app: str = "") -> str:
+    """看一眼电脑屏幕并回答问题：把屏幕截图交给视觉模型，返回文字描述。想知道屏幕上有什么、文档里写了什么、刚才操作的结果如何时用它（小智语音场景请用它而不是 screenshot）。
+    question 传具体问题，如“屏幕上显示了什么文字”。
+    app 给定时只看该应用的窗口（如 app="TextEdit"）；否则看整个屏幕。需要小智固件设备的 /vision/explain 端点。"""
+    jpg = _shot_jpeg(app)
+    body = json.dumps({
+        "question": question,
+        "image": base64.b64encode(jpg.read_bytes()).decode(),
+    }).encode()
+    req = urllib.request.Request(
+        f"{DEVICE}/vision/explain", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:  # 设备上传视觉模型需数秒
+            return resp.read().decode("utf-8", "replace")
+    except Exception as e:
+        raise RuntimeError(
+            f"视觉请求失败（设备 {DEVICE}）：{e}。确认设备在线且固件含 /vision/explain 端点")
 
 
 @mcp.tool()
