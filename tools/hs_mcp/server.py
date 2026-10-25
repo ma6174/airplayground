@@ -80,6 +80,8 @@ mcp = FastMCP(
         "看屏幕内容（截屏/看看屏幕/屏幕上有什么）必须用 screen_look：它返回文字；"
         "screenshot_image 只返回图片，语音对话里看不到；"
         "用户说“把某个应用/屏幕投到电视”时用 cast_to_tv（停止用 stop_cast）。"
+        "投屏只能用 cast_to_tv / stop_cast：设备自带的 self.airplay.start 只把设备自己的界面"
+        "投上去，拿不到电脑画面，不要用它。"
     ),
     # 无状态 HTTP：服务重启后旧会话不失效，经公网隧道接入也不需要粘性会话
     stateless_http=True,
@@ -1005,6 +1007,7 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
     """把 Mac 上的某个应用窗口（或整个屏幕）投到电视上，电视改显示它而不是设备的界面。
 
     用户说“把某某投到电视”“让电视显示这个窗口”时用这个工具。
+    （不要用 `self.airplay.start`：它只能把设备自己的界面投上去，电视上不会有电脑画面。）
     app 传应用名（如 "TextEdit"、"Google Chrome"），只投该应用的窗口（同名多窗口取最大的）；
     app 留空则投整个屏幕。
     tv 传电视名称（如 "我的Play 5"，取自设备发现列表），空则复用当前/上次的电视；
@@ -1199,6 +1202,7 @@ async def run_xiaozhi(url: str) -> None:
         try:
             print(f"[xiaozhi] 连接 {mask_url(url)} …", file=sys.stderr, flush=True)
             async with websockets.connect(url, open_timeout=10) as ws:
+                _log("xiaozhi: connected")
                 print("[xiaozhi] 已连接，等待云端初始化", file=sys.stderr, flush=True)
                 rx_send, rx = anyio.create_memory_object_stream(64)
                 tx, tx_recv = anyio.create_memory_object_stream(64)
