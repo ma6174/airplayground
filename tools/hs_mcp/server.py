@@ -29,9 +29,12 @@ import base64
 import functools
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -53,6 +56,11 @@ TYPEIN = Path(os.environ.get("HS_MCP_TYPEIN", _TYPEIN_DEFAULT))
 SHOT_DIR = Path(os.environ.get("HS_MCP_SHOT_DIR", "/tmp/hs-mcp"))
 # 小智固件设备的台架地址（/vision/explain 端点，见 tools/hs_mcp/README）
 DEVICE = os.environ.get("HS_MCP_DEVICE", "http://192.168.1.137:8080").rstrip("/")
+# 仓库自带的屏幕/窗口推流工具（macos/capture-cli/build.sh 构建，需要屏幕录制授权）
+_CAPTURE_DEFAULT = Path(__file__).resolve().parents[2] / "macos/capture-cli/capture-cli"
+CAPTURE_CLI = Path(os.environ.get("HS_MCP_CAPTURE_CLI", _CAPTURE_DEFAULT))
+CAST_PID = SHOT_DIR / "cast.pid"
+CAST_LOG = SHOT_DIR / "cast.log"
 
 mcp = FastMCP(
     "hammerspoon",
@@ -60,7 +68,8 @@ mcp = FastMCP(
         "操作用户 macOS 电脑的工具集。输入文字前先 open_app 打开/聚焦目标应用；"
         "应用名不确定时用 list_running_apps 查（很多应用实际是英文名，如 TextEdit）；"
         "看屏幕内容（截屏/看看屏幕/屏幕上有什么）必须用 screen_look：它返回文字；"
-        "screenshot_image 只返回图片，语音对话里看不到。"
+        "screenshot_image 只返回图片，语音对话里看不到；"
+        "用户说“把某个应用/屏幕投到电视”时用 cast_to_tv（停止用 stop_cast）。"
     ),
     # 无状态 HTTP：服务重启后旧会话不失效，经公网隧道接入也不需要粘性会话
     stateless_http=True,
@@ -358,6 +367,217 @@ def screen_look(question: str, app: str = "") -> str:
         if data.get("error"):
             raise RuntimeError(f"视觉服务拒绝：{data['error']}")
     return raw
+
+
+# ---- 把 Mac 的窗口/屏幕投到电视（capture-cli → 设备 8090 → AirPlay） ----
+
+
+def _capture_bin() -> str:
+    if not CAPTURE_CLI.is_file():
+        raise RuntimeError(
+            f"找不到 capture-cli（{CAPTURE_CLI}）：先在仓库里跑 macos/capture-cli/build.sh "
+            "并在系统设置里给它屏幕录制权限，或用 HS_MCP_CAPTURE_CLI 指定二进制")
+    return str(CAPTURE_CLI)
+
+
+def _device_get(path: str, timeout: float = 8.0) -> dict:
+    try:
+        with urllib.request.urlopen(f"{DEVICE}{path}", timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except Exception as e:
+        raise RuntimeError(f"小智设备 {DEVICE} 不可达：{e}")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"raw": raw}
+
+
+def _discover() -> list[dict]:
+    """设备看到的接收器列表（阻塞 browse，约几秒）。"""
+    out = _device_get("/airplay/discover", timeout=20)
+    if isinstance(out, list):
+        return out
+    return out.get("receivers") or []
+
+
+def _capture_list() -> tuple[list[dict], list[dict]]:
+    """capture-cli list 的显示器与窗口（窗口按面积降序，主窗口在前）。"""
+    out = run([_capture_bin(), "list"], timeout=20)
+    displays, windows = [], []
+    for line in out.splitlines():
+        m = re.match(r'\s*\[(\d+)\] id=\d+ pixels=(\d+)x(\d+)', line)
+        if m:
+            displays.append({"index": int(m[1]), "w": int(m[2]), "h": int(m[3])})
+            continue
+        m = re.match(r'\s*id=(\d+) app="(.*)" title="(.*)" size=(\d+)x(\d+)', line)
+        if m:
+            windows.append({"id": int(m[1]), "app": m[2], "title": m[3],
+                            "w": int(m[4]), "h": int(m[5])})
+    windows.sort(key=lambda w: w["w"] * w["h"], reverse=True)
+    return displays, windows
+
+
+def _even(w: int, h: int) -> tuple[int, int]:
+    return max(2, w - w % 2), max(2, h - h % 2)
+
+
+def _cast_pid() -> int | None:
+    """返回还活着的投屏进程 pid，顺手清掉残留的 pid 文件。"""
+    try:
+        pid = int(CAST_PID.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        CAST_PID.unlink(missing_ok=True)
+        return None
+
+
+def _ensure_mirroring(tv: str = "") -> str:
+    """让设备投屏到电视（tv 空 = 复用当前/上次的接收器）。返回 "" 或提示文本。"""
+    st = _device_get("/airplay/status")
+    if st.get("pin_required"):
+        return "pin required"
+    if st.get("running"):
+        if not tv:
+            return ""
+        # 用户点名了电视：已投到别处就先停（同台重说也只是重连一次）
+        _device_get("/airplay/stop")
+        for _ in range(20):
+            if not _device_get("/airplay/status").get("running"):
+                break
+            time.sleep(0.3)
+        st = _device_get("/airplay/status")
+
+    target = tv or (st.get("host") or "")
+    legacy = "1" if st.get("legacy") else "0"
+    if not target:
+        # 设备重启后不再记住接收器：发现一次，只有一台就直接用，多台让用户选
+        recv = _discover()
+        if not recv:
+            return "no AirPlay receiver on the LAN: turn the TV on and check it is on the same network"
+        if len(recv) > 1:
+            names = ", ".join(r.get("name", "?") for r in recv[:8])
+            return (f"several AirPlay receivers are on the LAN ({names}): ask the user which TV "
+                    f"to use, then call cast_to_tv again with tv=<that name>")
+        target = recv[0].get("name") or recv[0].get("host", "")
+        legacy = "1" if recv[0].get("legacy") else "0"
+    _device_get(f"/airplay/start?host={urllib.parse.quote(target)}&legacy={legacy}")
+    for _ in range(24):
+        st = _device_get("/airplay/status")
+        if st.get("pin_required"):
+            return "pin required"
+        if st.get("running"):
+            return ""
+        time.sleep(0.5)
+    return "the TV did not come up in time"
+
+
+@tool()
+def cast_to_tv(app: str = "", tv: str = "", audio: bool = False, fps: int = 20) -> str:
+    """把 Mac 上的某个应用窗口（或整个屏幕）投到电视上，电视改显示它而不是设备的界面。
+
+    用户说“把某某投到电视”“让电视显示这个窗口”时用这个工具。
+    app 传应用名（如 "TextEdit"、"Google Chrome"），只投该应用的窗口（同名多窗口取最大的）；
+    app 留空则投整个屏幕。
+    tv 传电视名称（如 "我的Play 5"，取自设备发现列表），空则复用当前/上次的电视；
+    局域网里有多台接收器时会报出名字让用户选。
+    audio=True 时连 Mac 的系统声音一起送过去（整个系统的输出声音，不是某个应用）。
+    停止投回设备界面用 stop_cast。投屏期间助手的声音留在设备扬声器（不占电视的音频通道）。
+    """
+    cli = _capture_bin()
+    note = _ensure_mirroring(tv)
+    if note == "pin required":
+        return ("the TV is waiting for its 4-digit code: ask the user for it, run "
+                "self.airplay.enter_pin with those digits, then call cast_to_tv again")
+    if note:
+        return note
+
+    stop_cast()  # 同一时间只推一路：换窗口/屏幕先停旧的
+    # 等设备看到推流断开：它会把会话切回自己的界面。不等的话新连接可能被当作同一个
+    # 客户端，会话沿用旧的编码参数（尺寸变了就是花屏）
+    for _ in range(15):
+        if not _device_get("/airplay/status").get("capture_client"):
+            break
+        time.sleep(0.2)
+    args = [cli, "record"]
+    if app:
+        _, windows = _capture_list()
+        hit = [w for w in windows if app.lower() in w["app"].lower()]
+        if not hit:
+            names = sorted({w["app"] for w in windows if w["app"]})
+            raise RuntimeError(
+                f"没找到 {app} 的窗口。当前有窗口的应用：{', '.join(names[:15])}")
+        target = hit[0]
+        args += ["--window-id", str(target["id"])]
+        label = (f'{target["app"]} "{target["title"]}"' if target["title"]
+                 else target["app"])
+        src_w, src_h = target["w"], target["h"]
+    else:
+        displays, _ = _capture_list()
+        if not displays:
+            raise RuntimeError("capture-cli 没列出显示器（屏幕录制权限？）")
+        args += ["--display", str(displays[0]["index"])]
+        label = "the whole screen"
+        src_w, src_h = displays[0]["w"], displays[0]["h"]
+
+    # 等比缩到宽 ≤960：文字密集窗口的关键帧能到几百 KB，原尺寸会让电视每秒顿一下
+    w, h = _even(src_w, src_h) if src_w <= 960 else _even(960, round(src_h * 960 / src_w))
+    if (w, h) != (src_w, src_h):
+        args += ["--width", str(w), "--height", str(h)]
+    args += ["--fps", str(fps)]
+    if audio:
+        args.append("--audio")
+    dev_host = urllib.parse.urlsplit(DEVICE).hostname or ""
+    args += ["--tcp", f"{dev_host}:8090"]
+
+    SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    with CAST_LOG.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=log,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    CAST_PID.write_text(str(proc.pid))
+    _log("cast start: " + " ".join(args))
+
+    # 设备检测到推流客户端后会自己重开会话切源，所以这里等会话真的跑在 capture 上：
+    # source 是会话开始时就定下的，单看它会被上一场会话骗到
+    st = {}
+    for _ in range(60):
+        if proc.poll() is not None:
+            CAST_PID.unlink(missing_ok=True)
+            tail = CAST_LOG.read_text(encoding="utf-8", errors="replace")[-400:].strip()
+            raise RuntimeError(f"capture-cli 退出了（{proc.returncode}）：{tail}")
+        st = _device_get("/airplay/status")
+        if st.get("running") and st.get("capture_client") and st.get("source") == "capture":
+            size = f"{w}x{h}@{fps}fps" + (" + audio" if audio else "")
+            return f"casting {label} to the TV ({size})"
+        time.sleep(0.5)
+    return (f"started sending {label} to {dev_host}:8090, but the device still reports "
+            f"source={st.get('source')!r} capture_client={st.get('capture_client')!r}; "
+            f"check {CAST_LOG} and the device log")
+
+
+@tool()
+def stop_cast() -> str:
+    """停止把 Mac 窗口/屏幕投到电视，电视回到设备自己的界面。"""
+    pid = _cast_pid()
+    if pid is None:
+        return "not casting"
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except OSError:
+            break
+        for _ in range(20):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                CAST_PID.unlink(missing_ok=True)
+                return "stopped: the TV is switching back to the device screen"
+            time.sleep(0.25)
+    CAST_PID.unlink(missing_ok=True)
+    return "stopped: the TV is switching back to the device screen"
 
 
 @tool()

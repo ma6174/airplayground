@@ -1,8 +1,8 @@
 # hs-mcp — Hammerspoon MCP 服务器
 
 把 hammerspoon 技能封装成 MCP 服务器，让小智等 MCP 客户端通过工具调用操控这台 Mac：
-打开应用、输入文字（支持中文/多行）、按快捷键、点菜单、按应用截屏看结果、读写剪贴板、
-语音播报等。支持限定在某个应用内操作（先聚焦再动作，避免误伤）。
+打开应用、输入文字（支持中文/多行）、按快捷键、点菜单、看屏幕内容（视觉模型转成文字）、
+把某个窗口/整屏投到电视、读写剪贴板、语音播报等。支持限定在某个应用内操作（先聚焦再动作，避免误伤）。
 
 实现方式：每个工具内部调用 Hammerspoon 的 `hs` 命令（Hammerspoon.app 持有辅助功能/
 录屏授权，规避了各宿主进程单独授权的问题）；文字输入复用仓库里的 `tools/typein`
@@ -24,7 +24,8 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 环境变量：`HS_MCP_HOST`/`HS_MCP_PORT`（HTTP 监听，默认 127.0.0.1:8390）、
 `HS_MCP_HS`（hs 命令路径，默认 ~/bin/hs）、`HS_MCP_TYPEIN`（默认锚定仓库内 tools/typein）、
 `HS_MCP_SHOT_DIR`（截图临时目录，默认 /tmp/hs-mcp）、
-`HS_MCP_DEVICE`（小智固件设备 8080 地址，默认 http://192.168.1.137:8080，供 `screen_look` 用）。
+`HS_MCP_DEVICE`（小智固件设备 8080 地址，默认 http://192.168.1.137:8080，供 `screen_look`/`cast_to_tv` 用）、
+`HS_MCP_CAPTURE_CLI`（推流工具路径，默认仓库内 `macos/capture-cli/capture-cli`）。
 
 前置条件：Hammerspoon.app 正在运行（报 "can't access Hammerspoon message port"
 时先 `open -a Hammerspoon`）。`typein` 需要运行本服务的宿主 App 持有「辅助功能」授权
@@ -43,6 +44,8 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 | `open_url` | 用默认程序打开 http(s) 网址 |
 | `screenshot_image` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
 | `screen_look` | **看屏幕并回答问题（小智场景用这个）**：截图 → 推给小智固件的 `/vision/explain` → 走云端视觉模型 → 返回文字描述。可选 `app` 参数 |
+| `cast_to_tv` | **把某个应用窗口或整个屏幕投到电视**（capture-cli → 设备 8090 → AirPlay）。`app` 空=整屏，`tv` 指定电视名，`audio=true` 连 Mac 系统声音 |
+| `stop_cast` | 停止投屏，电视回到设备自己的界面 |
 | `clipboard_set` / `clipboard_get` | 写/读系统剪贴板 |
 | `say` | TTS 朗读 |
 | `notify` | 系统通知横幅 |
@@ -57,6 +60,28 @@ Mac 截图后推给小智固件设备的 `/vision/explain` 端点（`HS_MCP_DEVI
 `http://192.168.1.137:8080`），设备用自己的 explain URL/token（MCP initialize 时
 云端下发的 vision 能力）上传视觉模型，把文字答案原路返回。要求固件包含该端点。
 
+## 把 Mac 窗口/屏幕投到电视（`cast_to_tv`）
+
+链路：仓库里的 `macos/capture-cli`（ScreenCaptureKit 采集 + VideoToolbox 编码）→ TCP 8090 →
+设备的 `media_net` → 现有 AirPlay 加密通道 → 电视。设备只做加密转发、不重新编码，所以电视上是
+真实桌面（视频、动画都跟得上）。
+
+一次调用做的事：
+
+1. 解析目标：`capture-cli list` 里按应用名匹配窗口（同名多窗口取面积最大的）；`app` 留空则整屏
+2. 确保设备在投屏：已经投着就复用；没投就 `/airplay/start`。设备重启后不记住接收器，会先
+   `/airplay/discover`；局域网里有多台接收器时返回名字列表，让小智问用户后带 `tv=` 重新调用
+3. 起 `capture-cli record --window-id … --fps 20 --tcp <设备>:8090`；宽度超过 960 等比缩到 960
+   （文字密集窗口的关键帧能到几百 KB，原尺寸会让电视每秒顿一下）
+4. 等设备 `status.source` 变成 `capture` 才返回；推流进程的日志在 `/tmp/hs-mcp/cast.log`
+
+设备在推流客户端连上/断开时会自己重开会话切换视频源，所以 `stop_cast` 之后电视会自动回到
+设备的界面。投屏期间助手的声音留在设备扬声器（电视的音频通道让给画面）。
+`audio=true` 则把 Mac 的系统输出声音一起送到电视（整个系统，不是某个应用）。
+
+前置条件：跑过一次 `macos/capture-cli/build.sh`（产物不进 git），并给运行本服务的宿主 App
+屏幕录制授权；二进制路径可用 `HS_MCP_CAPTURE_CLI` 覆盖。
+
 ## 接入小智
 
 在 Mac 上跑一条命令即可（token 在小智后台的 MCP 接入页）：
@@ -65,7 +90,7 @@ Mac 截图后推给小智固件设备的 `/vision/explain` 端点（`HS_MCP_DEVI
 uv run tools/hs_mcp/server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的token'
 ```
 
-进程内实现 WebSocket 传输的 MCP server（逐帧 JSON-RPC），连上后 13 个工具即注册到
+进程内实现 WebSocket 传输的 MCP server（逐帧 JSON-RPC），连上后 15 个工具即注册到
 小智，对话里直接说「打开文本编辑器写点内容」就能用；断网/断线每 2 秒起自动重连
 （指数退避到 30 秒）。想开机常驻就包一层 launchd/`nohup`，本仓库不内置。
 
