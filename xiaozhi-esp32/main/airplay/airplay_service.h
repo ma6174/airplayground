@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -61,6 +62,15 @@ public:
      * a private encoder so a running session keeps its reference state. */
     bool EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len);
 
+    /* Takes a playback chunk to the TV while a legacy session with audio is up
+     * (the audio service calls this for every chunk it plays). False means the
+     * local speaker must play it. */
+    bool AudioOutput(std::vector<int16_t>& pcm);
+    bool audio_enabled() const { return audio_enabled_.load(); }
+    /* Persists the choice and restarts a live session: the audio stream is
+     * negotiated in SETUP 2, it cannot flip mid-session. */
+    void SetAudioEnabled(bool enabled);
+
     /* Waits for Wi-Fi, then brings up the bench HTTP server, receiver discovery,
      * the capture-stream listener and Wi-Fi power-save settings. A session starts
      * only when it is asked for: which receiver to mirror to belongs to the
@@ -79,12 +89,14 @@ private:
     static void CaptureWatchTask(void* arg);
     std::string ResolveHost() const;
     bool ResolveLegacy() const;
+    bool ResolveAudioEnabled() const;
     void Remember(const std::string& host, bool legacy) const;
 
     VirtualDisplay* display_ = nullptr;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
+    std::atomic<bool> audio_enabled_{true};
     /* True while the session streams a capture client instead of this device's
      * own screen. */
     std::atomic<bool> capture_source_{false};

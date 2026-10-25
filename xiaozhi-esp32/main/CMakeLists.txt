@@ -42,6 +42,7 @@ set(SOURCES "audio/audio_codec.cc"
             "device_state_machine.cc"
             "assets.cc"
             "airplay/airplay_service.cc"
+            "airplay/airplay_audio.cc"
             "airplay/airplay_http.cc"
             "main.cc"
             )

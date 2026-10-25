@@ -122,6 +122,20 @@ private:
             });
 
         mcp_server.AddTool(
+            "self.airplay.audio",
+            "Choose where the assistant's voice, music and sounds play while mirroring: the TV "
+            "speakers through AirPlay, or this device's own speaker.\n"
+            "Args:\n  `enabled`: true for the TV (default), false for the device speaker\n"
+            "Return:\n  the state now in effect.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean, true)}),
+            [&airplay](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                airplay.SetAudioEnabled(enabled);
+                return std::string(enabled ? "sound goes to the TV while mirroring"
+                                           : "sound stays on this device");
+            });
+
+        mcp_server.AddTool(
             "self.airplay.status",
             "Report whether the screen is currently mirrored, to which receiver, and how the last "
             "session ended.",

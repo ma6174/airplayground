@@ -348,7 +348,12 @@ void AudioService::AudioOutputTask() {
             callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
         }
 
-        codec_->OutputData(task.pcm);
+        if (callbacks_.on_audio_output && callbacks_.on_audio_output(task.pcm)) {
+            /* The chunk went to the alternate output (AirPlay); keep the local
+             * speaker silent so the two never play the same thing apart. */
+        } else {
+            codec_->OutputData(task.pcm);
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
