@@ -12,7 +12,9 @@
 #include <nvs.h>
 
 #include "board.h"
+#include "airplay_audio.h"
 #include "airplay_http.h"
+#include "audio_codec.h"
 #include "cJSON.h"
 #include "display/virtual_display.h"
 #include "settings.h"
@@ -393,6 +395,22 @@ void GetLocalIp(char* out, size_t len) {
     }
 }
 
+/* The protocol stack pulls one frame per packet; the packet builder consumes
+ * the ring slot's bytes before the call returns, so handing out a pointer into
+ * the ring is safe. Bare stream key: the projector derives nothing (the same
+ * choice legacy_key_mode 0 makes for the mirror stream). */
+size_t SinkAudioFrame(void* ctx, ap_audio_frame_t* frame) {
+    const uint8_t* data = nullptr;
+    size_t len = 0;
+    if (!static_cast<AirplayAudioSink*>(ctx)->PullFrame(&data, &len)) {
+        return 0;
+    }
+    frame->data = data;
+    frame->len = len;
+    frame->mixed_key = false;
+    return len;
+}
+
 }  // namespace
 
 AirplayService& AirplayService::GetInstance() {
@@ -426,6 +444,11 @@ std::string AirplayService::ResolveHost() const {
 bool AirplayService::ResolveLegacy() const {
     Settings settings("airplay", false);
     return settings.GetString("legacy", "0") == "1";
+}
+
+bool AirplayService::ResolveAudioEnabled() const {
+    Settings settings("airplay", false);
+    return settings.GetString("audio", "1") == "1";
 }
 
 /* Stores the effective target (with port) and transport, so a reboot can
@@ -485,6 +508,7 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     host_ = target;
     port_ = port;
     legacy_ = legacy;
+    audio_enabled_ = ResolveAudioEnabled();
     Remember(target + ":" + std::to_string(port), legacy);
     stop_requested_ = false;
     pin_timeout_ = false;
@@ -510,6 +534,28 @@ void AirplayService::Stop() {
     ESP_LOGI(TAG, "stop requested");
     stop_requested_ = true;
     airplay_request_stop();
+}
+
+bool AirplayService::AudioOutput(std::vector<int16_t>& pcm) {
+    if (!running_.load() || !audio_enabled_.load() || !legacy_) {
+        return false;
+    }
+    return AirplayAudioSink::Instance().Push(pcm.data(), pcm.size());
+}
+
+void AirplayService::SetAudioEnabled(bool enabled) {
+    {
+        Settings settings("airplay", true);
+        settings.SetString("audio", enabled ? "1" : "0");
+    }
+    audio_enabled_ = enabled;
+    ESP_LOGI(TAG, "audio to the TV: %s", enabled ? "on" : "off");
+    /* The audio stream is negotiated in SETUP 2; restart a live session to
+     * apply instead of leaving it on the old transport until it dies. */
+    if (running_.load()) {
+        Stop();
+        Start("", ResolveLegacy());
+    }
 }
 
 /* Speech recognition hands over whatever was said: "1234", "一 二 三 四", or a
@@ -641,6 +687,12 @@ std::string AirplayService::StatusJson() const {
     cJSON_AddBoolToObject(root, "streamed", airplay_last_session_streamed());
     cJSON_AddBoolToObject(root, "pin_required", pin_pending_.load());
     cJSON_AddNumberToObject(root, "backoff_ms", airplay_backoff_ms());
+    cJSON_AddBoolToObject(root, "audio", audio_enabled_.load());
+    {
+        const AirplayAudioSink& sink = AirplayAudioSink::Instance();
+        cJSON_AddNumberToObject(root, "audio_frames", (double)sink.pushed_frames());
+        cJSON_AddNumberToObject(root, "audio_stalled", (double)sink.stalled_chunks());
+    }
     if (display_ != nullptr) {
         cJSON_AddNumberToObject(root, "width", display_->width());
         cJSON_AddNumberToObject(root, "height", display_->height());
@@ -789,14 +841,30 @@ void AirplayService::SessionTask(void* arg) {
         cfg.legacy_iv_source = 0;
         cfg.legacy_inband_sps = true;
         cfg.legacy_pairing = false;
-        cfg.legacy_audio = false;
     }
 
     ESP_LOGI(TAG, "session start: host %s, local %s, %dx%d", cfg.host, local_ip, s_sink.width,
              s_sink.height);
     esp_err_t err = ESP_FAIL;
     for (int attempt = 0;; attempt++) {
+        /* The sink arms per attempt: a dead session must not leave it accepting
+         * audio with nobody pulling, which would stall every chunk for the
+         * stall timeout before falling back to the local speaker. */
+        AirplayAudioSink& sink = AirplayAudioSink::Instance();
+        if (self->legacy_ && self->audio_enabled_.load()) {
+            sink.StartForSession(Board::GetInstance().GetAudioCodec()->output_sample_rate());
+            cfg.legacy_audio = sink.live();
+            cfg.legacy_audio_spf = AirplayAudioSink::kSpf;
+            cfg.legacy_audio_frame = SinkAudioFrame;
+            cfg.legacy_audio_ctx = &sink;
+        } else {
+            sink.StopForSession();
+            cfg.legacy_audio = false;
+            cfg.legacy_audio_frame = nullptr;
+            cfg.legacy_audio_ctx = nullptr;
+        }
         err = airplay_mirror(&cfg);
+        sink.StopForSession();
         self->last_result_ = err == ESP_OK ? "session ended" : esp_err_to_name(err);
         ESP_LOGI(TAG, "session end: %s (streamed=%d)", self->last_result_.c_str(),
                  (int)airplay_last_session_streamed());

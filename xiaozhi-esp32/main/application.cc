@@ -3,6 +3,7 @@
 #include "assets/lang_config.h"
 #include "audio_codec.h"
 #include "board.h"
+#include "airplay/airplay_service.h"
 #include "cjson_utils.h"
 #include "display.h"
 #include "mcp_server.h"
@@ -90,6 +91,9 @@ void Application::Initialize() {
     };
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
+    };
+    callbacks.on_audio_output = [](std::vector<int16_t>& pcm) {
+        return AirplayService::GetInstance().AudioOutput(pcm);
     };
     audio_service_.SetCallbacks(callbacks);
 

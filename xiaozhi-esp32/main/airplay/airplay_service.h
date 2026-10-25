@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -61,6 +62,15 @@ public:
      * a private encoder so a running session keeps its reference state. */
     bool EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len);
 
+    /* Takes a playback chunk to the TV while a legacy session with audio is up
+     * (the audio service calls this for every chunk it plays). False means the
+     * local speaker must play it. */
+    bool AudioOutput(std::vector<int16_t>& pcm);
+    bool audio_enabled() const { return audio_enabled_.load(); }
+    /* Persists the choice and restarts a live session: the audio stream is
+     * negotiated in SETUP 2, it cannot flip mid-session. */
+    void SetAudioEnabled(bool enabled);
+
     /* Waits for Wi-Fi, then connects to the configured receiver on its own. */
     void AutoStart();
 
@@ -73,12 +83,14 @@ private:
     static void AutoStartTask(void* arg);
     std::string ResolveHost() const;
     bool ResolveLegacy() const;
+    bool ResolveAudioEnabled() const;
     void Remember(const std::string& host, bool legacy) const;
 
     VirtualDisplay* display_ = nullptr;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
+    std::atomic<bool> audio_enabled_{true};
     /* A session that ended because no pairing code arrived is not going to be
      * fixed by retrying: the code has to come from a person. */
     std::atomic<bool> pin_timeout_{false};
