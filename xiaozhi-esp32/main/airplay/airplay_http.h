@@ -13,8 +13,8 @@
 void AirplayHttpStart();
 
 /**
- * Ask the device's cloud vision pipeline (the one behind self.screen.look)
- * about an externally-provided JPEG. Board code injects this at startup so
+ * Ask the device's cloud vision pipeline (the same one behind the camera
+ * tool) about an externally-provided JPEG. Board code injects this at startup so
  * the bench API can expose POST /vision/explain without knowing the board.
  * The callback receives JPEG bytes plus a question and returns the vision
  * service's answer text (or an error message).

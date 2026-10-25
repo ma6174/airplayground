@@ -41,7 +41,7 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 | `press_key` | 组合键如 `cmd+s`；可选 `app` 参数：先聚焦该应用再按键 |
 | `click_menu` | 点击菜单栏菜单项，如 `编辑/全选` |
 | `open_url` | 用默认程序打开 http(s) 网址 |
-| `screenshot` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
+| `screenshot_image` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
 | `screen_look` | **看屏幕并回答问题（小智场景用这个）**：截图 → 推给小智固件的 `/vision/explain` → 走云端视觉模型 → 返回文字描述。可选 `app` 参数 |
 | `clipboard_set` / `clipboard_get` | 写/读系统剪贴板 |
 | `say` | TTS 朗读 |
@@ -92,7 +92,6 @@ uv run tools/hs_mcp/server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的t
 ## 固件侧：`POST /vision/explain`
 
 台架 8080 端点，body 为 JSON `{"question": "…", "image": "<base64 JPEG>"}`，
-返回值是云端视觉服务的答案文本（与 `self.screen.look` 同一链路，复用设备持有的
-explain URL/token，设备自己完成上传鉴权）。实现：`airplay_http.cc` 里注册 URI、
+返回值是云端视觉服务的答案文本（复用设备持有的 explain URL/token，设备自己完成上传鉴权）。实现：`airplay_http.cc` 里注册 URI、
 板级注回调（`AirplayHttpSetVisionExplain` → `AirplayScreenCamera::ExplainJpeg`）。
 注意 httpd 在 handler 里会阻塞数秒上传视觉模型，以及 `max_uri_handlers` 已调到 16。
