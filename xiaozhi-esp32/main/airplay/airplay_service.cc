@@ -537,7 +537,6 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     port_ = port;
     legacy_ = legacy;
     audio_enabled_ = ResolveAudioEnabled();
-    Remember(target + ":" + std::to_string(port), legacy);
     stop_requested_ = false;
     pin_timeout_ = false;
     pin_pending_ = false;
@@ -713,6 +712,11 @@ std::string AirplayService::StatusJson() const {
     cJSON_AddBoolToObject(root, "running", running_.load());
     cJSON_AddBoolToObject(root, "legacy", legacy_);
     cJSON_AddStringToObject(root, "host", host_.c_str());
+    /* The receiver this device last mirrored to, session or not. Without it a
+     * caller trying to reopen a session has to browse the LAN again and then
+     * cannot tell which of many receivers the user meant. */
+    cJSON_AddStringToObject(root, "remembered", ResolveHost().c_str());
+    cJSON_AddBoolToObject(root, "remembered_legacy", ResolveLegacy());
     cJSON_AddStringToObject(root, "result", last_result_.c_str());
     cJSON_AddBoolToObject(root, "streamed", airplay_last_session_streamed());
     cJSON_AddBoolToObject(root, "pin_required", pin_pending_.load());
@@ -955,6 +959,10 @@ void AirplayService::SessionTask(void* arg) {
     }
 
     if (airplay_last_session_streamed()) {
+        /* Only a target that actually put frames on a screen is worth keeping:
+         * Start() used to store it before dialling, so a typo or a wrong port
+         * overwrote the receiver every caller falls back to. */
+        self->Remember(self->host_ + ":" + std::to_string(self->port_), self->legacy_);
         /* Receivers behind a network that swallows their multicast, or that only
          * announce once per power cycle, never answer a browse: frames actually
          * reaching a screen is the only evidence the list will ever get. */

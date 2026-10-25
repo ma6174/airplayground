@@ -85,10 +85,13 @@ private:
 
         mcp_server.AddTool(
             "self.airplay.start",
-            "Mirror this device's own screen (its chat UI) to an AirPlay receiver such as a TV.\n"
-            "This device has no access to any computer's screen: to put a computer window on the TV, "
-            "the computer has to send it itself (its own MCP tool, cast_to_tv) — do not use this one "
-            "for that; the user would see the device UI instead of what they asked for.\n"
+            "Mirror THIS DEVICE's own screen (the assistant's chat UI, what the assistant itself "
+            "draws) to the TV. Use it when the user says \"put your own screen on the TV\" or "
+            "\"把你自己（小智）的画面投上去\", or to show text set with self.display.text.\n"
+            "Three screens can go to the TV, each with its own tool - pick by what the user named:\n"
+            "  this device's own screen -> this tool\n"
+            "  the Mac the user is talking to -> that Mac's cast_to_tv tool\n"
+            "  any other machine (cloud server, Linux box) -> self.screen.cast_server\n"
             "Args:\n"
             "  `host`: receiver address, or a receiver name from `self.airplay.discover` "
             "  (empty = the receiver used last time)\n"
@@ -244,12 +247,13 @@ private:
 
         mcp_server.AddTool(
             "self.screen.cast_server",
-            "Put another computer's screen (a Mac, a Linux box, a cloud server) on the TV: that "
-            "machine runs a screen-cast service and this device pulls the stream, so it works "
-            "even when that machine cannot be reached from here. Use self.airplay.start for this "
-            "device's own screen. Args: host is \"ip\" or \"ip:port\" (port defaults to 8090); "
-            "leave it out to reuse the machine shown last time - ask the user for the address "
-            "instead of guessing.",
+            "Put ANOTHER MACHINE's screen on the TV: a cloud server, a Linux box, a second computer. "
+            "That machine runs a screen-cast service and this device pulls the stream, so it works "
+            "even when that machine cannot be reached from here.\n"
+            "NOT for the Mac the user is talking to (that Mac pushes its own screen with cast_to_tv) "
+            "and NOT for this device's own screen (self.airplay.start).\n"
+            "Args: host is \"ip\" or \"ip:port\" (port defaults to 8090); leave it out to reuse "
+            "the machine shown last time - ask the user for the address instead of guessing.",
             PropertyList({
                 Property("host", kPropertyTypeString, std::string("")),
             }),
