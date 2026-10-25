@@ -1028,6 +1028,14 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
         return note
 
     stop_cast()  # 同一时间只推一路：换窗口/屏幕先停旧的
+    # 设备同一时刻只有一个画面源。webcast 拉流和我们的推流共用同一条 capture
+    # 通道，而且设备会优先去拉 pull 目标：留着的话我们的推流连不进来，电视会
+    # 继续显示服务器的画面（或者另一个 agent 的画面）。
+    for path in ("/airplay/webcast_stop", "/airplay/pull?host="):
+        try:
+            _device_get(path)
+        except RuntimeError:
+            pass
     # 等设备看到推流断开：它会把会话切回自己的界面。不等的话新连接可能被当作同一个
     # 客户端，会话沿用旧的编码参数（尺寸变了就是花屏）
     for _ in range(15):
