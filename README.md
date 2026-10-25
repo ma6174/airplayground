@@ -12,6 +12,14 @@ SAP 白盒密钥交换、RTSP 会话协商、加密镜像数据通道拼起来�
 
 ---
 
+## 实机演示
+
+<p align="center">
+  <video src="docs/assets/1024-airplayground.mp4" controls muted playsinline width="720"></video>
+</p>
+
+---
+
 ## 一、为什么值得做
 
 ### 1. 协议自主：发送端比接收端稀缺得多
@@ -400,7 +408,7 @@ tools/
 ├── esp32lock                板卡互斥锁
 ├── make_font.py             字库生成
 └── mitm_capture.py          ARP 中间人抓包（协议取证用）
-docs/                        协议规格、legacy 规格、运维手册、FairPlay 参考实现
+docs/                        协议规格、legacy 规格、运维手册、FairPlay 参考实现、演示视频
 ```
 
 ---
