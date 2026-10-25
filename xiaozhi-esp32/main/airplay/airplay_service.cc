@@ -28,6 +28,7 @@ extern "C" {
 #include "airplay.h"
 #include "ap_discovery.h"
 #include "media_avcc.h"
+#include "media_net.h"
 }
 
 #define TAG "Airplay"
@@ -58,6 +59,10 @@ constexpr uint8_t kGop = 1;
 constexpr uint32_t kBitrateBps = 1200000;
 constexpr uint8_t kQpMin = 26;
 constexpr uint8_t kQpMax = 42;
+/* 352 samples per packet: 8 ms of ALAC, the size the airplay component was
+ * measured with on the projector (4096-sample packets overflow the Wi-Fi
+ * buffers and end the session). */
+constexpr uint16_t kAudioSpf = 352;
 
 /* One screen-to-H.264 pipeline. It lives for the whole session: the protocol
  * stack asks for the decoder configuration record once and then for one access
@@ -411,6 +416,22 @@ size_t SinkAudioFrame(void* ctx, ap_audio_frame_t* frame) {
     return len;
 }
 
+/* One audio frame the capture client sent, per packet the session sends. An
+ * empty ring yields no frame: a made-up payload decodes as noise. The
+ * projector keys the audio stream off the bare stream key. */
+size_t CaptureAudioFrame(void* ctx, ap_audio_frame_t* frame) {
+    (void)ctx;
+    size_t len = 0;
+    const uint8_t* data = media_net_audio(&len);
+    if (data == nullptr || len == 0) {
+        return 0;
+    }
+    frame->data = data;
+    frame->len = len;
+    frame->mixed_key = false;
+    return len;
+}
+
 }  // namespace
 
 AirplayService& AirplayService::GetInstance() {
@@ -451,8 +472,8 @@ bool AirplayService::ResolveAudioEnabled() const {
     return settings.GetString("audio", "1") == "1";
 }
 
-/* Stores the effective target (with port) and transport, so a reboot can
- * reconnect the same way. Only called with the resolved values. */
+/* Stores the effective target (with port) and transport, so "the receiver used
+ * last time" resolves to the same address the same way. */
 void AirplayService::Remember(const std::string& host, bool legacy) const {
     Settings settings("airplay", true);
     settings.SetString("host", host);
@@ -469,6 +490,9 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     std::string target = host;
     if (target.empty()) {
         target = ResolveHost();
+        /* Asked to reuse the last receiver: it was remembered together with the
+         * way it has to be spoken to (a projector only answers legacy AirTunes). */
+        legacy = legacy || ResolveLegacy();
     }
     name_.clear();
     /* A named receiver resolves through the discovery list, which also decides
@@ -537,7 +561,9 @@ void AirplayService::Stop() {
 }
 
 bool AirplayService::AudioOutput(std::vector<int16_t>& pcm) {
-    if (!running_.load() || !audio_enabled_.load() || !legacy_) {
+    /* While a capture client is on screen it owns the TV's audio channel with
+     * its own frames; the assistant's voice stays on the local speaker. */
+    if (!running_.load() || !audio_enabled_.load() || !legacy_ || capture_source_.load()) {
         return false;
     }
     return AirplayAudioSink::Instance().Push(pcm.data(), pcm.size());
@@ -693,6 +719,9 @@ std::string AirplayService::StatusJson() const {
         cJSON_AddNumberToObject(root, "audio_frames", (double)sink.pushed_frames());
         cJSON_AddNumberToObject(root, "audio_stalled", (double)sink.stalled_chunks());
     }
+    /* What is on the TV: the capture client's screen or this device's UI. */
+    cJSON_AddBoolToObject(root, "capture_client", media_net_ready());
+    cJSON_AddStringToObject(root, "source", capture_source_.load() ? "capture" : "display");
     if (display_ != nullptr) {
         cJSON_AddNumberToObject(root, "width", display_->width());
         cJSON_AddNumberToObject(root, "height", display_->height());
@@ -821,13 +850,24 @@ void AirplayService::SessionTask(void* arg) {
     char device_name[48];
     snprintf(device_name, sizeof(device_name), "%s", CONFIG_AIRPLAY_DEVICE_NAME);
 
+    /* A capture client (macOS capture-cli) wins: it streams the real screen,
+     * already encoded, so the TV shows that instead of this device's UI. The
+     * choice is made per session - a client may connect or drop between them. */
+    bool capture = media_net_ready();
+    const airplay_live_source_t* live = capture ? media_net_source() : &s_source;
+    if (live == nullptr) {
+        capture = false;
+        live = &s_source;
+    }
+    self->capture_source_ = capture;
+
     airplay_config_t cfg = {};
     cfg.host = self->host_.c_str();
     cfg.port = self->port_;
     cfg.device_name = device_name;
     cfg.local_address = local_ip;
     cfg.identity = &identity;
-    cfg.live_source = &s_source;
+    cfg.live_source = live;
     cfg.frame_interval_ms = 0;
     cfg.request_pin = [](char pin[5], void* user_data) {
         return static_cast<AirplayService*>(user_data)->WaitForPin(pin);
@@ -843,18 +883,28 @@ void AirplayService::SessionTask(void* arg) {
         cfg.legacy_pairing = false;
     }
 
-    ESP_LOGI(TAG, "session start: host %s, local %s, %dx%d", cfg.host, local_ip, s_sink.width,
-             s_sink.height);
+    ESP_LOGI(TAG, "session start: host %s, local %s, source %s%s", cfg.host, local_ip,
+             capture ? "capture stream" : "virtual display",
+             capture && !self->legacy_ ? " (audio needs the legacy path)" : "");
     esp_err_t err = ESP_FAIL;
     for (int attempt = 0;; attempt++) {
-        /* The sink arms per attempt: a dead session must not leave it accepting
-         * audio with nobody pulling, which would stall every chunk for the
-         * stall timeout before falling back to the local speaker. */
+        /* One audio producer per session, picked by what is on screen: a capture
+         * client streams its own frames (the Mac's sound), the virtual display
+         * feeds the sink with the assistant's voice. The sink arms per attempt:
+         * a dead session must not leave it accepting audio with nobody pulling,
+         * which would stall every chunk for the stall timeout before falling
+         * back to the local speaker. */
         AirplayAudioSink& sink = AirplayAudioSink::Instance();
-        if (self->legacy_ && self->audio_enabled_.load()) {
+        if (self->legacy_ && capture && self->audio_enabled_.load()) {
+            sink.StopForSession();
+            cfg.legacy_audio = true;
+            cfg.legacy_audio_spf = kAudioSpf;
+            cfg.legacy_audio_frame = CaptureAudioFrame;
+            cfg.legacy_audio_ctx = nullptr;
+        } else if (self->legacy_ && self->audio_enabled_.load()) {
             sink.StartForSession(Board::GetInstance().GetAudioCodec()->output_sample_rate());
             cfg.legacy_audio = sink.live();
-            cfg.legacy_audio_spf = AirplayAudioSink::kSpf;
+            cfg.legacy_audio_spf = kAudioSpf;
             cfg.legacy_audio_frame = SinkAudioFrame;
             cfg.legacy_audio_ctx = &sink;
         } else {
@@ -894,13 +944,45 @@ void AirplayService::SessionTask(void* arg) {
     vTaskDelete(nullptr);
 }
 
-void AirplayService::AutoStart() {
-    xTaskCreate(AutoStartTask, "airplay_auto", 4 * 1024, this, 2, nullptr);
+void AirplayService::StartNetworkServices() {
+    xTaskCreate(NetworkTask, "airplay_net", 4 * 1024, this, 2, nullptr);
 }
 
-void AirplayService::AutoStartTask(void* arg) {
-    auto* self = static_cast<AirplayService*>(arg);
+void AirplayService::CaptureWatchTask(void* arg) {
+    (void)arg;
+    bool was_ready = media_net_ready();
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        const bool ready = media_net_ready();
+        if (ready == was_ready) {
+            continue;
+        }
+        was_ready = ready;
+        auto& self = GetInstance();
+        /* The source is fixed when a session starts, so a client that arrives
+         * mid-session would stay invisible; a client that leaves would freeze
+         * the TV on its last frame. Handing over takes a new session. */
+        if (!self.running_.load() || self.capture_source_.load() == ready) {
+            continue;
+        }
+        ESP_LOGI(TAG, "capture client %s: restarting the session on the %s",
+                 ready ? "connected" : "left", ready ? "capture stream" : "virtual display");
+        self.Stop();
+        for (int i = 0; i < 150 && self.running_.load(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        /* The receiver needs a moment to tear the old session down; reconnecting
+         * straight away lands on a black screen. */
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        if (!self.Start("", false)) {
+            ESP_LOGW(TAG, "cannot restart the session on the %s",
+                     ready ? "capture stream" : "virtual display");
+        }
+    }
+}
 
+void AirplayService::NetworkTask(void* arg) {
+    (void)arg;
     char ip[16] = {0};
     for (int i = 0; i < 120; i++) {
         GetLocalIp(ip, sizeof(ip));
@@ -910,7 +992,7 @@ void AirplayService::AutoStartTask(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (strcmp(ip, "0.0.0.0") == 0) {
-        ESP_LOGW(TAG, "no network address, bench API and automatic session stay off");
+        ESP_LOGW(TAG, "no network address, bench API and receiver discovery stay off");
         vTaskDelete(nullptr);
         return;
     }
@@ -926,15 +1008,16 @@ void AirplayService::AutoStartTask(void* arg) {
         ESP_LOGW(TAG, "receiver discovery unavailable; self.airplay.discover stays empty");
     }
 
-    if (self->ResolveHost().empty()) {
-        ESP_LOGI(TAG, "no default receiver configured, waiting for self.airplay.start");
-        vTaskDelete(nullptr);
-        return;
+    /* A screen already encoded on the network beats anything this chip can
+     * render: the capture client (macOS capture-cli) sends the real desktop. */
+    if (media_net_init(CONFIG_AIRPLAY_VIDEO_INPUT_PORT) && media_net_start()) {
+        ESP_LOGI(TAG, "capture stream accepted on port %d (audio on %d)",
+                 CONFIG_AIRPLAY_VIDEO_INPUT_PORT, CONFIG_AIRPLAY_VIDEO_INPUT_PORT + 1);
+        xTaskCreate(CaptureWatchTask, "airplay_capture", 3 * 1024, nullptr, 2, nullptr);
+    } else {
+        ESP_LOGW(TAG, "capture stream listener unavailable; mirroring this device's UI only");
     }
-    ESP_LOGI(TAG, "network is up (%s), connecting to the configured receiver", ip);
-    /* The receiver needs a moment to tear the previous session down after this
-     * device rebooted; connecting too early yields a black session. */
-    vTaskDelay(pdMS_TO_TICKS(15000));
-    self->Start("", self->ResolveLegacy());
+
+    ESP_LOGI(TAG, "network is up (%s); mirroring starts when self.airplay.start is called", ip);
     vTaskDelete(nullptr);
 }

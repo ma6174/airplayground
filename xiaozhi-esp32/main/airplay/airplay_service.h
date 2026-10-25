@@ -71,8 +71,11 @@ public:
      * negotiated in SETUP 2, it cannot flip mid-session. */
     void SetAudioEnabled(bool enabled);
 
-    /* Waits for Wi-Fi, then connects to the configured receiver on its own. */
-    void AutoStart();
+    /* Waits for Wi-Fi, then brings up the bench HTTP server, receiver discovery,
+     * the capture-stream listener and Wi-Fi power-save settings. A session starts
+     * only when it is asked for: which receiver to mirror to belongs to the
+     * user. */
+    void StartNetworkServices();
 
     /* Called by the protocol stack when the receiver demands a PIN. */
     bool WaitForPin(char pin[5]);
@@ -80,7 +83,10 @@ public:
 private:
     AirplayService() = default;
     static void SessionTask(void* arg);
-    static void AutoStartTask(void* arg);
+    static void NetworkTask(void* arg);
+    /* Watches for a capture client appearing or going away, and hands the
+     * running session over to the source that should be on screen. */
+    static void CaptureWatchTask(void* arg);
     std::string ResolveHost() const;
     bool ResolveLegacy() const;
     bool ResolveAudioEnabled() const;
@@ -91,6 +97,9 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
     std::atomic<bool> audio_enabled_{true};
+    /* True while the session streams a capture client instead of this device's
+     * own screen. */
+    std::atomic<bool> capture_source_{false};
     /* A session that ended because no pairing code arrived is not going to be
      * fixed by retrying: the code has to come from a person. */
     std::atomic<bool> pin_timeout_{false};
