@@ -15,7 +15,9 @@ SAP 白盒密钥交换、RTSP 会话协商、加密镜像数据通道拼起来�
 ## 实机演示
 
 <p align="center">
-  <video src="docs/assets/1024-airplayground.mp4" controls muted playsinline width="720"></video>
+  <a href="https://github.com/ma6174/airplayground/blob/develop/docs/assets/1024-airplayground.mp4">
+    <img src="docs/assets/demo-poster.jpg" width="720" alt="实机演示视频（点击播放）">
+  </a>
 </p>
 
 ---
