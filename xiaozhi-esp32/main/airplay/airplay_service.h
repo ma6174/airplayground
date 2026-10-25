@@ -47,6 +47,12 @@ public:
      * `error` (optional) carries the reason on failure. */
     bool ShowImageFromUrl(const std::string& url, std::string* error = nullptr);
 
+    /* Same, but returns as soon as the work is on its own task: a generated
+     * picture takes 15-40 s to download, far longer than a voice turn may block.
+     * `error` reports only the immediate failures (no screen, one picture already
+     * on its way); whether it worked shows up on the TV and in the log. */
+    bool ShowImageFromUrlInBackground(const std::string& url, std::string* error = nullptr);
+
     /* Same, for JPEG bytes that are already in memory (the bench API posts them). */
     bool ShowImageFromJpeg(const uint8_t* data, size_t len, std::string* error = nullptr);
 
@@ -126,6 +132,8 @@ private:
 
     VirtualDisplay* display_ = nullptr;
     std::atomic<bool> running_{false};
+    /* One picture job at a time: two decodes at once fight over the JPEG engine. */
+    std::atomic<bool> image_busy_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
     std::atomic<bool> audio_enabled_{true};

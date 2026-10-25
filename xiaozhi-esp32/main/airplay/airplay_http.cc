@@ -237,10 +237,18 @@ esp_err_t ImageHandler(httpd_req_t* req) {
     char url[512] = {0};
     if (QueryValue(req, "url", url, sizeof(url), 640)) {
         std::string error;
-        if (!service.ShowImageFromUrl(url, &error)) {
+        /* `async=1` is the shape the voice tool has: answer now, let the download
+         * run in the background. The default waits, so a test can check the
+         * picture is up before returning. */
+        char async[8] = {0};
+        const bool background =
+            QueryValue(req, "async", async, sizeof(async)) && (async[0] == '1' || async[0] == 't');
+        const bool ok = background ? service.ShowImageFromUrlInBackground(url, &error)
+                                   : service.ShowImageFromUrl(url, &error);
+        if (!ok) {
             return Reply(req, (std::string("{\"ok\":false,\"error\":\"") + error + "\"}").c_str());
         }
-        return Reply(req, "{\"ok\":true}");
+        return Reply(req, background ? "{\"ok\":true,\"async\":true}" : "{\"ok\":true}");
     }
 
     char length_hdr[16] = {0};

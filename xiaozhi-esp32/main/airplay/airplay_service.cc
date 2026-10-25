@@ -813,6 +813,7 @@ struct AirplayService::ImageJob {
     std::vector<uint8_t> jpeg;   /* kShowJpeg input; kPhoto payload. */
     bool ok = false;
     std::string result;
+    /* Null for a job nobody waits for; the worker then releases it at once. */
     SemaphoreHandle_t done = nullptr;
 };
 
@@ -1261,11 +1262,19 @@ void AirplayService::ImageTask(void* arg) {
         case ImageJob::Kind::kShowUrl: {
             std::string error;
             std::vector<uint8_t> jpeg;
-            /* The type is checked before the body is pulled: a link that points
-             * at a PNG or a GIF fails with that in the answer instead of costing
-             * a megabyte of download first. Servers that send no type are tried
-             * anyway; the decoder has the last word. */
-            if (!DownloadUrl(job->url, kMaxImageBytes, &jpeg, &error, "image/jpeg")) {
+            /* One retry: a picture generator stalls mid-body now and then (it is
+             * still drawing), and a second request gets a finished answer. The
+             * type is checked before the body is pulled: a link that points at a
+             * PNG or a GIF fails with that in the answer instead of costing a
+             * megabyte of download first. */
+            bool downloaded = false;
+            for (int attempt = 0; attempt < 2 && !downloaded; attempt++) {
+                downloaded = DownloadUrl(job->url, kMaxImageBytes, &jpeg, &error, "image/jpeg");
+                if (!downloaded) {
+                    ESP_LOGW(TAG, "picture attempt %d: %s", attempt + 1, error.c_str());
+                }
+            }
+            if (!downloaded) {
                 job->result = std::move(error);
                 break;
             }
@@ -1306,9 +1315,17 @@ void AirplayService::ImageTask(void* arg) {
         }
     }
 
-    if (job->done != nullptr) {
-        xSemaphoreGive(job->done);
+    if (job->done == nullptr) {
+        /* Nobody waits: the assistant answered before the picture was ready. */
+        self->image_busy_ = false;
+        ESP_LOGI(TAG, "picture job finished in the background: %s",
+                 job->ok ? "shown" : job->result.c_str());
+        delete job;
+        vTaskDelete(nullptr);
+        return;
     }
+    xSemaphoreGive(job->done);
+    self->image_busy_ = false;
     /* The caller copies the result right after the semaphore turns; the delay
      * covers that, and frees the job here when nobody waited for it. */
     vTaskDelay(pdMS_TO_TICKS(10000));
@@ -1318,8 +1335,14 @@ void AirplayService::ImageTask(void* arg) {
 }
 
 bool AirplayService::RunImageJob(std::unique_ptr<ImageJob> job, std::string* result) {
+    bool idle = false;
+    if (!image_busy_.compare_exchange_strong(idle, true)) {
+        *result = "another picture is still on its way";
+        return false;
+    }
     job->done = xSemaphoreCreateBinary();
     if (job->done == nullptr) {
+        image_busy_ = false;
         *result = "no memory";
         return false;
     }
@@ -1327,6 +1350,7 @@ bool AirplayService::RunImageJob(std::unique_ptr<ImageJob> job, std::string* res
     if (xTaskCreate(ImageTask, "airplay_img", 16 * 1024, raw, 3, nullptr) != pdPASS) {
         vSemaphoreDelete(raw->done);
         delete raw;
+        image_busy_ = false;
         *result = "cannot create the picture task";
         return false;
     }
@@ -1363,6 +1387,35 @@ bool AirplayService::ShowImageFromUrl(const std::string& url, std::string* error
         }
     }
     return ok;
+}
+
+bool AirplayService::ShowImageFromUrlInBackground(const std::string& url, std::string* error) {
+    if (display_ == nullptr) {
+        if (error != nullptr) {
+            *error = "no screen";
+        }
+        return false;
+    }
+    bool idle = false;
+    if (!image_busy_.compare_exchange_strong(idle, true)) {
+        if (error != nullptr) {
+            *error = "another picture is still on its way";
+        }
+        return false;
+    }
+    auto job = std::make_unique<ImageJob>();
+    job->kind = ImageJob::Kind::kShowUrl;
+    job->url = url;
+    ImageJob* raw = job.release();
+    if (xTaskCreate(ImageTask, "airplay_img", 16 * 1024, raw, 3, nullptr) != pdPASS) {
+        delete raw;
+        image_busy_ = false;
+        if (error != nullptr) {
+            *error = "cannot create the picture task";
+        }
+        return false;
+    }
+    return true;
 }
 
 bool AirplayService::ShowImageFromJpeg(const uint8_t* data, size_t len, std::string* error) {

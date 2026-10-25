@@ -401,6 +401,9 @@ private:
             "else takes the screen; an empty url brings the chat user interface back.\n"
             "Starts mirroring too when nothing is being mirrored yet, and takes the screen away from "
             "a Mac or server stream that is on it.\n"
+            "Answers at once: the download runs in the background and the picture appears on the TV "
+            "when it is ready (10-40 s for a generated one), so tell the user it is coming instead of "
+            "waiting.\n"
             "Args:\n"
             "  `url`: http(s) URL of a JPEG picture: up to 4 MB, up to 2 megapixels, baseline JPEG "
             "(progressive is refused). An empty string restores the chat UI.\n"
@@ -414,7 +417,7 @@ private:
             "picks the format of each answer itself and sometimes sends PNG or GIF, which cannot "
             "be decoded here: call the tool again for another cat.\n"
             "Return:\n"
-            "  Whether the picture is now on screen, or why not.",
+            "  That the picture is on its way (it lands on the TV seconds later), or why not.",
             PropertyList({Property("url", kPropertyTypeString)}),
             [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
                 auto url = properties["url"].value<std::string>();
@@ -429,33 +432,39 @@ private:
                 media_net_pull_stop();
                 media_net_drop_client();
                 webcast.Stop();
+                /* Fetching the picture takes 15-40 s and a voice turn cannot wait
+                 * that long, so it runs on its own task: the user is answered now,
+                 * the picture lands on the TV when it is ready. */
                 std::string error;
-                if (!airplay.ShowImageFromUrl(url, &error)) {
+                if (!airplay.ShowImageFromUrlInBackground(url, &error)) {
                     return std::string("cannot show the picture: ") + error;
                 }
+                const std::string on_its_way =
+                    "the picture is on its way to the TV (a generated one takes 10-40 s, tell the "
+                    "user it is being drawn)";
                 if (airplay.running()) {
                     return std::string(was_capture
-                                           ? "picture is up; the TV switches over from the capture "
-                                             "stream in a few seconds"
-                                           : "picture shown on the TV");
+                                           ? on_its_way + "; the TV is switching over from the capture "
+                                                          "stream first"
+                                           : on_its_way);
                 }
                 if (!airplay.Start("", false)) {
-                    return std::string("picture is up on this device's screen, but mirroring did not "
-                                       "start: ") +
+                    return std::string(on_its_way + ", but mirroring did not start: ") +
                            airplay.StatusJson();
                 }
                 switch (airplay.WaitForStart(8000)) {
                     case AirplayService::StartState::kEstablished:
-                        return std::string("picture shown on the TV");
+                        return on_its_way;
                     case AirplayService::StartState::kPinRequired:
-                        return std::string("picture is up, but the receiver shows a 4-digit code: ask "
-                                           "the user for it and call self.airplay.enter_pin");
+                        return std::string(on_its_way +
+                                           ", but the receiver shows a 4-digit code: ask the user for "
+                                           "it and call self.airplay.enter_pin");
                     case AirplayService::StartState::kFailed:
-                        return std::string("picture is up, but mirroring failed: ") +
+                        return std::string(on_its_way + ", but mirroring failed: ") +
                                airplay.StatusJson();
                     case AirplayService::StartState::kTimeout:
                     default:
-                        return std::string("picture is up, mirroring still connecting: ") +
+                        return std::string(on_its_way + ", mirroring still connecting: ") +
                                airplay.StatusJson();
                 }
             });
