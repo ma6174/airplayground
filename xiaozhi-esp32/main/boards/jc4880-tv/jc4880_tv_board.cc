@@ -1,9 +1,11 @@
 #include "wifi_board.h"
 
 #include "airplay/airplay_service.h"
+#include "airplay_screen_camera.h"
 #include "application.h"
 #include "audio/codecs/es8311_audio_codec.h"
 #include "button.h"
+#include "camera.h"
 #include "config.h"
 #include "display/virtual_display.h"
 #include "mcp_server.h"
@@ -229,6 +231,14 @@ public:
     }
 
     virtual Display* GetDisplay() override { return display_; }
+
+    /* The screen camera lets the assistant look at what is being mirrored to
+     * the TV: the MCP layer registers self.camera.take_photo for it and the
+     * server's vision capability feeds the upload URL. */
+    virtual Camera* GetCamera() override {
+        static AirplayScreenCamera camera(VIRTUAL_DISPLAY_WIDTH, VIRTUAL_DISPLAY_HEIGHT);
+        return &camera;
+    }
 };
 
 DECLARE_BOARD(Jc4880TvBoard);
