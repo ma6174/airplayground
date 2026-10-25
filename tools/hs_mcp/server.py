@@ -1071,15 +1071,16 @@ def cast_mac_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 2
         label = "the whole screen"
         src_w, src_h = displays[0]["w"], displays[0]["h"]
 
-    # 等比缩到宽 ≤960：文字密集窗口的关键帧能到几百 KB，原尺寸会让电视每秒顿一下
-    w, h = _even(src_w, src_h) if src_w <= 960 else _even(960, round(src_h * 960 / src_w))
+    # 等比缩到宽 ≤1280：960 宽投到电视上小字发虚，而这个通道从云上拉 1280x720 的
+    # 流是稳的，设备也只是把帧转发进 AirPlay，多出来的像素不吃它的 CPU。
+    w, h = _even(src_w, src_h) if src_w <= 1280 else _even(1280, round(src_h * 1280 / src_w))
     if (w, h) != (src_w, src_h):
         args += ["--width", str(w), "--height", str(h)]
     args += ["--fps", str(fps)]
     # 大面积变化的画面（视频、动画页）会把平均码率从 1.4 Mbps 挑到 6 Mbps，
     # 设备的 AirPlay 通道和帧队列吞不下去，后果是丢帧、花屏、最后连接被断。
     # 文字窗口给得宽一点，全屏动态画面压紧。
-    args += ["--bitrate", str(1200000 if w * h <= 400_000 else 2000000)]
+    args += ["--bitrate", str(1200000 if w * h <= 400_000 else 3000000)]
     if audio:
         args.append("--audio")
     pull = mode.strip().lower() == "pull"
