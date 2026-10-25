@@ -148,7 +148,7 @@ VirtualDisplay::VirtualDisplay(int width, int height, int fps) : fps_(fps) {
     /* Copies of the smaller built-in faces: the theme font is the large one, and
      * the content layer shrinks to these when the text is long. */
     medium_font_ = font_noto_sans_basic_20_4;
-    small_font_ = font_noto_sans_basic_14_1;
+    small_font_ = height >= 480 ? font_noto_sans_basic_20_4 : font_noto_sans_basic_14_1;
     InitializeLvgl();
     InitializeThemes();
 
@@ -233,8 +233,15 @@ void VirtualDisplay::FlushReady(lv_display_t* display, const lv_area_t* area, ui
 }
 
 void VirtualDisplay::InitializeThemes() {
-    auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
-    auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
+    /* The frame is 960x540 here, twice the 480x270 these 14px faces were picked
+     * for, so the chat UI would read as fine print. Step up to the 20px text and
+     * 30px icon faces: both are already linked (content face and large-icon
+     * face), so the bigger type costs no flash. */
+    const bool large_frame = height_ >= 480;
+    auto text_font = std::make_shared<LvglBuiltInFont>(
+        large_frame ? &font_noto_sans_basic_20_4 : &BUILTIN_TEXT_FONT);
+    auto icon_font = std::make_shared<LvglBuiltInFont>(
+        large_frame ? &font_material_symbols_30_4 : &BUILTIN_ICON_FONT);
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
     auto emoji_font = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
 
