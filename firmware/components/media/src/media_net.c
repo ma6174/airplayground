@@ -718,6 +718,19 @@ void media_net_pull_stop(void)
     ESP_LOGI(TAG, "pull stopped; waiting for a capture client again");
 }
 
+void media_net_drop_client(void)
+{
+    int video = s_net.video_fd;
+    int audio = s_net.audio_fd;
+    if (video >= 0) {
+        shutdown(video, SHUT_RDWR);
+    }
+    if (audio >= 0) {
+        shutdown(audio, SHUT_RDWR);
+    }
+    ESP_LOGI(TAG, "capture connection dropped for another source");
+}
+
 const char *media_net_pull_target(void)
 {
     static char text[80];

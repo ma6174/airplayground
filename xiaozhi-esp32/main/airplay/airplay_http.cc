@@ -15,6 +15,7 @@
 
 #include "airplay_service.h"
 #include "display/virtual_display.h"
+#include "webcast_client.h"
 
 extern "C" {
 #include "media_net.h"
@@ -119,6 +120,9 @@ esp_err_t PullHandler(httpd_req_t* req) {
     if (!media_net_pull(target.c_str(), port)) {
         return Reply(req, "{\"ok\":false,\"error\":\"bad pull target\"}");
     }
+    /* The capture stream is the newer request: stop the webcast pull so it
+     * does not keep a second screen stream running out of sight. */
+    WebcastClient::GetInstance().Stop();
     char body[128];
     snprintf(body, sizeof(body), "{\"ok\":true,\"pull\":\"%s:%u\"}", target.c_str(),
              static_cast<unsigned>(port));
@@ -175,6 +179,42 @@ esp_err_t FrameHandler(httpd_req_t* req) {
 esp_err_t DiscoverHandler(httpd_req_t* req) {
     auto list = AirplayService::GetInstance().DiscoverJson();
     return Reply(req, list.c_str());
+}
+
+/* Sets the webcaster address (host:port) the device pulls pages from; the
+ * alternative to the retired MCP tool, since the address rarely changes. */
+esp_err_t WebcastHostHandler(httpd_req_t* req) {
+    char host[64] = {0};
+    if (!QueryValue(req, "host", host, sizeof(host)) || host[0] == '\0') {
+        return Reply(req, "{\"ok\":false,\"error\":\"missing host\"}");
+    }
+    WebcastClient::GetInstance().SetHost(host);
+    return Reply(req, "{\"ok\":true}");
+}
+
+/* Bench entry points for the page stream: mirror of what the MCP tools do,
+ * so the chain is testable without speech. Opening a page does not start
+ * mirroring by itself - POST /airplay/start separately, exactly like the
+ * voice path's ordering. */
+esp_err_t WebcastOpenHandler(httpd_req_t* req) {
+    char url[256] = {0};
+    if (!QueryValue(req, "url", url, sizeof(url)) || url[0] == '\0') {
+        return Reply(req, "{\"ok\":false,\"error\":\"missing url\"}");
+    }
+    const bool ok = WebcastClient::GetInstance().Open(url);
+    if (ok) {
+        /* One source on screen at a time. A capture client that keeps pushing
+         * would win the per-session source pick, so let it go: whoever was
+         * asked for most recently is what the user wants to see. */
+        media_net_pull_stop();
+        media_net_drop_client();
+    }
+    return Reply(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+esp_err_t WebcastStopHandler(httpd_req_t* req) {
+    WebcastClient::GetInstance().Stop();
+    return Reply(req, "{\"ok\":true}");
 }
 
 /* Body is the text itself; an empty body hands the screen back to the chat UI.
@@ -302,6 +342,8 @@ void AirplayHttpStart() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 8080;
     config.lru_purge_enable = true;
+    /* Eleven endpoints now; the default cap of 8 silently dropped the rest. */
+    config.max_uri_handlers = 16;
     /* The screenshot endpoint runs the software H.264 encoder in the handler. */
     config.stack_size = 32768;
     /* Built-ins plus board-registered endpoints; over the default 8 new URIs
@@ -329,6 +371,9 @@ void AirplayHttpStart() {
         {.uri = "/airplay/screen.raw", .method = HTTP_GET, .handler = ScreenHandler, .user_ctx = nullptr},
         {.uri = "/airplay/frame.h264", .method = HTTP_GET, .handler = FrameHandler, .user_ctx = nullptr},
         {.uri = "/airplay/discover", .method = HTTP_GET, .handler = DiscoverHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/webcast_host", .method = HTTP_GET, .handler = WebcastHostHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/webcast_open", .method = HTTP_GET, .handler = WebcastOpenHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/webcast_stop", .method = HTTP_GET, .handler = WebcastStopHandler, .user_ctx = nullptr},
         {.uri = "/airplay/text", .method = HTTP_POST, .handler = TextHandler, .user_ctx = nullptr},
         {.uri = "/vision/explain", .method = HTTP_POST, .handler = VisionExplainHandler, .user_ctx = nullptr},
     };

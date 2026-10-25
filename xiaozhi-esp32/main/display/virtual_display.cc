@@ -170,6 +170,10 @@ VirtualDisplay::~VirtualDisplay() {
         heap_caps_free(framebuffer_);
         framebuffer_ = nullptr;
     }
+    if (webcast_buffer_ != nullptr) {
+        heap_caps_free(webcast_buffer_);
+        webcast_buffer_ = nullptr;
+    }
 }
 
 void VirtualDisplay::InitializeLvgl() {
@@ -180,6 +184,20 @@ void VirtualDisplay::InitializeLvgl() {
         return;
     }
     memset(framebuffer_, 0, frame_bytes);
+
+    /* The webcaster stream writes here and the image widget shows it; only a
+     * warning when it is missing, the chat UI works without it. */
+    webcast_buffer_ = static_cast<uint16_t*>(heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM));
+    if (webcast_buffer_ == nullptr) {
+        ESP_LOGW(TAG, "no PSRAM for webcast frames; page streaming disabled");
+    } else {
+        memset(webcast_buffer_, 0, frame_bytes);
+        webcast_dsc_.header.w = static_cast<uint32_t>(width_);
+        webcast_dsc_.header.h = static_cast<uint32_t>(height_);
+        webcast_dsc_.header.cf = LV_COLOR_FORMAT_RGB565;
+        webcast_dsc_.data = reinterpret_cast<const uint8_t*>(webcast_buffer_);
+        webcast_dsc_.data_size = frame_bytes;
+    }
 
     ESP_LOGI(TAG, "virtual display %dx%d @ %d fps, frame buffer %u bytes in PSRAM", width_, height_,
              fps_, (unsigned)frame_bytes);
@@ -580,6 +598,10 @@ void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& s
         return;
     }
     DisplayLockGuard lock(this);
+    /* The page view sits above every widget, so hand the screen back first. */
+    if (webcast_visible_) {
+        ShowWebcastLocked(false);
+    }
     text_style_ = style;
     content_active_ = !text.empty();
     if (content_active_) {
@@ -629,6 +651,66 @@ void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& s
         lv_label_set_text(status_label_, hidden_status_.c_str());
         hidden_status_.clear();
     }
+}
+
+void VirtualDisplay::ShowWebcastLocked(bool on) {
+    if (webcast_buffer_ == nullptr || webcast_visible_ == on) {
+        return;
+    }
+    webcast_visible_ = on;
+    if (on) {
+        if (webcast_image_ == nullptr) {
+            webcast_image_ = lv_image_create(lv_screen_active());
+            lv_image_set_src(webcast_image_, &webcast_dsc_);
+        }
+        /* The page view covers the whole screen: no chat UI underneath. */
+        for (auto* label : {status_label_, notification_label_, emoji_label_,
+                            chat_message_label_}) {
+            if (label != nullptr) {
+                lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (content_area_ != nullptr) {
+            lv_obj_add_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_remove_flag(webcast_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_to_index(webcast_image_, -1);  // keep it on top of everything
+    } else {
+        if (webcast_image_ != nullptr) {
+            lv_obj_add_flag(webcast_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        for (auto* label : {status_label_, notification_label_, emoji_label_,
+                            chat_message_label_}) {
+            if (label != nullptr) {
+                lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (content_active_ && content_area_ != nullptr) {
+            lv_obj_remove_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void VirtualDisplay::ShowWebcast(bool on) {
+    if (!lvgl_ready_) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    ShowWebcastLocked(on);
+}
+
+bool VirtualDisplay::PushWebcastFrame(const uint16_t* rgb565) {
+    if (!lvgl_ready_ || webcast_buffer_ == nullptr || rgb565 == nullptr) {
+        return false;
+    }
+    DisplayLockGuard lock(this);
+    memcpy(webcast_buffer_, rgb565,
+           static_cast<size_t>(width_) * height_ * 2);
+    ShowWebcastLocked(true);
+    if (webcast_image_ != nullptr) {
+        lv_obj_invalidate(webcast_image_);
+    }
+    return true;
 }
 
 void VirtualDisplay::SetStatus(const char* status) {

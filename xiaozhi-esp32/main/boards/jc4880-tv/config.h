@@ -24,10 +24,12 @@
 // 别用。第三个物理键 SW1 接充电芯片 KEY，不接 ESP32。
 #define BOOT_BUTTON_GPIO        GPIO_NUM_35
 
-/* Frame the AirPlay sink encodes. 480x270 is 16:9 and keeps text legible on a
- * TV while the software encoder keeps up on both targets. */
-#define VIRTUAL_DISPLAY_WIDTH 480
-#define VIRTUAL_DISPLAY_HEIGHT 270
+/* Frame the AirPlay sink encodes. 960x540 is 16:9 and keeps text legible on a
+ * TV: at 480x270 a desktop shrinks four times before the TV scales it back up,
+ * which turns any text into grey smears. The P4 hardware encoder carries this
+ * size at 15 fps; the software one did not. */
+#define VIRTUAL_DISPLAY_WIDTH 960
+#define VIRTUAL_DISPLAY_HEIGHT 540
 #define VIRTUAL_DISPLAY_FPS 15
 
 #endif  // _BOARD_CONFIG_H_
