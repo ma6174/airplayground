@@ -406,10 +406,14 @@ def _capture_bin() -> str:
     return str(CAPTURE_CLI)
 
 
-def _device_ok(base: str) -> bool:
-    """这个地址是不是小智设备：8080 上得有台架 API 的 /airplay/status。"""
+def _device_ok(base: str, timeout: float = 4.0) -> bool:
+    """这个地址是不是小智设备：8080 上得有台架 API 的 /airplay/status。
+
+    超时给得宽松：设备刚切完投屏源时 HTTP 会慢上几秒，把它当成「不存在」会让
+    语音场景直接报「找不到设备」。
+    """
     try:
-        with urllib.request.urlopen(f"{base}/airplay/status", timeout=2) as resp:
+        with urllib.request.urlopen(f"{base}/airplay/status", timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         return isinstance(data, dict) and "streamed" in data
     except Exception:
@@ -470,14 +474,19 @@ def _device_base(refresh: bool = False) -> str:
     """设备地址：HS_MCP_DEVICE > 上次发现的 > 扫网段。换电脑/换 IP 都靠这条。"""
     if DEVICE_ENV:
         return DEVICE_ENV
-    if not refresh:
-        try:
-            cached = DEVICE_CACHE.read_text().strip()
-        except OSError:
-            cached = ""
-        if cached and _device_ok(cached):
-            return cached
+    cached = ""
+    try:
+        cached = DEVICE_CACHE.read_text().strip()
+    except OSError:
+        pass
+    if not refresh and cached and _device_ok(cached):
+        return cached
     found = _scan_lan()
+    if found is None and cached:
+        # 扫不到不代表地址错了：设备可能正在切源、HTTP 慢过超时
+        time.sleep(1.0)
+        if _device_ok(cached, timeout=8.0):
+            found = cached
     if found is None:
         raise RuntimeError(
             "找不到小智设备：确认它已开机并与这台电脑在同一 Wi-Fi；"
@@ -670,6 +679,9 @@ class _Relay:
         self.configure: dict[int, bytes] = {}
         self.head_buf: dict[int, bytes] = {}
         self.forwarded: dict[int, bool] = {}
+        # 一个端口一把发送锁：补发 configure 和转发帧可能同时发生，两个线程写同一
+        # 个 socket 会把字节交错成非法流。
+        self.send_lock = {port: threading.Lock() for port in (port, port + 1)}
 
     def start(self) -> None:
         for port in (self.port, self.port + 1):
@@ -714,19 +726,22 @@ class _Relay:
                                  daemon=True).start()
                 _log(f"relay: capture client on {port}")
             else:
-                old = self.device.get(port)
-                self.device[port] = conn
-                _close_quietly(old)
-                # 重连的设备错过了 configure（它已经当帧被丢掉过一次）：先补上
+                # 重连的设备错过了 configure（那个包早已当帧被丢掉了）：先补上，
+                # 而且要赶在它进入 device 表之前——否则 pump_capture 会先把帧发过去，
+                # 设备把帧当成 configure 解析，直接断线重连，循环不止。
                 cfg = self.configure.get(port)
                 if cfg and self.forwarded.get(port):
                     try:
-                        conn.sendall(cfg)
+                        with self.send_lock[port]:
+                            conn.sendall(cfg)
                         _log(f"relay: replayed the configure packet on {port}")
                     except OSError:
                         _close_quietly(conn)
-                        self.device.pop(port, None)
                         return
+                with self.lock:
+                    old = self.device.get(port)
+                    self.device[port] = conn
+                _close_quietly(old)
                 threading.Thread(target=self._pump_device, args=(conn, port),
                                  daemon=True).start()
                 _log(f"relay: device {addr[0]} on {port}")
@@ -764,7 +779,8 @@ class _Relay:
             if dev is None:
                 continue
             try:
-                dev.sendall(data)
+                with self.send_lock[port]:
+                    dev.sendall(data)
                 self.forwarded[port] = True
             except OSError:
                 with self.lock:
