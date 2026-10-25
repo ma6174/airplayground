@@ -44,6 +44,7 @@ set(SOURCES "audio/audio_codec.cc"
             "airplay/airplay_service.cc"
             "airplay/airplay_audio.cc"
             "airplay/airplay_http.cc"
+            "airplay/webcast_client.cc"
             "main.cc"
             )
 

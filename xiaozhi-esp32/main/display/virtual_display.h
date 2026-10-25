@@ -57,6 +57,13 @@ public:
     void ShowText(const std::string& text);
     void ShowText(const std::string& text, const DisplayTextStyle& style);
 
+    /* Webcaster frames: RGB565 screenshots of a remote browser page, shown in
+     * place of the chat UI until ShowWebcast(false). Returns false when the
+     * display cannot take external frames (no PSRAM, not initialized). */
+    bool PushWebcastFrame(const uint16_t* rgb565);
+    void ShowWebcast(bool on);
+    bool webcast_visible() const { return webcast_visible_; }
+
     /* RGB565 frame the sink encodes, and a counter bumped per rendered frame so
      * it can skip re-encoding an unchanged screen. */
     const uint16_t* framebuffer() const { return framebuffer_; }
@@ -83,6 +90,9 @@ private:
     /* Applies text_style_ to the content layer: wrapped, centred, and at the
      * largest font the text fits in. */
     void ApplyContentStyle();
+    /* ShowWebcast for callers that already hold the display lock (both the
+     * public ShowWebcast and PushWebcastFrame run inside it). */
+    void ShowWebcastLocked(bool on);
     /* Picks a face that can draw the whole text at one size; a face that lacks a
      * character would borrow it from the fallback at another size, which shows up
      * as two text sizes on one line. */
@@ -97,6 +107,13 @@ private:
     std::atomic<uint32_t> frame_counter_{0};
     int fps_ = 15;
     bool lvgl_ready_ = false;
+
+    /* External page frames: one extra RGB565 buffer the webcaster stream writes
+     * into, shown by an image widget that lives above every UI layer. */
+    lv_obj_t* webcast_image_ = nullptr;
+    uint16_t* webcast_buffer_ = nullptr;
+    lv_image_dsc_t webcast_dsc_{};
+    bool webcast_visible_ = false;
 
     lv_obj_t* emoji_label_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;

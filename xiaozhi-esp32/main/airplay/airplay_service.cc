@@ -18,6 +18,7 @@
 #include "cJSON.h"
 #include "display/virtual_display.h"
 #include "settings.h"
+#include "webcast_client.h"
 
 #include "esp_h264_enc_param.h"
 #include "esp_h264_enc_single.h"
@@ -56,7 +57,7 @@ constexpr size_t kAvccCap = 64;
  * chain: a receiver that mishandles P-frames cannot smear the picture, and the
  * unchanged-screen resend keeps replaying a self-contained frame. */
 constexpr uint8_t kGop = 1;
-constexpr uint32_t kBitrateBps = 1200000;
+constexpr uint32_t kBitrateBps = 3000000;
 constexpr uint8_t kQpMin = 26;
 constexpr uint8_t kQpMax = 42;
 /* 352 samples per packet: 8 ms of ALAC, the size the airplay component was
@@ -73,7 +74,7 @@ struct Sink {
     int width = 0;
     int height = 0;
     int fps = 15;
-    uint8_t* i420 = nullptr;
+    uint8_t* yuv = nullptr;
     uint8_t* annexb = nullptr;
     uint8_t* au = nullptr;
     uint8_t avcc[kAvccCap] = {0};
@@ -94,7 +95,8 @@ inline uint8_t ClampU8(int value) {
     return value < 0 ? 0 : (value > 255 ? 255 : static_cast<uint8_t>(value));
 }
 
-/* RGB565 -> planar YUV420 (BT.601 studio swing, integer only). */
+/* RGB565 -> planar YUV420 (BT.601 studio swing, integer only): the layout the
+ * software encoder takes. */
 void Rgb565ToI420(const uint16_t* src, int width, int height, uint8_t* y_plane, uint8_t* u_plane,
                   uint8_t* v_plane) {
     for (int row = 0; row < height; row++) {
@@ -136,7 +138,7 @@ void Rgb565ToI420(const uint16_t* src, int width, int height, uint8_t* y_plane, 
 }
 
 bool OpenEncoder(esp_h264_enc_handle_t* out, int width, int height, int fps, uint8_t gop) {
-    esp_h264_enc_cfg_sw_t cfg = {};
+    esp_h264_enc_cfg_t cfg = {};
     cfg.pic_type = ESP_H264_RAW_FMT_I420;
     cfg.gop = gop;
     cfg.fps = static_cast<uint8_t>(fps);
@@ -178,15 +180,16 @@ bool EncodeOne(size_t* annexb_len, bool* idr) {
     const int height = s_sink.height;
     const size_t luma = static_cast<size_t>(width) * height;
 
-    /* LVGL draws straight into the frame buffer; hold the render lock so the
-     * conversion reads one consistent frame instead of a mid-redraw tear. */
+    /* LVGL draws straight into the frame buffer; convert under the render lock
+     * so the encoder sees one consistent frame instead of a mid-redraw tear.
+     * The converted buffer is also what the hardware encoder DMAs from. */
     s_sink.display->LockRender();
-    Rgb565ToI420(s_sink.display->framebuffer(), width, height, s_sink.i420, s_sink.i420 + luma,
-                 s_sink.i420 + luma + luma / 4);
+    Rgb565ToI420(s_sink.display->framebuffer(), width, height, s_sink.yuv, s_sink.yuv + luma,
+                 s_sink.yuv + luma + luma / 4);
     s_sink.display->UnlockRender();
 
     esp_h264_enc_in_frame_t in = {};
-    in.raw_data.buffer = s_sink.i420;
+    in.raw_data.buffer = s_sink.yuv;
     in.raw_data.len = static_cast<uint32_t>(luma * 3 / 2);
     in.pts = s_sink.pts_ms;
 
@@ -256,12 +259,13 @@ const uint8_t* SourceCodecRecord(void* user, size_t* len) {
     }
 
     const size_t luma = static_cast<size_t>(s_sink.width) * s_sink.height;
-    if (s_sink.i420 == nullptr) {
-        s_sink.i420 = static_cast<uint8_t*>(heap_caps_malloc(luma * 3 / 2, MALLOC_CAP_SPIRAM));
+    if (s_sink.yuv == nullptr) {
+        s_sink.yuv =
+            static_cast<uint8_t*>(heap_caps_aligned_alloc(64, luma * 3 / 2, MALLOC_CAP_SPIRAM));
         s_sink.annexb = static_cast<uint8_t*>(heap_caps_malloc(kAuCap, MALLOC_CAP_SPIRAM));
         s_sink.au = static_cast<uint8_t*>(heap_caps_malloc(kAuCap, MALLOC_CAP_SPIRAM));
     }
-    if (s_sink.i420 == nullptr || s_sink.annexb == nullptr || s_sink.au == nullptr) {
+    if (s_sink.yuv == nullptr || s_sink.annexb == nullptr || s_sink.au == nullptr) {
         ESP_LOGE(TAG, "no PSRAM for the encoder buffers (%u bytes luma)", (unsigned)luma);
         return nullptr;
     }
@@ -724,7 +728,23 @@ std::string AirplayService::StatusJson() const {
     /* Where the capture stream comes from when this device dials out, so the
      * caller can tell "nobody is streaming" from "the stream is unreachable". */
     cJSON_AddStringToObject(root, "pull", media_net_pull_target());
-    cJSON_AddStringToObject(root, "source", capture_source_.load() ? "capture" : "display");
+    cJSON_AddStringToObject(root, "source", capture_source_.load() ? "capture"
+                             : (display_ != nullptr && display_->webcast_visible())
+                                   ? "webcast"
+                                   : "display");
+    {
+        /* Page streaming from the webcaster, so one status answers "is the web
+         * page still alive" without its own tool. */
+        auto& webcast = WebcastClient::GetInstance();
+        cJSON* web = cJSON_CreateObject();
+        if (web != nullptr) {
+            cJSON_AddBoolToObject(web, "streaming", webcast.streaming());
+            cJSON_AddBoolToObject(web, "stalled", webcast.stalled());
+            cJSON_AddNumberToObject(web, "frames", (double)webcast.frames());
+            cJSON_AddStringToObject(web, "host", webcast.Host().c_str());
+            cJSON_AddItemToObject(root, "webcast", web);
+        }
+    }
     if (display_ != nullptr) {
         cJSON_AddNumberToObject(root, "width", display_->width());
         cJSON_AddNumberToObject(root, "height", display_->height());
@@ -798,16 +818,16 @@ bool AirplayService::EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len) {
     const int height = display_->height();
     const size_t luma = static_cast<size_t>(width) * height;
 
-    auto* i420 = static_cast<uint8_t*>(heap_caps_malloc(luma * 3 / 2, MALLOC_CAP_SPIRAM));
+    auto* yuv = static_cast<uint8_t*>(heap_caps_aligned_alloc(64, luma * 3 / 2, MALLOC_CAP_SPIRAM));
     auto* annexb = static_cast<uint8_t*>(heap_caps_malloc(kAuCap, MALLOC_CAP_SPIRAM));
-    if (i420 == nullptr || annexb == nullptr) {
-        heap_caps_free(i420);
+    if (yuv == nullptr || annexb == nullptr) {
+        heap_caps_free(yuv);
         heap_caps_free(annexb);
         return false;
     }
 
     display_->LockRender();
-    Rgb565ToI420(display_->framebuffer(), width, height, i420, i420 + luma, i420 + luma + luma / 4);
+    Rgb565ToI420(display_->framebuffer(), width, height, yuv, yuv + luma, yuv + luma + luma / 4);
     display_->UnlockRender();
 
     /* gop 1 makes every frame an IDR, so the dump decodes on its own. */
@@ -815,7 +835,7 @@ bool AirplayService::EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len) {
     bool ok = OpenEncoder(&enc, width, height, display_->fps(), 1);
     if (ok) {
         esp_h264_enc_in_frame_t in = {};
-        in.raw_data.buffer = i420;
+        in.raw_data.buffer = yuv;
         in.raw_data.len = static_cast<uint32_t>(luma * 3 / 2);
         esp_h264_enc_out_frame_t out = {};
         out.raw_data.buffer = annexb;
@@ -830,7 +850,7 @@ bool AirplayService::EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len) {
         esp_h264_enc_del(enc);
     }
 
-    heap_caps_free(i420);
+    heap_caps_free(yuv);
     heap_caps_free(annexb);
     return ok;
 }

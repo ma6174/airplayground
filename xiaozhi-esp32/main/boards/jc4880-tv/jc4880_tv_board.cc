@@ -2,6 +2,7 @@
 
 #include "airplay/airplay_http.h"
 #include "airplay/airplay_service.h"
+#include "airplay/webcast_client.h"
 #include "airplay_screen_camera.h"
 #include "application.h"
 #include "audio/codecs/es8311_audio_codec.h"
@@ -51,6 +52,7 @@ private:
         display_ = new VirtualDisplay(VIRTUAL_DISPLAY_WIDTH, VIRTUAL_DISPLAY_HEIGHT,
                                       VIRTUAL_DISPLAY_FPS);
         AirplayService::GetInstance().AttachDisplay(display_);
+        WebcastClient::GetInstance().AttachDisplay(display_);
     }
 
     void InitializeButtons() {
@@ -178,6 +180,122 @@ private:
                     default:
                         return std::string("code sent, still connecting: ") + airplay.StatusJson();
                 }
+            });
+
+        auto& webcast = WebcastClient::GetInstance();
+
+        /* Distinct from self.airplay.start: that mirrors this device's own
+         * screen, while the webcast tools put a browser page from the server on
+         * the TV and let the user look at it and interact by voice. */
+        mcp_server.AddTool(
+            "self.webcast.open",
+            "Show a web page on the TV: a server renders it headlessly and streams the screen "
+            "here, and the device mirrors it on like any other screen content. Starts mirroring "
+            "too when nothing is being mirrored yet.\n"
+            "Args:\n"
+            "  `url`: the page to open, e.g. \"news.ycombinator.com\" or a full https:// URL\n"
+            "Return:\n"
+            "  \"page on TV\" when streaming, or what went wrong. Afterwards use "
+            "self.webcast.snapshot to see what can be clicked.\n"
+            "Prefer asking the user which page when they just say \"open a webpage\"; known "
+            "sites can be mapped directly (\"B站\" -> bilibili.com).",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+            }),
+            [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
+                auto url = properties["url"].value<std::string>();
+                if (url.empty()) {
+                    return std::string("no url given");
+                }
+                if (webcast.Host().empty()) {
+                    return std::string("no webcaster configured; set one with the bench endpoint "
+                                       "/airplay/webcast_host?host=ip:port first");
+                }
+                if (!webcast.Open(url)) {
+                    return std::string("failed: the webcaster at " + webcast.Host() +
+                                       " did not answer");
+                }
+                if (!airplay.running()) {
+                    if (!airplay.Start("", false)) {
+                        return std::string("page is streaming, but starting mirroring failed: " +
+                                           airplay.StatusJson());
+                    }
+                    switch (airplay.WaitForStart(8000)) {
+                        case AirplayService::StartState::kEstablished:
+                            break;
+                        case AirplayService::StartState::kPinRequired:
+                            return std::string("page is streaming, but the receiver shows a 4-digit "
+                                               "code; ask the user and call self.airplay.enter_pin");
+                        case AirplayService::StartState::kFailed:
+                            return std::string("page is streaming, but mirroring failed: " +
+                                               airplay.StatusJson());
+                        case AirplayService::StartState::kTimeout:
+                        default:
+                            return std::string("page is streaming, mirroring still connecting: " +
+                                               airplay.StatusJson());
+                    }
+                }
+                return std::string("page on TV");
+            });
+
+        mcp_server.AddTool(
+            "self.webcast.snapshot",
+            "List the interactive elements of the web page currently on the TV, numbered.\n"
+            "Use the numbers with self.webcast.control: click to open a link, type to fill a "
+            "search box. Call this again after the page navigated - the numbers change.",
+            PropertyList(),
+            [&webcast](const PropertyList&) -> ReturnValue { return webcast.Snapshot(); });
+
+        mcp_server.AddTool(
+            "self.webcast.control",
+            "Interact with the web page currently on the TV.\n"
+            "Args:\n"
+            "  `action`: click, type, scroll or press\n"
+            "  `ref`: element number from self.webcast.snapshot (click and type)\n"
+            "  `text`: what to type into the element (type); the search is not submitted "
+            "automatically - follow with press Enter\n"
+            "  `dy`: pixels to scroll, positive scrolls down (scroll)\n"
+            "  `key`: key name for press, e.g. Enter, Escape, ArrowDown\n"
+            "Return:\n"
+            "  Whether the server performed it.",
+            PropertyList({
+                Property("action", kPropertyTypeString),
+                Property("ref", kPropertyTypeInteger, -1),
+                Property("text", kPropertyTypeString, ""),
+                Property("dy", kPropertyTypeInteger, 600),
+                Property("key", kPropertyTypeString, "Enter"),
+            }),
+            [&webcast](const PropertyList& properties) -> ReturnValue {
+                auto action = properties["action"].value<std::string>();
+                auto ref = properties["ref"].value<int>();
+                auto text = properties["text"].value<std::string>();
+                auto dy = properties["dy"].value<int>();
+                auto key = properties["key"].value<std::string>();
+                bool ok;
+                if (action == "click") {
+                    ok = webcast.Click(ref);
+                } else if (action == "type") {
+                    ok = webcast.Type(ref, text);
+                } else if (action == "scroll") {
+                    ok = webcast.Scroll(dy);
+                } else if (action == "press") {
+                    ok = webcast.Press(key);
+                } else {
+                    return std::string("action must be click, type, scroll or press");
+                }
+                return std::string(ok ? action + " done"
+                                      : action + " failed: webcaster unreachable or stale "
+                                        "element number (snapshot again)");
+            });
+
+        mcp_server.AddTool(
+            "self.webcast.stop",
+            "Close the web page and stop showing it on the TV; the chat screen comes back. "
+            "Mirroring itself keeps running.",
+            PropertyList(),
+            [&webcast](const PropertyList&) -> ReturnValue {
+                webcast.Stop();
+                return std::string("page closed");
             });
 
         mcp_server.AddTool(

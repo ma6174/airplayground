@@ -39,6 +39,12 @@ bool media_net_pull(const char *host, uint16_t port);
  * back to waiting for a client. */
 void media_net_pull_stop(void);
 
+/* Drops whichever capture connection is live - a client pushing to us, or the
+ * server we pulled from - so a different content source can take the session.
+ * Shutting the socket down is what gets the task out of recv(); it then clears
+ * the configure packet by itself. */
+void media_net_drop_client(void);
+
 /* "host:port" while a target is set, "" otherwise. */
 const char *media_net_pull_target(void);
 
