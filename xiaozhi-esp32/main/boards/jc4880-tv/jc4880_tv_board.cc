@@ -397,21 +397,62 @@ private:
         mcp_server.AddTool(
             "self.display.image",
             "Show a picture on the screen people are looking at (the TV this device mirrors to).\n"
-            "The picture fills the screen (black bars keep the aspect ratio) and stays until an empty "
-            "url is passed; the chat user interface comes back then.\n"
+            "The picture fills the screen (black bars keep the aspect ratio) and stays until something "
+            "else takes the screen; an empty url brings the chat user interface back.\n"
+            "Starts mirroring too when nothing is being mirrored yet, and takes the screen away from "
+            "a Mac or server stream that is on it.\n"
             "Args:\n"
-            "  `url`: http(s) URL of a JPEG picture (up to 4 MB, up to 2 megapixels; progressive "
-            "JPEG is not supported). An empty string restores the chat UI.\n"
+            "  `url`: http(s) URL of a JPEG picture: up to 4 MB, up to 2 megapixels, baseline JPEG "
+            "(progressive is refused). An empty string restores the chat UI.\n"
+            "  A random cat picture is https://cataas.com/cat/cute?width=960 - use it as the url when "
+            "the user asks to see a cat (\"显示一只猫\", \"来张猫图\"). That server picks the format of "
+            "each answer itself and sometimes sends PNG or GIF, which cannot be decoded here: call "
+            "the tool again for another cat.\n"
             "Return:\n"
             "  Whether the picture is now on screen, or why not.",
             PropertyList({Property("url", kPropertyTypeString)}),
-            [&airplay](const PropertyList& properties) -> ReturnValue {
+            [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
                 auto url = properties["url"].value<std::string>();
+                if (url.empty()) {
+                    airplay.ShowImageFromUrl("", nullptr);
+                    return std::string("chat user interface restored");
+                }
+                /* A capture or page stream wins the per-session source pick, and
+                 * this picture is the most recent request: let those go so the
+                 * device's own screen is what the TV shows. */
+                const bool was_capture = airplay.showing_capture();
+                media_net_pull_stop();
+                media_net_drop_client();
+                webcast.Stop();
                 std::string error;
                 if (!airplay.ShowImageFromUrl(url, &error)) {
                     return std::string("cannot show the picture: ") + error;
                 }
-                return std::string(url.empty() ? "chat user interface restored" : "picture shown");
+                if (airplay.running()) {
+                    return std::string(was_capture
+                                           ? "picture is up; the TV switches over from the capture "
+                                             "stream in a few seconds"
+                                           : "picture shown on the TV");
+                }
+                if (!airplay.Start("", false)) {
+                    return std::string("picture is up on this device's screen, but mirroring did not "
+                                       "start: ") +
+                           airplay.StatusJson();
+                }
+                switch (airplay.WaitForStart(8000)) {
+                    case AirplayService::StartState::kEstablished:
+                        return std::string("picture shown on the TV");
+                    case AirplayService::StartState::kPinRequired:
+                        return std::string("picture is up, but the receiver shows a 4-digit code: ask "
+                                           "the user for it and call self.airplay.enter_pin");
+                    case AirplayService::StartState::kFailed:
+                        return std::string("picture is up, but mirroring failed: ") +
+                               airplay.StatusJson();
+                    case AirplayService::StartState::kTimeout:
+                    default:
+                        return std::string("picture is up, mirroring still connecting: ") +
+                               airplay.StatusJson();
+                }
             });
 
         mcp_server.AddTool(

@@ -452,7 +452,11 @@ size_t CaptureAudioFrame(void* ctx, ap_audio_frame_t* frame) {
 constexpr size_t kMaxImageBytes = 4u * 1024 * 1024;
 constexpr uint32_t kMaxImagePixels = 2100000; /* 1920x1080 fits. */
 
-bool DownloadUrl(const std::string& url, size_t cap, std::vector<uint8_t>* out, std::string* error) {
+/* `required_type`, when set, is the response content type the caller needs: the
+ * body is only pulled when the server says it is sending that, so an answer in
+ * the wrong format costs one round trip instead of a megabyte of download. */
+bool DownloadUrl(const std::string& url, size_t cap, std::vector<uint8_t>* out, std::string* error,
+                 const char* required_type = nullptr) {
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
     http->SetTimeout(10000);
     if (auto opened = http->Open("GET", url); !opened) {
@@ -469,6 +473,17 @@ bool DownloadUrl(const std::string& url, size_t cap, std::vector<uint8_t>* out, 
         *error = "HTTP " + std::to_string(*status) + " for " + url;
         http->Close();
         return false;
+    }
+    /* Open waits for the response headers, so the type is known before the body
+     * is streamed. A server that sends no type is given the benefit of the doubt:
+     * the decoder turns the body down if it really is not a JPEG. */
+    if (required_type != nullptr) {
+        const std::string type = http->GetResponseHeader("Content-Type");
+        if (!type.empty() && type.rfind(required_type, 0) != 0) {
+            *error = "the server answered with " + type + " instead of a JPEG";
+            http->Close();
+            return false;
+        }
     }
     out->clear();
     char chunk[4096];
@@ -1230,7 +1245,11 @@ void AirplayService::ImageTask(void* arg) {
         case ImageJob::Kind::kShowUrl: {
             std::string error;
             std::vector<uint8_t> jpeg;
-            if (!DownloadUrl(job->url, kMaxImageBytes, &jpeg, &error)) {
+            /* The type is checked before the body is pulled: a link that points
+             * at a PNG or a GIF fails with that in the answer instead of costing
+             * a megabyte of download first. Servers that send no type are tried
+             * anyway; the decoder has the last word. */
+            if (!DownloadUrl(job->url, kMaxImageBytes, &jpeg, &error, "image/jpeg")) {
                 job->result = std::move(error);
                 break;
             }
