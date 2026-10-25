@@ -1181,11 +1181,19 @@ menu "AirPlay display"
     depends on BOARD_TYPE_JC4880_TV
 
     config AIRPLAY_DEFAULT_HOST
-        string "Default AirPlay receiver address"
+        string "Fallback receiver for self.airplay.start without a host"
         default ""
         help
-            开机后自动连接的接收端地址（电视或盒子的 IP）。
-            留空则只在调用 MCP 工具 self.airplay.start 时才开会话。
+            self.airplay.start 不传 host 时先找上次用过的接收端，没有记录才用这里的地址。
+            开机不会自动连接：投屏到哪台设备由用户决定。
+
+    config AIRPLAY_VIDEO_INPUT_PORT
+        int "Port that accepts a capture stream (macOS capture-cli)"
+        default 8090
+        help
+            一个已经编码好的视频流可以从网络推进来（macOS 的 capture-cli），
+            设备只做加密转发，画面就是真实桌面而不是本机 UI。
+            音频固定在这个端口 + 1。
 
     config AIRPLAY_DEVICE_NAME
         string "Device name shown on the receiver"

@@ -61,9 +61,10 @@ public:
      * a private encoder so a running session keeps its reference state. */
     bool EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len);
 
-    /* Waits for Wi-Fi, then brings up the bench HTTP server, receiver discovery
-     * and Wi-Fi power-save settings. A session starts only when it is asked
-     * for: which receiver to mirror to belongs to the user. */
+    /* Waits for Wi-Fi, then brings up the bench HTTP server, receiver discovery,
+     * the capture-stream listener and Wi-Fi power-save settings. A session starts
+     * only when it is asked for: which receiver to mirror to belongs to the
+     * user. */
     void StartNetworkServices();
 
     /* Called by the protocol stack when the receiver demands a PIN. */
@@ -73,6 +74,9 @@ private:
     AirplayService() = default;
     static void SessionTask(void* arg);
     static void NetworkTask(void* arg);
+    /* Watches for a capture client appearing or going away, and hands the
+     * running session over to the source that should be on screen. */
+    static void CaptureWatchTask(void* arg);
     std::string ResolveHost() const;
     bool ResolveLegacy() const;
     void Remember(const std::string& host, bool legacy) const;
@@ -81,6 +85,9 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> starting_{false};
+    /* True while the session streams a capture client instead of this device's
+     * own screen. */
+    std::atomic<bool> capture_source_{false};
     /* A session that ended because no pairing code arrived is not going to be
      * fixed by retrying: the code has to come from a person. */
     std::atomic<bool> pin_timeout_{false};
