@@ -162,6 +162,18 @@ static esp_err_t discover(ap_session_t *session)
     if (session->prefers_legacy_pairing) {
         AP_LOGI("receiver prefers the legacy pairing type (no screen-capture ACL)");
     }
+    /* Time HAP sessions with NTP, on our own boot clock: the receiver measures
+     * us through the NTP responder and presents against that, so no shared
+     * clock domain is needed. The PTP path cannot be used as implemented: it
+     * anchors once on the SETUP reply's clock headers and extrapolates them
+     * forever, but macOS presents against a network gPTP domain that sits a
+     * large constant offset away from the domain those headers report
+     * (-14165 s measured on 2026-10-26). Every frame then lands far in the
+     * future, the decoder queues them all (sbuf grew to 25 s) and nothing
+     * past the first frame is ever presented - the classic "picture frozen
+     * on the first frame" report. Real gPTP sync is not implemented; NTP
+     * gives the receiver everything it needs to follow us instead. */
+    session->force_ntp = true;
     session->use_ptp = !session->force_ntp && info.has_features && (info.features & (1ULL << 41)) != 0;
     session->timing_protocol = session->use_ptp ? "PTP" : "NTP";
     AP_LOGI("timing protocol: %s", session->timing_protocol);
@@ -407,8 +419,11 @@ static esp_err_t pair_and_verify(ap_session_t *session)
 
     /* A receiver that has paired with us before accepts pair-verify straight
      * away, and a rejected pair-verify does not start a pairing backoff, so this
-     * is always the first thing to try - even for receivers that want a code. */
-    if (session->config->identity != NULL) {
+     * is always the first thing to try - even for receivers that want a code.
+     * The exception is a receiver that is advertising a PIN requirement: one
+     * that reset its pairing list still verifies our key but then rejects every
+     * later request, so only a fresh pair-setup clears it. */
+    if (session->config->identity != NULL && !want_pin) {
         if (pair_verify(session) == ESP_OK) {
             AP_LOGI("known identity verified without pair-setup");
             return ESP_OK;

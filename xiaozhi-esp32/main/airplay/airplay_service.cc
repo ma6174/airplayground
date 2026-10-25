@@ -288,6 +288,11 @@ const uint8_t* SourceCodecRecord(void* user, size_t* len) {
         return nullptr;
     }
 
+    /* Stamp before encoding: the encode takes a few hundred ms, and a render
+     * that lands mid-encode must still count as unseen afterwards, or its
+     * pixels never make it into any access unit. */
+    s_sink.seen_counter = s_sink.display->frame_counter();
+
     bool idr = false;
     size_t annexb_len = 0;
     if (!EncodeOne(&annexb_len, &idr) || !idr) {
@@ -309,7 +314,6 @@ const uint8_t* SourceCodecRecord(void* user, size_t* len) {
     ESP_LOGI(TAG, "video source ready: %dx%d @ %d fps, avcC %u bytes", s_sink.width, s_sink.height,
              s_sink.fps, (unsigned)s_sink.avcc_len);
     s_sink.have_pending = true;
-    s_sink.seen_counter = s_sink.display->frame_counter();
     *len = s_sink.avcc_len;
     return s_sink.avcc;
 }
