@@ -61,8 +61,10 @@ public:
      * a private encoder so a running session keeps its reference state. */
     bool EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len);
 
-    /* Waits for Wi-Fi, then connects to the configured receiver on its own. */
-    void AutoStart();
+    /* Waits for Wi-Fi, then brings up the bench HTTP server, receiver discovery
+     * and Wi-Fi power-save settings. A session starts only when it is asked
+     * for: which receiver to mirror to belongs to the user. */
+    void StartNetworkServices();
 
     /* Called by the protocol stack when the receiver demands a PIN. */
     bool WaitForPin(char pin[5]);
@@ -70,7 +72,7 @@ public:
 private:
     AirplayService() = default;
     static void SessionTask(void* arg);
-    static void AutoStartTask(void* arg);
+    static void NetworkTask(void* arg);
     std::string ResolveHost() const;
     bool ResolveLegacy() const;
     void Remember(const std::string& host, bool legacy) const;

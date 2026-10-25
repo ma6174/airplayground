@@ -210,9 +210,10 @@ public:
         InitializeDisplay();
         InitializeButtons();
         InitializeTools();
-        /* 台架 HTTP 口由 AirplayService::AutoStart 的任务在网络就绪后拉起：
-         * 板级构造函数早于 TCP/IP 栈初始化，在这里起 httpd 会断言。 */
-        AirplayService::GetInstance().AutoStart();
+        /* 台架 HTTP 口、接收端发现由 AirplayService::StartNetworkServices 的任务
+         * 在网络就绪后拉起：板级构造函数早于 TCP/IP 栈初始化，在这里起 httpd 会
+         * 断言。投屏到哪台设备由用户决定（语音 / MCP / 台架接口），开机不自动连。 */
+        AirplayService::GetInstance().StartNetworkServices();
     }
 
     virtual std::string GetBoardType() override { return "jc4880-tv"; }

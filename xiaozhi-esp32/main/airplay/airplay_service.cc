@@ -428,8 +428,8 @@ bool AirplayService::ResolveLegacy() const {
     return settings.GetString("legacy", "0") == "1";
 }
 
-/* Stores the effective target (with port) and transport, so a reboot can
- * reconnect the same way. Only called with the resolved values. */
+/* Stores the effective target (with port) and transport, so "the receiver used
+ * last time" resolves to the same address the same way. */
 void AirplayService::Remember(const std::string& host, bool legacy) const {
     Settings settings("airplay", true);
     settings.SetString("host", host);
@@ -446,6 +446,9 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
     std::string target = host;
     if (target.empty()) {
         target = ResolveHost();
+        /* Asked to reuse the last receiver: it was remembered together with the
+         * way it has to be spoken to (a projector only answers legacy AirTunes). */
+        legacy = legacy || ResolveLegacy();
     }
     name_.clear();
     /* A named receiver resolves through the discovery list, which also decides
@@ -826,13 +829,12 @@ void AirplayService::SessionTask(void* arg) {
     vTaskDelete(nullptr);
 }
 
-void AirplayService::AutoStart() {
-    xTaskCreate(AutoStartTask, "airplay_auto", 4 * 1024, this, 2, nullptr);
+void AirplayService::StartNetworkServices() {
+    xTaskCreate(NetworkTask, "airplay_net", 4 * 1024, this, 2, nullptr);
 }
 
-void AirplayService::AutoStartTask(void* arg) {
-    auto* self = static_cast<AirplayService*>(arg);
-
+void AirplayService::NetworkTask(void* arg) {
+    (void)arg;
     char ip[16] = {0};
     for (int i = 0; i < 120; i++) {
         GetLocalIp(ip, sizeof(ip));
@@ -842,7 +844,7 @@ void AirplayService::AutoStartTask(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (strcmp(ip, "0.0.0.0") == 0) {
-        ESP_LOGW(TAG, "no network address, bench API and automatic session stay off");
+        ESP_LOGW(TAG, "no network address, bench API and receiver discovery stay off");
         vTaskDelete(nullptr);
         return;
     }
@@ -858,15 +860,6 @@ void AirplayService::AutoStartTask(void* arg) {
         ESP_LOGW(TAG, "receiver discovery unavailable; self.airplay.discover stays empty");
     }
 
-    if (self->ResolveHost().empty()) {
-        ESP_LOGI(TAG, "no default receiver configured, waiting for self.airplay.start");
-        vTaskDelete(nullptr);
-        return;
-    }
-    ESP_LOGI(TAG, "network is up (%s), connecting to the configured receiver", ip);
-    /* The receiver needs a moment to tear the previous session down after this
-     * device rebooted; connecting too early yields a black session. */
-    vTaskDelay(pdMS_TO_TICKS(15000));
-    self->Start("", self->ResolveLegacy());
+    ESP_LOGI(TAG, "network is up (%s); mirroring starts when self.airplay.start is called", ip);
     vTaskDelete(nullptr);
 }
