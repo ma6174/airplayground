@@ -867,15 +867,34 @@ def _start_watchdog() -> None:
     threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
-def _kill_capture() -> None:
-    """干掉推流进程，交给下一轮 watchdog 重新拉起。"""
-    pid = _cast_pid()
-    if pid is None:
-        return
+def _capture_pids() -> list[int]:
+    """所有在跑的 capture-cli record 进程。
+
+    投屏状态靠一个 pid 文件记，但同一个 /tmp/hs-mcp 下可能有两个 hs-mcp（用户
+    常驻的 --xiaozhi 和调试用的 --http），它们各起一路、互相覆盖 pid 文件，剩下的
+    孤儿会和新那路一起抢设备的 8090——设备只认一个，画面就乱了（而且 ScreenCaptureKit
+    的多会话竞争会让下一次 list 直接挂住）。
+    """
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except OSError:
-        pass
+        out = subprocess.run(["pgrep", "-f", f"{CAPTURE_CLI.name} record"],
+                             capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return []
+    return [int(pid) for pid in out.split() if pid.isdigit()]
+
+
+def _kill_capture() -> None:
+    """干掉所有推流进程，交给下一轮 watchdog 重新拉起。"""
+    pids = _capture_pids()
+    for pid in pids:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
     CAST_PID.unlink(missing_ok=True)
 
 
@@ -898,8 +917,8 @@ def _watchdog_loop() -> None:
             except RuntimeError:
                 continue  # 设备不在线，下一轮再看
             if state.get("mode") == "push":
-                # capture-cli 的视频连接断了之后并不退出（进程活着、只刷"连接已断开"，
-                # 音频还照发），电视就永远停在最后一帧。进程看不出问题，只能问设备：
+                # capture-cli 的视频连接断了之后并不退出（旧二进制），进程活着、只刷
+                # "连接已断开"，电视就永远停在最后一帧。进程看不出问题，只能问设备：
                 # 连续 15 秒没看到推流客户端，就重起一路。
                 if st.get("capture_client"):
                     _stream_idle = 0
@@ -909,17 +928,18 @@ def _watchdog_loop() -> None:
                         _log("watchdog: the stream is not reaching the device, restarting it")
                         _kill_capture()
                         _stream_idle = 0
-                continue
-            _reopen_pull_session(state)
+            # 设备重启后会话就没了（重启不会把它接回电视）：流即使连上了，电视上还是
+            # 设备自己的界面。两种模式都需要这一下。
+            _reopen_session(state)
         except Exception as e:  # 守护线程不能再死一次
             _log(f"watchdog: {e}")
 
 
-def _reopen_pull_session(state: dict) -> None:
-    """设备重启后会话就没了：流还在拉，但没人在投屏。
+def _reopen_session(state: dict) -> None:
+    """把丢掉的投屏会话接回去。
 
-    把会话接回去是拉流真正的意义——用户只说了一次“投上去”，设备重启、电视断电
-    回来都不该再问一遍。停机意图由 stop_cast 表达（它会先把拉流目标清掉）。
+    重启、电视断电回来都不该再让用户说一遍——停机的意思是 stop_cast，它会先把
+    拉流目标清掉并把状态文件删了，watchdog 就不再插手。
     """
     global _last_reopen
     if time.time() - _last_reopen < 20:
@@ -1057,22 +1077,14 @@ def stop_cast() -> str:
         _RELAY.close()
         _RELAY = None
     CAST_STATE.unlink(missing_ok=True)
-    pid = _cast_pid()
-    if pid is None:
+    if not _capture_pids():
+        CAST_PID.unlink(missing_ok=True)
         return "not casting"
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(os.getpgid(pid), sig)
-        except OSError:
+    _kill_capture()
+    for _ in range(20):
+        if not _capture_pids():
             break
-        for _ in range(20):
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                CAST_PID.unlink(missing_ok=True)
-                return "stopped: the TV is switching back to the device screen"
-            time.sleep(0.25)
-    CAST_PID.unlink(missing_ok=True)
+        time.sleep(0.1)
     return "stopped: the TV is switching back to the device screen"
 
 
