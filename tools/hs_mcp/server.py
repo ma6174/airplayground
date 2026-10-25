@@ -79,9 +79,9 @@ mcp = FastMCP(
         "应用名不确定时用 list_running_apps 查（很多应用实际是英文名，如 TextEdit）；"
         "看屏幕内容（截屏/看看屏幕/屏幕上有什么）必须用 screen_look：它返回文字；"
         "screenshot_image 只返回图片，语音对话里看不到；"
-        "用户说“把某个应用/屏幕投到电视”时用 cast_to_tv（停止用 stop_cast）。"
+        "用户说“把某个应用/屏幕投到电视”时用 cast_mac_to_tv（停止用 stop_cast）。"
         "投屏有三种画面，按用户说的是哪一种来选："
-        "① 这台 Mac 的窗口/屏幕 → cast_to_tv；"
+        "① 这台 Mac 的窗口/屏幕 → cast_mac_to_tv；"
         "② 设备自己的界面（用户说“你自己的画面/小智的画面”）→ 设备的 self.airplay.start；"
         "③ 别的机器（服务器/云主机/Linux）→ 设备的 self.screen.cast_server。"
     ),
@@ -609,7 +609,7 @@ def _ensure_mirroring(tv: str = "") -> str:
         if len(recv) > 1:
             names = ", ".join(r.get("name", "?") for r in recv[:8])
             return (f"several AirPlay receivers are on the LAN ({names}): ask the user which TV "
-                    f"to use, then call cast_to_tv again with tv=<that name>")
+                    f"to use, then call cast_mac_to_tv again with tv=<that name>")
         target = recv[0].get("name") or recv[0].get("host", "")
         legacy = "1" if recv[0].get("legacy") else "0"
     _device_get(f"/airplay/start?host={urllib.parse.quote(target)}&legacy={legacy}")
@@ -1009,7 +1009,7 @@ def _reopen_session(state: dict) -> None:
 
 
 @tool()
-def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
+def cast_mac_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
                mode: str = "push") -> str:
     """把 Mac 上的某个应用窗口（或整个屏幕）投到电视上，电视改显示它而不是设备的界面。
 
@@ -1032,7 +1032,7 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
     note = _ensure_mirroring(tv)
     if note == "pin required":
         return ("the TV is waiting for its 4-digit code: ask the user for it, run "
-                "self.airplay.enter_pin with those digits, then call cast_to_tv again")
+                "self.airplay.enter_pin with those digits, then call cast_mac_to_tv again")
     if note:
         return note
 

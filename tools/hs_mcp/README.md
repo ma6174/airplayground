@@ -46,7 +46,7 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 | `open_url` | 用默认程序打开 http(s) 网址 |
 | `screenshot_image` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
 | `screen_look` | **看屏幕并回答问题（小智场景用这个）**：截图 → 推给小智固件的 `/vision/explain` → 走云端视觉模型 → 返回文字描述。可选 `app` 参数 |
-| `cast_to_tv` | **把某个应用窗口或整个屏幕投到电视**。`app` 空=整屏，`tv` 指定电视名，`audio=true` 连 Mac 系统声音，`mode` 选 `push`（默认，本机推给设备）或 `pull`（设备来本机拉，断线自恢复）|
+| `cast_mac_to_tv` | **把某个应用窗口或整个屏幕投到电视**。`app` 空=整屏，`tv` 指定电视名，`audio=true` 连 Mac 系统声音，`mode` 选 `push`（默认，本机推给设备）或 `pull`（设备来本机拉，断线自恢复）|
 | `find_device` | 找小智设备的地址和当前投屏状态（换了电脑/设备重启换了 IP 也能扫出来） |
 | `stop_cast` | 停止投屏，电视回到设备自己的界面 |
 | `clipboard_set` / `clipboard_get` | 写/读系统剪贴板 |
@@ -71,7 +71,7 @@ Mac 截图后推给小智固件设备的 `/vision/explain` 端点（设备地址
 云端下发的 vision 能力）上传视觉模型，把文字答案原路返回。要求固件包含该端点。
 设备在重建投屏会话时会瞬时断连，`screen_look` 因此失败时会自动重试一次。
 
-## 把 Mac 窗口/屏幕投到电视（`cast_to_tv`）
+## 把 Mac 窗口/屏幕投到电视（`cast_mac_to_tv`）
 
 链路：仓库里的 `macos/capture-cli`（ScreenCaptureKit 采集 + VideoToolbox 编码）→ TCP 8090 →
 设备的 `media_net` → 现有 AirPlay 加密通道 → 电视。设备只做加密转发、不重新编码，所以电视上是
