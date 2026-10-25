@@ -618,6 +618,12 @@ void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& s
             lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    /* A subtitle may have arrived while the text owned the screen; the face
+     * only comes back when there is nothing to read. */
+    const char* chat_text = chat_message_label_ ? lv_label_get_text(chat_message_label_) : "";
+    if (emoji_label_ != nullptr && (chat_text == nullptr || chat_text[0] == '\0')) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
     /* The status the state machine kept reporting while the text was up. */
     if (!hidden_status_.empty() && status_label_ != nullptr) {
         lv_label_set_text(status_label_, hidden_status_.c_str());
@@ -662,7 +668,14 @@ void VirtualDisplay::SetChatMessage(const char* role, const char* content) {
     DisplayLockGuard lock(this);
     if (content == nullptr || content[0] == '\0') {
         lv_label_set_text(chat_message_label_, "");
+        if (emoji_label_ != nullptr) {
+            lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
         return;
     }
     lv_label_set_text(chat_message_label_, content);
+    /* The face sits mid-screen where long subtitles reach; show one at a time. */
+    if (emoji_label_ != nullptr) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
