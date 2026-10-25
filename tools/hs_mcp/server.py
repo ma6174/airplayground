@@ -849,6 +849,8 @@ _watchdog_started = False
 # 刚重开过的会话给足建立时间：会话建立期间 status 也是 running=false，
 # 不等就再开一次，只会把刚接上的会话又敲断
 _last_reopen = 0.0
+# 连续多少次看到「进程还在、流没到设备」
+_stream_idle = 0
 
 
 def _start_watchdog() -> None:
@@ -865,19 +867,50 @@ def _start_watchdog() -> None:
     threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
+def _kill_capture() -> None:
+    """干掉推流进程，交给下一轮 watchdog 重新拉起。"""
+    pid = _cast_pid()
+    if pid is None:
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        pass
+    CAST_PID.unlink(missing_ok=True)
+
+
 def _watchdog_loop() -> None:
+    global _stream_idle
     while True:
         time.sleep(5)
         try:
             state = _cast_state_read()
             if not state.get("args"):
+                _stream_idle = 0
                 continue
             if _cast_pid() is None:
                 _log("watchdog: the capture stream died, starting it again")
                 _spawn_capture(state["args"])
+                _stream_idle = 0
                 continue
-            if state.get("pull"):
-                _reopen_pull_session(state)
+            try:
+                st = _device_get("/airplay/status")
+            except RuntimeError:
+                continue  # 设备不在线，下一轮再看
+            if state.get("mode") == "push":
+                # capture-cli 的视频连接断了之后并不退出（进程活着、只刷"连接已断开"，
+                # 音频还照发），电视就永远停在最后一帧。进程看不出问题，只能问设备：
+                # 连续 15 秒没看到推流客户端，就重起一路。
+                if st.get("capture_client"):
+                    _stream_idle = 0
+                else:
+                    _stream_idle += 1
+                    if _stream_idle >= 3:
+                        _log("watchdog: the stream is not reaching the device, restarting it")
+                        _kill_capture()
+                        _stream_idle = 0
+                continue
+            _reopen_pull_session(state)
         except Exception as e:  # 守护线程不能再死一次
             _log(f"watchdog: {e}")
 
@@ -961,6 +994,10 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
     if (w, h) != (src_w, src_h):
         args += ["--width", str(w), "--height", str(h)]
     args += ["--fps", str(fps)]
+    # 大面积变化的画面（视频、动画页）会把平均码率从 1.4 Mbps 挑到 6 Mbps，
+    # 设备的 AirPlay 通道和帧队列吞不下去，后果是丢帧、花屏、最后连接被断。
+    # 文字窗口给得宽一点，全屏动态画面压紧。
+    args += ["--bitrate", str(1200000 if w * h <= 400_000 else 2000000)]
     if audio:
         args.append("--audio")
     pull = mode.strip().lower() == "pull"

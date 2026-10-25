@@ -1545,11 +1545,19 @@ func record(_ options: Options, content: SCShareableContent) async throws {
     if let duration = options.duration {
         try await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
     } else {
+        /* 视频连接断了之后没人再消费帧：捕获还挂着只会每秒刷一行「连接已断开」，
+         * 音频继续跑，电视就永远停在最后一帧（外面看不出进程有问题）。所以除了
+         * SIGINT，还要盯编码器记录的失败：一旦写不出去就收工，让上层重起一路。 */
+        final class StopFlag {
+            var stopped = false
+        }
+        let flag = StopFlag()
         let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGINT, SIG_IGN)
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            signalSource.setEventHandler { continuation.resume() }
-            signalSource.resume()
+        signalSource.setEventHandler { flag.stopped = true }
+        signalSource.resume()
+        while !flag.stopped && encoder.error == nil && muxer?.error == nil {
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
         signalSource.cancel()
     }
