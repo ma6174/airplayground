@@ -664,23 +664,23 @@ bool ShowJpegOnDisplay(VirtualDisplay* display, const uint8_t* jpeg, size_t len,
     }
     const size_t out_w = info.width;
     const size_t out_h = info.height;
-    size_t out_len = 0;
-    int stride = 0;
+    /* Where the engine puts a picture is not the same for every sampling: 4:2:0
+     * and 4:2:2 come back padded to whole 16 px MCUs, 4:4:4 and grayscale do
+     * not. Sizing the buffer for the padded case covers all of them (it is the
+     * upper bound), and the stride is taken from what the engine reports it
+     * wrote. */
+    const size_t padded_w = (out_w + 15) & ~15u;
+    const size_t padded_h = (out_h + 15) & ~15u;
+    const size_t plane_len = out_w * out_h * 2;
+    const size_t padded_len = padded_w * padded_h * 2;
     bool gray = false;
     switch (info.sample_method) {
         case JPEG_DOWN_SAMPLING_GRAY:
-            out_len = out_w * out_h * 2;
-            stride = out_w * 2;
             gray = true;
             break;
         case JPEG_DOWN_SAMPLING_YUV444:
-            out_len = out_w * out_h * 2;
-            stride = out_w * 2;
-            break;
         case JPEG_DOWN_SAMPLING_YUV422:
         case JPEG_DOWN_SAMPLING_YUV420:
-            out_len = ((out_w + 15) & ~15u) * ((out_h + 15) & ~15u) * 2;
-            stride = static_cast<int>(((out_w + 15) & ~15u) * 2);
             break;
         default:
             heap_caps_free(bit_stream);
@@ -689,8 +689,8 @@ bool ShowJpegOnDisplay(VirtualDisplay* display, const uint8_t* jpeg, size_t len,
             return false;
     }
     size_t rx_size = 0;
-    auto* out_buf = static_cast<uint8_t*>(jpeg_alloc_decoder_mem(out_len, &rx_cfg, &rx_size));
-    if (out_buf == nullptr || rx_size < out_len) {
+    auto* out_buf = static_cast<uint8_t*>(jpeg_alloc_decoder_mem(padded_len, &rx_cfg, &rx_size));
+    if (out_buf == nullptr || rx_size < padded_len) {
         heap_caps_free(bit_stream);
         jpeg_del_decoder_engine(decoder);
         *error = "no memory for the JPEG decode";
@@ -702,15 +702,29 @@ bool ShowJpegOnDisplay(VirtualDisplay* display, const uint8_t* jpeg, size_t len,
         .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
     };
     uint32_t produced = 0;
-    const bool decoded =
-        jpeg_decoder_process(decoder, &decode_cfg, bit_stream, len, out_buf, out_len, &produced) ==
-            ESP_OK &&
-        (produced == out_len || (gray && produced == out_w * out_h));
+    const esp_err_t process_err =
+        jpeg_decoder_process(decoder, &decode_cfg, bit_stream, len, out_buf, padded_len, &produced);
     jpeg_del_decoder_engine(decoder);
     heap_caps_free(bit_stream);
-    if (!decoded) {
+    if (process_err != ESP_OK || produced == 0) {
+        ESP_LOGE(TAG, "JPEG decode failed: err=%d sampling=%d %zux%zu produced=%u",
+                 (int)process_err, (int)info.sample_method, out_w, out_h, (unsigned)produced);
         heap_caps_free(out_buf);
         *error = "JPEG decode failed";
+        return false;
+    }
+    int stride = 0;
+    if (gray && produced == out_w * out_h) {
+        stride = static_cast<int>(out_w);
+    } else if (produced == padded_len) {
+        stride = static_cast<int>(padded_w * 2);
+    } else if (produced == plane_len) {
+        stride = static_cast<int>(out_w * 2);
+    } else {
+        ESP_LOGE(TAG, "JPEG decode produced %u bytes, expected %u or %u", (unsigned)produced,
+                 (unsigned)plane_len, (unsigned)padded_len);
+        heap_caps_free(out_buf);
+        *error = "JPEG decode produced an unexpected size";
         return false;
     }
 
