@@ -28,6 +28,8 @@ extern "C" {
 namespace {
 
 constexpr int kMaxQuery = 96;
+/* The longest query value any endpoint takes: an image URL. */
+constexpr size_t kMaxValue = 640;
 /* One screen of text; the POST body carries it raw so the model can send any
  * UTF-8 without percent-encoding games. */
 constexpr size_t kMaxText = 512;
@@ -63,8 +65,10 @@ bool QueryValue(httpd_req_t* req, const char* key, char* out, size_t out_len,
     if (httpd_req_get_url_query_str(req, query.data(), query_len) != ESP_OK) {
         return false;
     }
-    char value[512];
-    if (out_len >= sizeof(value)) {
+    char value[kMaxValue];
+    /* A caller that asks for a buffer as large as this one would lose the
+     * terminating NUL: the value is copied out with room to spare. */
+    if (out_len > sizeof(value)) {
         return false;
     }
     if (httpd_query_key_value(query.data(), key, value, sizeof(value)) != ESP_OK) {

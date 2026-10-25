@@ -458,7 +458,9 @@ constexpr uint32_t kMaxImagePixels = 2100000; /* 1920x1080 fits. */
 bool DownloadUrl(const std::string& url, size_t cap, std::vector<uint8_t>* out, std::string* error,
                  const char* required_type = nullptr) {
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
-    http->SetTimeout(10000);
+    /* 20 s between chunks: this is a per-read wait, and a long-haul HTTPS download
+     * routinely goes quiet for ten seconds mid-body, which used to kill the fetch. */
+    http->SetTimeout(20000);
     if (auto opened = http->Open("GET", url); !opened) {
         *error = "cannot open " + url + ": " + opened.error().ToString();
         return false;
@@ -1314,10 +1316,10 @@ bool AirplayService::RunImageJob(std::unique_ptr<ImageJob> job, std::string* res
         *result = "cannot create the picture task";
         return false;
     }
-    /* 30 s covers a slow download plus the decode; past that the attempt is a
-     * failure and the worker cleans the job up on its own. */
-    if (xSemaphoreTake(raw->done, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        *result = "timed out after 30 s";
+    /* A download over a long-haul link plus the decode; past that the attempt is
+     * a failure and the worker cleans the job up on its own. */
+    if (xSemaphoreTake(raw->done, pdMS_TO_TICKS(45000)) != pdTRUE) {
+        *result = "timed out after 45 s";
         return false;
     }
     *result = raw->result;
