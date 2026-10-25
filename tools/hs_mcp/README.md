@@ -46,7 +46,7 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 | `open_url` | 用默认程序打开 http(s) 网址 |
 | `screenshot_image` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
 | `screen_look` | **看屏幕并回答问题（小智场景用这个）**：截图 → 推给小智固件的 `/vision/explain` → 走云端视觉模型 → 返回文字描述。可选 `app` 参数 |
-| `cast_mac_to_tv` | **把某个应用窗口或整个屏幕投到电视**。`app` 空=整屏，`tv` 指定电视名，`audio=true` 连 Mac 系统声音，`mode` 选 `push`（默认，本机推给设备）或 `pull`（设备来本机拉，断线自恢复）|
+| `cast_mac_to_tv` | **把某个应用窗口或整个屏幕投到电视**。`app` 空=整屏，`tv` 指定电视名，`audio` 连 Mac 系统声音（默认开，整系统输出而不是某个应用），`fps` 默认 20，`mode` 选 `push`（默认，本机推给设备）或 `pull`（设备来本机拉，断线自恢复）|
 | `find_device` | 找小智设备的地址和当前投屏状态（换了电脑/设备重启换了 IP 也能扫出来） |
 | `stop_cast` | 停止投屏，电视回到设备自己的界面 |
 | `clipboard_set` / `clipboard_get` | 写/读系统剪贴板 |
@@ -88,7 +88,8 @@ Mac 截图后推给小智固件设备的 `/vision/explain` 端点（设备地址
 
 设备在推流客户端连上/断开时会自己重开会话切换视频源，所以 `stop_cast` 之后电视会自动回到
 设备的界面。投屏期间助手的声音留在设备扬声器（电视的音频通道让给画面）。
-`audio=true` 则把 Mac 的系统输出声音一起送到电视（整个系统，不是某个应用）。
+`audio` 默认开，把 Mac 的系统输出声音一起送到电视（整个系统，不是某个应用）；传 `false`
+只投画面，电视的音频通道留给助手。
 
 ### push 与 pull
 
@@ -126,7 +127,7 @@ Mac 截图后推给小智固件设备的 `/vision/explain` 端点（设备地址
 uv run tools/hs_mcp/server.py --xiaozhi 'wss://api.xiaozhi.me/mcp/?token=你的token'
 ```
 
-进程内实现 WebSocket 传输的 MCP server（逐帧 JSON-RPC），连上后 15 个工具即注册到
+进程内实现 WebSocket 传输的 MCP server（逐帧 JSON-RPC），连上后 16 个工具即注册到
 小智，对话里直接说「打开文本编辑器写点内容」就能用；断网/断线每 2 秒起自动重连
 （指数退避到 30 秒）。想开机常驻就包一层 launchd/`nohup`，本仓库不内置。
 
