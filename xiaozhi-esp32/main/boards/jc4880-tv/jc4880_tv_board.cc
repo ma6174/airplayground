@@ -1,9 +1,11 @@
 #include "wifi_board.h"
 
 #include "airplay/airplay_service.h"
+#include "airplay_screen_camera.h"
 #include "application.h"
 #include "audio/codecs/es8311_audio_codec.h"
 #include "button.h"
+#include "camera.h"
 #include "config.h"
 #include "display/virtual_display.h"
 #include "mcp_server.h"
@@ -22,6 +24,16 @@ private:
     i2c_master_bus_handle_t codec_i2c_bus_ = nullptr;
     Button boot_button_;
     VirtualDisplay* display_ = nullptr;
+    AirplayScreenCamera* screen_camera_ = nullptr;
+
+    /* Created on demand and shared by GetCamera() (for the server's vision
+     * capability) and the self.screen.look tool. */
+    AirplayScreenCamera* ScreenCamera() {
+        if (screen_camera_ == nullptr) {
+            screen_camera_ = new AirplayScreenCamera(VIRTUAL_DISPLAY_WIDTH, VIRTUAL_DISPLAY_HEIGHT);
+        }
+        return screen_camera_;
+    }
 
     void InitializeCodecI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
@@ -202,6 +214,35 @@ private:
                 display_->ShowText(text, style);
                 return std::string("shown");
             });
+
+        /* Distinct from self.camera.take_photo: that one keeps the generic
+         * camera semantics (and indeed photographs the room on boards with a
+         * camera), while looking at the screen is its own verb on a board
+         * whose only image is the one it mirrors to the TV. */
+        mcp_server.AddTool(
+            "self.screen.look",
+            "Look at the screen: examine what this device is currently showing on the TV it "
+            "mirrors to (its own interface when not mirroring). The image comes from the display "
+            "frame buffer, not from a camera, so this never sees the room or the user.\n"
+            "Use it when the user asks what is on the screen or TV, asks you to look at / check "
+            "the screen, or when you want to verify what you are currently displaying.\n"
+            "Args:\n"
+            "  `question`: what to check about the screen, e.g. \"what text is shown?\" or "
+            "\"what colour is the background?\"\n"
+            "Return:\n"
+            "  A JSON object with the vision service's answer about the screen.",
+            PropertyList({Property("question", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                auto* camera = ScreenCamera();
+                if (!camera->Capture()) {
+                    return std::unexpected("Failed to capture the screen");
+                }
+                auto result = camera->Explain(properties["question"].value<std::string>());
+                if (!result) {
+                    return std::unexpected(std::move(result.error()));
+                }
+                return std::move(*result);
+            });
     }
 
 public:
@@ -229,6 +270,11 @@ public:
     }
 
     virtual Display* GetDisplay() override { return display_; }
+
+    /* Exposing the screen camera keeps the server's vision capability flowing
+     * (it is only delivered to Board::GetCamera); it also registers the
+     * generic self.camera.take_photo, whose photo here is the screen itself. */
+    virtual Camera* GetCamera() override { return ScreenCamera(); }
 };
 
 DECLARE_BOARD(Jc4880TvBoard);
