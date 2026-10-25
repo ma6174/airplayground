@@ -407,8 +407,11 @@ static esp_err_t pair_and_verify(ap_session_t *session)
 
     /* A receiver that has paired with us before accepts pair-verify straight
      * away, and a rejected pair-verify does not start a pairing backoff, so this
-     * is always the first thing to try - even for receivers that want a code. */
-    if (session->config->identity != NULL) {
+     * is always the first thing to try - even for receivers that want a code.
+     * The exception is a receiver that is advertising a PIN requirement: one
+     * that reset its pairing list still verifies our key but then rejects every
+     * later request, so only a fresh pair-setup clears it. */
+    if (session->config->identity != NULL && !want_pin) {
         if (pair_verify(session) == ESP_OK) {
             AP_LOGI("known identity verified without pair-setup");
             return ESP_OK;
