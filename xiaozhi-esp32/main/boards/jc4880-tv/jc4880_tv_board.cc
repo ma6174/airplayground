@@ -12,6 +12,10 @@
 #include "display/virtual_display.h"
 #include "mcp_server.h"
 
+extern "C" {
+#include "media_net.h"
+}
+
 #include <driver/i2c_master.h>
 #include <esp_log.h>
 
@@ -69,6 +73,7 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         auto& airplay = AirplayService::GetInstance();
+        auto& webcast = WebcastClient::GetInstance();
 
         mcp_server.AddTool(
             "self.airplay.discover",
@@ -81,10 +86,13 @@ private:
 
         mcp_server.AddTool(
             "self.airplay.start",
-            "Mirror this device's own screen (its chat UI) to an AirPlay receiver such as a TV.\n"
-            "This device has no access to any computer's screen: to put a computer window on the TV, "
-            "the computer has to send it itself (its own MCP tool, cast_to_tv) — do not use this one "
-            "for that; the user would see the device UI instead of what they asked for.\n"
+            "Mirror THIS DEVICE's own screen (the assistant's chat UI, what the assistant itself "
+            "draws) to the TV. Use it when the user says \"put your own screen on the TV\" or "
+            "\"把你自己（小智）的画面投上去\", or to show text set with self.display.text.\n"
+            "Three screens can go to the TV, each with its own tool - pick by what the user named:\n"
+            "  this device's own screen -> this tool\n"
+            "  the Mac the user is talking to -> that Mac's cast_mac_to_tv tool\n"
+            "  any other machine (cloud server, Linux box) -> self.screen.cast_server\n"
             "Args:\n"
             "  `host`: receiver address, or a receiver name from `self.airplay.discover` "
             "  (empty = the receiver used last time)\n"
@@ -97,9 +105,24 @@ private:
                 Property("host", kPropertyTypeString, std::string("")),
                 Property("legacy", kPropertyTypeBoolean, false),
             }),
-            [&airplay](const PropertyList& properties) -> ReturnValue {
+            [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
                 auto host = properties["host"].value<std::string>();
                 auto legacy = properties["legacy"].value<bool>();
+                /* This tool is "the assistant's own screen". Any capture stream
+                 * that is up (pushed here or pulled from another machine) wins
+                 * the source pick, so the TV would show that machine instead -
+                 * let it go before mirroring this device's UI. */
+                media_net_pull_stop();
+                media_net_drop_client();
+                webcast.Stop();
+                /* A session picks its source when it starts, so a live one has
+                 * to be rebuilt for the device UI to come back. */
+                if (airplay.running()) {
+                    airplay.Stop();
+                    for (int i = 0; i < 100 && airplay.running(); i++) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+                }
                 if (!airplay.Start(host, legacy)) {
                     return std::string("not started: a session is already running, or no receiver by that "
                                        "name (self.airplay.discover lists them)");
@@ -182,7 +205,6 @@ private:
                 }
             });
 
-        auto& webcast = WebcastClient::GetInstance();
 
         /* Distinct from self.airplay.start: that mirrors this device's own
          * screen, while the webcast tools put a browser page from the server on
@@ -239,55 +261,68 @@ private:
             });
 
         mcp_server.AddTool(
-            "self.webcast.snapshot",
-            "List the interactive elements of the web page currently on the TV, numbered.\n"
-            "Use the numbers with self.webcast.control: click to open a link, type to fill a "
-            "search box. Call this again after the page navigated - the numbers change.",
-            PropertyList(),
-            [&webcast](const PropertyList&) -> ReturnValue { return webcast.Snapshot(); });
-
-        mcp_server.AddTool(
-            "self.webcast.control",
-            "Interact with the web page currently on the TV.\n"
-            "Args:\n"
-            "  `action`: click, type, scroll or press\n"
-            "  `ref`: element number from self.webcast.snapshot (click and type)\n"
-            "  `text`: what to type into the element (type); the search is not submitted "
-            "automatically - follow with press Enter\n"
-            "  `dy`: pixels to scroll, positive scrolls down (scroll)\n"
-            "  `key`: key name for press, e.g. Enter, Escape, ArrowDown\n"
-            "Return:\n"
-            "  Whether the server performed it.",
+            "self.screen.cast_server",
+            "Put ANOTHER MACHINE's screen on the TV: a cloud server, a Linux box, a second computer. "
+            "That machine runs a screen-cast service and this device pulls the stream, so it works "
+            "even when that machine cannot be reached from here.\n"
+            "NOT for the Mac the user is talking to (that Mac pushes its own screen with cast_mac_to_tv) "
+            "and NOT for this device's own screen (self.airplay.start).\n"
+            "Args: host is \"ip\" or \"ip:port\" (port defaults to 8090); leave it out to reuse "
+            "the machine shown last time - ask the user for the address instead of guessing.",
             PropertyList({
-                Property("action", kPropertyTypeString),
-                Property("ref", kPropertyTypeInteger, -1),
-                Property("text", kPropertyTypeString, ""),
-                Property("dy", kPropertyTypeInteger, 600),
-                Property("key", kPropertyTypeString, "Enter"),
+                Property("host", kPropertyTypeString, std::string("")),
             }),
-            [&webcast](const PropertyList& properties) -> ReturnValue {
-                auto action = properties["action"].value<std::string>();
-                auto ref = properties["ref"].value<int>();
-                auto text = properties["text"].value<std::string>();
-                auto dy = properties["dy"].value<int>();
-                auto key = properties["key"].value<std::string>();
-                bool ok;
-                if (action == "click") {
-                    ok = webcast.Click(ref);
-                } else if (action == "type") {
-                    ok = webcast.Type(ref, text);
-                } else if (action == "scroll") {
-                    ok = webcast.Scroll(dy);
-                } else if (action == "press") {
-                    ok = webcast.Press(key);
-                } else {
-                    return std::string("action must be click, type, scroll or press");
+            [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
+                auto target = properties["host"].value<std::string>();
+                if (target.empty()) {
+                    /* The address from the last request is remembered in NVS, so
+                     * "put the server on the TV" keeps working without repeating
+                     * it every time. */
+                    target = media_net_pull_target();
+                    if (target.empty()) {
+                        return std::string("no address yet: ask the user which machine to show, "
+                                           "like 192.168.1.20:8090");
+                    }
                 }
-                return std::string(ok ? action + " done"
-                                      : action + " failed: webcaster unreachable or stale "
-                                        "element number (snapshot again)");
+                char host[64] = {0};
+                snprintf(host, sizeof(host), "%s", target.c_str());
+                uint16_t port = 8090;
+                if (char* colon = strrchr(host, ':')) {
+                    const long parsed = strtol(colon + 1, nullptr, 10);
+                    if (parsed > 0 && parsed < 65536) {
+                        port = static_cast<uint16_t>(parsed);
+                        *colon = '\0';
+                    }
+                }
+                /* One picture at a time: a page stream left running would keep a
+                 * second screen coming in behind this one. */
+                webcast.Stop();
+                if (!media_net_pull(host, port)) {
+                    return std::string("bad address: ") + target;
+                }
+                for (int i = 0; i < 60 && !media_net_ready(); i++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!media_net_ready()) {
+                    media_net_pull_stop();
+                    return std::string("cannot reach ") + target +
+                           ": is the screen service running there, and reachable from this network?";
+                }
+                /* A live session picks its source when it starts; the capture
+                 * watchdog rebuilds it once this stream is up, so either way the
+                 * answer is "wait a moment" rather than a second restart here. */
+                if (!airplay.running() && !airplay.Start("", false)) {
+                    return std::string("stream is up but mirroring failed: ") + airplay.StatusJson();
+                }
+                for (int i = 0; i < 120 && !airplay.showing_capture(); i++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (airplay.showing_capture()) {
+                    return std::string("the screen of ") + target + " is on the TV";
+                }
+                return std::string("the stream is up, the TV is still switching to it: ") +
+                       airplay.StatusJson();
             });
-
         mcp_server.AddTool(
             "self.webcast.stop",
             "Close the web page and stop showing it on the TV; the chat screen comes back. "
