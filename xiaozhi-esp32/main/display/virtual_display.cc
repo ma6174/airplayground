@@ -21,7 +21,6 @@ LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_material_symbols_30_4);
 LV_FONT_DECLARE(font_noto_emoji_30_4);
 LV_FONT_DECLARE(font_noto_sans_basic_20_4);
-LV_FONT_DECLARE(font_noto_sans_basic_14_1);
 
 /* Content layer layout: the text never touches the edges, and that margin is
  * also what the font fitting below measures against. */
@@ -147,9 +146,12 @@ VirtualDisplay::VirtualDisplay(int width, int height, int fps) : fps_(fps) {
     width_ = width;
     height_ = height;
     /* Copies of the smaller built-in faces: the theme font is the large one, and
-     * the content layer shrinks to these when the text is long. */
+     * the content layer shrinks to these when the text is long. 20 px is the
+     * smallest face linked: the 14 px one only helps a display shorter than the
+     * 540-line frame here, and it costs 35 KB of an app partition that is within
+     * 20 KB of full. "small" therefore lands on the same face as "medium". */
     medium_font_ = font_noto_sans_basic_20_4;
-    small_font_ = height >= 480 ? font_noto_sans_basic_20_4 : font_noto_sans_basic_14_1;
+    small_font_ = medium_font_;
     InitializeLvgl();
     InitializeThemes();
 
