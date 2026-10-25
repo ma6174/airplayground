@@ -342,19 +342,7 @@ def screen_look(question: str, app: str = "") -> str:
     app 给定时只看该应用的窗口（如 app="TextEdit"），否则看整个屏幕。
     """
     jpg = _shot_jpeg(app)
-    body = json.dumps({
-        "question": question,
-        "image": base64.b64encode(jpg.read_bytes()).decode(),
-    }).encode()
-    req = urllib.request.Request(
-        f"{DEVICE}/vision/explain", data=body,
-        headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:  # 设备上传视觉模型需数秒
-            raw = resp.read().decode("utf-8", "replace")
-    except Exception as e:
-        raise RuntimeError(
-            f"视觉请求失败（设备 {DEVICE}）：{e}。确认设备在线且固件含 /vision/explain 端点")
+    raw = _post_vision(jpg.read_bytes(), question)
     # 设备返回 {"success":true,"filename":…,"text":"<答案>"}：只把答案文本交给模型，
     # 否则语音助手会念出整包 JSON，或者把 JSON 当成“看不到”
     try:
@@ -368,6 +356,33 @@ def screen_look(question: str, app: str = "") -> str:
             raise RuntimeError(f"视觉服务拒绝：{data['error']}")
     return raw
 
+
+def _post_vision(jpeg: bytes, question: str) -> str:
+    """把 JPEG 交给设备的视觉链路，返回原始 JSON 文本。
+
+    设备在重建投屏会话时（capture 源切换）会短暂不收请求，实测能直接送一个
+    Broken pipe 回来；用户已经说完话等答案了，这里自己重试一次而不是报错。
+    """
+    body = json.dumps({
+        "question": question,
+        "image": base64.b64encode(jpeg).decode(),
+    }).encode()
+    last: Exception | None = None
+    for attempt in (1, 2):
+        req = urllib.request.Request(
+            f"{DEVICE}/vision/explain", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:  # 设备上传视觉模型需数秒
+                return resp.read().decode("utf-8", "replace")
+        except Exception as e:
+            last = e
+            _log(f"vision explain attempt {attempt} failed: {e}")
+            if attempt == 1:
+                time.sleep(0.8)
+    raise RuntimeError(
+        f"视觉请求失败（设备 {DEVICE}）：{last}。重试一次仍失败：确认设备在线、固件含 "
+        "/vision/explain；设备刚切换投屏源时也会短暂失败，稍等几秒再问")
 
 # ---- 把 Mac 的窗口/屏幕投到电视（capture-cli → 设备 8090 → AirPlay） ----
 
