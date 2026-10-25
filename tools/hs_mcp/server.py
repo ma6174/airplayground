@@ -80,8 +80,10 @@ mcp = FastMCP(
         "看屏幕内容（截屏/看看屏幕/屏幕上有什么）必须用 screen_look：它返回文字；"
         "screenshot_image 只返回图片，语音对话里看不到；"
         "用户说“把某个应用/屏幕投到电视”时用 cast_to_tv（停止用 stop_cast）。"
-        "投屏只能用 cast_to_tv / stop_cast：设备自带的 self.airplay.start 只把设备自己的界面"
-        "投上去，拿不到电脑画面，不要用它。"
+        "投屏有三种画面，按用户说的是哪一种来选："
+        "① 这台 Mac 的窗口/屏幕 → cast_to_tv；"
+        "② 设备自己的界面（用户说“你自己的画面/小智的画面”）→ 设备的 self.airplay.start；"
+        "③ 别的机器（服务器/云主机/Linux）→ 设备的 self.screen.cast_server。"
     ),
     # 无状态 HTTP：服务重启后旧会话不失效，经公网隧道接入也不需要粘性会话
     stateless_http=True,
@@ -595,6 +597,11 @@ def _ensure_mirroring(tv: str = "") -> str:
     target = tv or (st.get("host") or "")
     legacy = "1" if st.get("legacy") else "0"
     if not target:
+        # 设备记得上次投的是哪台（NVS），但 host 只在会话中才有值：断线后直接用它，
+        # 否则只能重新浏览局域网，而这里有 8 台接收器，会变成“先问用户投哪台”。
+        target = st.get("remembered") or ""
+        legacy = "1" if st.get("remembered_legacy") else "0"
+    if not target:
         # 设备重启后不再记住接收器：发现一次，只有一台就直接用，多台让用户选
         recv = _discover()
         if not recv:
@@ -1007,7 +1014,9 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
     """把 Mac 上的某个应用窗口（或整个屏幕）投到电视上，电视改显示它而不是设备的界面。
 
     用户说“把某某投到电视”“让电视显示这个窗口”时用这个工具。
-    （不要用 `self.airplay.start`：它只能把设备自己的界面投上去，电视上不会有电脑画面。）
+    这里投的是**这台 Mac** 的画面：设备自己的界面用 self.airplay.start，
+    别的机器（服务器/云主机）用 self.screen.cast_server。
+    （不要用 `self.airplay.start` 投 Mac 的画面：它只能把设备自己的界面投上去。）
     app 传应用名（如 "TextEdit"、"Google Chrome"），只投该应用的窗口（同名多窗口取最大的）；
     app 留空则投整个屏幕。
     tv 传电视名称（如 "我的Play 5"，取自设备发现列表），空则复用当前/上次的电视；
