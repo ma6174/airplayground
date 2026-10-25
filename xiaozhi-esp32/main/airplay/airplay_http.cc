@@ -1,6 +1,7 @@
 #include "airplay_http.h"
 
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -14,6 +15,10 @@
 
 #include "airplay_service.h"
 #include "display/virtual_display.h"
+
+extern "C" {
+#include "media_net.h"
+}
 
 #define TAG "AirplayHttp"
 
@@ -91,6 +96,33 @@ esp_err_t StartHandler(httpd_req_t* req) {
 esp_err_t StopHandler(httpd_req_t* req) {
     AirplayService::GetInstance().Stop();
     return Reply(req, "{\"stopping\":true}");
+}
+
+/* "host:port" makes the device dial a streaming server instead of waiting for
+ * one. A host that cannot reach the device - a laptop behind NAT, a machine on
+ * another network - still gets its screen on the TV this way, and the target is
+ * kept in NVS so a reboot resumes without asking again. An empty host clears it. */
+esp_err_t PullHandler(httpd_req_t* req) {
+    char host[kMaxQuery] = {0};
+    QueryValue(req, "host", host, sizeof(host));
+    if (host[0] == '\0') {
+        media_net_pull_stop();
+        return Reply(req, "{\"ok\":true,\"pull\":\"\"}");
+    }
+    std::string target(host);
+    uint16_t port = 8090;
+    const size_t colon = target.rfind(':');
+    if (colon != std::string::npos) {
+        port = static_cast<uint16_t>(strtoul(target.c_str() + colon + 1, nullptr, 10));
+        target.erase(colon);
+    }
+    if (!media_net_pull(target.c_str(), port)) {
+        return Reply(req, "{\"ok\":false,\"error\":\"bad pull target\"}");
+    }
+    char body[128];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"pull\":\"%s:%u\"}", target.c_str(),
+             static_cast<unsigned>(port));
+    return Reply(req, body);
 }
 
 esp_err_t PinHandler(httpd_req_t* req) {
@@ -287,6 +319,7 @@ void AirplayHttpStart() {
         {.uri = "/airplay/status", .method = HTTP_GET, .handler = StatusHandler, .user_ctx = nullptr},
         {.uri = "/airplay/start", .method = HTTP_GET, .handler = StartHandler, .user_ctx = nullptr},
         {.uri = "/airplay/stop", .method = HTTP_GET, .handler = StopHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/pull", .method = HTTP_GET, .handler = PullHandler, .user_ctx = nullptr},
         {.uri = "/airplay/pin", .method = HTTP_GET, .handler = PinHandler, .user_ctx = nullptr},
         {.uri = "/airplay/screen.raw", .method = HTTP_GET, .handler = ScreenHandler, .user_ctx = nullptr},
         {.uri = "/airplay/frame.h264", .method = HTTP_GET, .handler = FrameHandler, .user_ctx = nullptr},
@@ -299,5 +332,5 @@ void AirplayHttpStart() {
     }
     ESP_LOGI(TAG,
              "bench API on http://<device>:8080/airplay/"
-             "{status,start,stop,pin,screen.raw,frame.h264,discover,text} + /vision/explain");
+             "{status,start,stop,pull,pin,screen.raw,frame.h264,discover,text} + /vision/explain");
 }

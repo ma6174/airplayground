@@ -721,6 +721,9 @@ std::string AirplayService::StatusJson() const {
     }
     /* What is on the TV: the capture client's screen or this device's UI. */
     cJSON_AddBoolToObject(root, "capture_client", media_net_ready());
+    /* Where the capture stream comes from when this device dials out, so the
+     * caller can tell "nobody is streaming" from "the stream is unreachable". */
+    cJSON_AddStringToObject(root, "pull", media_net_pull_target());
     cJSON_AddStringToObject(root, "source", capture_source_.load() ? "capture" : "display");
     if (display_ != nullptr) {
         cJSON_AddNumberToObject(root, "width", display_->width());

@@ -1,5 +1,6 @@
 #include "media_net.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -7,7 +8,9 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "nvs.h"
 
 #include "media_avcc.h"
 
@@ -76,6 +79,18 @@ static const char *TAG = "media_net";
  * a deadline the capture task never returns to accept(), and the port stops
  * listening - no new client can connect until the device is reset. */
 #define NET_CLIENT_IDLE_MS 30000
+/* A pull target that is not answering is retried on this cadence: fast enough
+ * that a laptop returning from sleep restores the picture promptly, slow enough
+ * to keep the radio and the log quiet. The listener stays up meanwhile, so a
+ * capture client that dials in still wins. */
+#define NET_PULL_RETRY_MS 3000
+
+/* The target lives in NVS so a reboot resumes pulling without anyone asking
+ * again - the whole point of pulling is that the device repairs the stream on
+ * its own. */
+#define PULL_NVS_NAMESPACE "media_net"
+#define PULL_NVS_HOST "pull_host"
+#define PULL_NVS_PORT "pull_port"
 
 static struct {
     uint16_t port;
@@ -113,6 +128,15 @@ static struct {
      * session has started using this ring. */
     int audio_client;
     bool audio_armed;
+    /* Pull target: while set, both tasks dial "host:port" instead of waiting
+     * for a client. */
+    char pull_host[64];
+    uint16_t pull_port;
+    volatile bool pull_on;
+    /* Sockets of a running connection, so stopping a pull can break a read that
+     * is already in flight. */
+    volatile int video_fd;
+    volatile int audio_fd;
     SemaphoreHandle_t queued;
     SemaphoreHandle_t lock;
 } s_net;
@@ -161,6 +185,98 @@ static bool recv_all(int fd, void *buf, size_t len)
         deadline = xTaskGetTickCount() + pdMS_TO_TICKS(NET_CLIENT_IDLE_MS);
     }
     return true;
+}
+
+static int listener_open(uint16_t port)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (listener < 0) {
+        return -1;
+    }
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(listener, 1) != 0) {
+        ESP_LOGE(TAG, "cannot listen on TCP %u", (unsigned)port);
+        close(listener);
+        return -1;
+    }
+    ESP_LOGI(TAG, "waiting for a capture client on TCP %u", (unsigned)port);
+    return listener;
+}
+
+static int pull_connect(uint16_t port)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+    };
+    if (inet_pton(AF_INET, s_net.pull_host, &addr.sin_addr) != 1) {
+        return -1;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (fd < 0) {
+        return -1;
+    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* The next connection on this port, however it arrives: this side dials the pull
+ * target when one is set, and keeps listening meanwhile. The two are
+ * alternatives rather than modes - a capture client that dials in still gets the
+ * screen even while a pull target is configured but unreachable. */
+static int wait_for_peer(uint16_t port)
+{
+    int listener = -1;
+    TickType_t retry_at = 0;
+    bool complained = false;
+    for (;;) {
+        if (s_net.pull_on && xTaskGetTickCount() >= retry_at) {
+            int fd = pull_connect(port);
+            if (fd >= 0) {
+                if (listener >= 0) {
+                    /* The pull owns the stream now; a second producer would fight
+                     * it for the queue. */
+                    close(listener);
+                }
+                ESP_LOGI(TAG, "pulling from %s on TCP %u", s_net.pull_host, (unsigned)port);
+                return fd;
+            }
+            retry_at = xTaskGetTickCount() + pdMS_TO_TICKS(NET_PULL_RETRY_MS);
+            if (!complained) {
+                ESP_LOGW(TAG, "nothing to pull from %s on TCP %u, retrying every %d ms",
+                         s_net.pull_host, (unsigned)port, NET_PULL_RETRY_MS);
+                complained = true;
+            }
+        }
+        if (!s_net.pull_on) {
+            complained = false;
+        }
+        if (listener < 0) {
+            listener = listener_open(port);
+            if (listener < 0) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+        }
+        /* Short waits so a pull target set from the bench API takes effect
+         * within a fifth of a second. */
+        if (!recv_ready(listener, 200)) {
+            continue;
+        }
+        int client = accept(listener, NULL, NULL);
+        close(listener);
+        return client;
+    }
 }
 
 static uint16_t read_be16(const uint8_t *p)
@@ -344,32 +460,12 @@ static void capture_task(void *arg)
     (void)arg;
 
     for (;;) {
-        struct sockaddr_in addr = {
-            .sin_family = AF_INET,
-            .sin_port = htons(s_net.port),
-            .sin_addr.s_addr = htonl(INADDR_ANY),
-        };
-        int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (listener < 0) {
+        int client = wait_for_peer(s_net.port);
+        if (client < 0) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        int reuse = 1;
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-            listen(listener, 1) != 0) {
-            ESP_LOGE(TAG, "cannot listen on TCP %u", (unsigned)s_net.port);
-            close(listener);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
-        }
-        ESP_LOGI(TAG, "waiting for a capture client on TCP %u", (unsigned)s_net.port);
-
-        int client = accept(listener, NULL, NULL);
-        close(listener);
-        if (client < 0) {
-            continue;
-        }
+        s_net.video_fd = client;
         ESP_LOGI(TAG, "capture client connected");
 
         bool alive = handle_config(client);
@@ -378,6 +474,7 @@ static void capture_task(void *arg)
         }
 
         close(client);
+        s_net.video_fd = -1;
         s_net.configured = false;
         s_source.width = 0;
         s_source.height = 0;
@@ -429,31 +526,12 @@ void audio_capture_task(void *arg)
     (void)arg;
     const uint16_t port = (uint16_t)(s_net.port + 1);
     for (;;) {
-        struct sockaddr_in addr = {
-            .sin_family = AF_INET,
-            .sin_port = htons(port),
-            .sin_addr.s_addr = htonl(INADDR_ANY),
-        };
-        int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (listener < 0) {
+        int client = wait_for_peer(port);
+        if (client < 0) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        int reuse = 1;
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-            listen(listener, 1) != 0) {
-            ESP_LOGE(TAG, "cannot listen on TCP %u", (unsigned)port);
-            close(listener);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
-        }
-        ESP_LOGI(TAG, "waiting for an audio client on TCP %u", (unsigned)port);
-        int client = accept(listener, NULL, NULL);
-        close(listener);
-        if (client < 0) {
-            continue;
-        }
+        s_net.audio_fd = client;
         int window = 64 * 1024;
         setsockopt(client, SOL_SOCKET, SO_RCVBUF, &window, sizeof(window));
         /* A new audio client means a new run: the counters describe it alone. */
@@ -475,6 +553,7 @@ void audio_capture_task(void *arg)
             }
         }
         close(client);
+        s_net.audio_fd = -1;
         ESP_LOGW(TAG, "audio client disconnected (%u frame(s) dropped)",
                  (unsigned)s_net.audio_dropped);
         s_net.audio_dropped = 0;
@@ -560,12 +639,103 @@ static esp_err_t net_next_frame(void *user, const uint8_t **au, size_t *len, boo
     }
 }
 
+static void pull_store(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(PULL_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "cannot persist the pull target");
+        return;
+    }
+    if (s_net.pull_host[0] == '\0') {
+        nvs_erase_key(handle, PULL_NVS_HOST);
+        nvs_erase_key(handle, PULL_NVS_PORT);
+    } else {
+        nvs_set_str(handle, PULL_NVS_HOST, s_net.pull_host);
+        nvs_set_u16(handle, PULL_NVS_PORT, s_net.pull_port);
+    }
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void pull_load(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(PULL_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+    size_t len = sizeof(s_net.pull_host);
+    uint16_t port = 0;
+    if (nvs_get_str(handle, PULL_NVS_HOST, s_net.pull_host, &len) == ESP_OK &&
+        nvs_get_u16(handle, PULL_NVS_PORT, &port) == ESP_OK && port != 0) {
+        s_net.pull_port = port;
+        s_net.pull_on = true;
+        ESP_LOGI(TAG, "pull target from NVS: %s:%u", s_net.pull_host, (unsigned)port);
+    }
+    nvs_close(handle);
+}
+
+bool media_net_pull(const char *host, uint16_t port)
+{
+    if (host == NULL || host[0] == '\0' || port == 0) {
+        media_net_pull_stop();
+        return true;
+    }
+    if (strlen(host) >= sizeof(s_net.pull_host)) {
+        return false;
+    }
+    /* A different target means the connection in flight points at the old one. */
+    if (strcmp(s_net.pull_host, host) != 0 || s_net.pull_port != port) {
+        media_net_pull_stop();
+    }
+    strncpy(s_net.pull_host, host, sizeof(s_net.pull_host) - 1);
+    s_net.pull_host[sizeof(s_net.pull_host) - 1] = '\0';
+    s_net.pull_port = port;
+    s_net.pull_on = true;
+    pull_store();
+    ESP_LOGI(TAG, "pulling the capture stream from %s:%u", host, (unsigned)port);
+    return true;
+}
+
+void media_net_pull_stop(void)
+{
+    if (!s_net.pull_on) {
+        return;
+    }
+    s_net.pull_on = false;
+    s_net.pull_host[0] = '\0';
+    s_net.pull_port = 0;
+    pull_store();
+    /* A connection that is already pulling sits in recv(); shutting it down is
+     * what gets the task back to waiting for a client. */
+    int video = s_net.video_fd;
+    int audio = s_net.audio_fd;
+    if (video >= 0) {
+        shutdown(video, SHUT_RDWR);
+    }
+    if (audio >= 0) {
+        shutdown(audio, SHUT_RDWR);
+    }
+    ESP_LOGI(TAG, "pull stopped; waiting for a capture client again");
+}
+
+const char *media_net_pull_target(void)
+{
+    static char text[80];
+    text[0] = '\0';
+    if (s_net.pull_on) {
+        snprintf(text, sizeof(text), "%s:%u", s_net.pull_host, (unsigned)s_net.pull_port);
+    }
+    return text;
+}
+
 bool media_net_init(uint16_t port)
 {
     if (s_net.queued != NULL) {
         return true;
     }
     s_net.port = port;
+    s_net.video_fd = -1;
+    s_net.audio_fd = -1;
     s_net.avcc = big_alloc(NET_AVCC_CAP);
     if (s_net.avcc == NULL) {
         ESP_LOGE(TAG, "no memory for the codec record");
@@ -608,6 +778,7 @@ bool media_net_init(uint16_t port)
         .next_frame = net_next_frame,
         .user = NULL,
     };
+    pull_load();
     return true;
 }
 

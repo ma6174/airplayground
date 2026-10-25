@@ -24,8 +24,10 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 环境变量：`HS_MCP_HOST`/`HS_MCP_PORT`（HTTP 监听，默认 127.0.0.1:8390）、
 `HS_MCP_HS`（hs 命令路径，默认 ~/bin/hs）、`HS_MCP_TYPEIN`（默认锚定仓库内 tools/typein）、
 `HS_MCP_SHOT_DIR`（截图临时目录，默认 /tmp/hs-mcp）、
-`HS_MCP_DEVICE`（小智固件设备 8080 地址，默认 http://192.168.1.137:8080，供 `screen_look`/`cast_to_tv` 用）、
-`HS_MCP_CAPTURE_CLI`（推流工具路径，默认仓库内 `macos/capture-cli/capture-cli`）。
+`HS_MCP_DEVICE`（显式指定小智固件设备的 8080 地址；不用时自动发现，见下文）、
+`HS_MCP_CAPTURE_CLI`（推流工具路径，默认仓库内 `macos/capture-cli/capture-cli`）、
+`HS_MCP_CAST_HOST`（拉流时要告诉设备的本机地址，默认从 ifconfig 取同网段地址）、
+`HS_MCP_RELAY_PORT`（拉流时本地 relay 的视频端口，默认 8090，音频用 8091）。
 
 前置条件：Hammerspoon.app 正在运行（报 "can't access Hammerspoon message port"
 时先 `open -a Hammerspoon`）。`typein` 需要运行本服务的宿主 App 持有「辅助功能」授权
@@ -44,7 +46,8 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 | `open_url` | 用默认程序打开 http(s) 网址 |
 | `screenshot_image` | 截屏返回 JPEG（MCP image content）；可选 `app` 参数只截该应用当前窗口，否则全屏。**小智语音链路不消费图片**，看屏幕内容用 `screen_look` |
 | `screen_look` | **看屏幕并回答问题（小智场景用这个）**：截图 → 推给小智固件的 `/vision/explain` → 走云端视觉模型 → 返回文字描述。可选 `app` 参数 |
-| `cast_to_tv` | **把某个应用窗口或整个屏幕投到电视**（capture-cli → 设备 8090 → AirPlay）。`app` 空=整屏，`tv` 指定电视名，`audio=true` 连 Mac 系统声音 |
+| `cast_to_tv` | **把某个应用窗口或整个屏幕投到电视**。`app` 空=整屏，`tv` 指定电视名，`audio=true` 连 Mac 系统声音，`mode` 选 `push`（默认，本机推给设备）或 `pull`（设备来本机拉，断线自恢复）|
+| `find_device` | 找小智设备的地址和当前投屏状态（换了电脑/设备重启换了 IP 也能扫出来） |
 | `stop_cast` | 停止投屏，电视回到设备自己的界面 |
 | `clipboard_set` / `clipboard_get` | 写/读系统剪贴板 |
 | `say` | TTS 朗读 |
@@ -52,13 +55,21 @@ uv run tools/hs_mcp/server.py --http    # 默认 127.0.0.1:8390
 
 应用名注意：很多应用实际名是英文（TextEdit、Calculator），不确定先 `list_running_apps`。
 
+### 设备地址不用配
+
+设备没有 mDNS，只有一个 DHCP 主机名，重启后地址可能变；服务也不一定总在这台电脑上跑。
+所以设备地址按这个顺序取：`HS_MCP_DEVICE`（显式）→ 上次发现的（`/tmp/hs-mcp/device.txt`，
+用前先验证 `/airplay/status` 确实是设备）→ 扫本机所有私网 /24 的 8080（实测 508 个地址约 3 秒）。
+扫到的地址会写进缓存，下次直接就命中。
+
 ### 为什么小智看不到 screenshot
 
 小智 LLM 不消费 MCP 工具返回的图片（image content 会丢），它的视觉走设备侧链路：
 图片 → 云端视觉接口 → **文字回答** → 进对话。所以给小智用的是 `screen_look`：
-Mac 截图后推给小智固件设备的 `/vision/explain` 端点（`HS_MCP_DEVICE`，默认
-`http://192.168.1.137:8080`），设备用自己的 explain URL/token（MCP initialize 时
+Mac 截图后推给小智固件设备的 `/vision/explain` 端点（设备地址按上文的发现规则，
+也可用 `HS_MCP_DEVICE` 直接指定），设备用自己的 explain URL/token（MCP initialize 时
 云端下发的 vision 能力）上传视觉模型，把文字答案原路返回。要求固件包含该端点。
+设备在重建投屏会话时会瞬时断连，`screen_look` 因此失败时会自动重试一次。
 
 ## 把 Mac 窗口/屏幕投到电视（`cast_to_tv`）
 
@@ -78,6 +89,19 @@ Mac 截图后推给小智固件设备的 `/vision/explain` 端点（`HS_MCP_DEVI
 设备在推流客户端连上/断开时会自己重开会话切换视频源，所以 `stop_cast` 之后电视会自动回到
 设备的界面。投屏期间助手的声音留在设备扬声器（电视的音频通道让给画面）。
 `audio=true` 则把 Mac 的系统输出声音一起送到电视（整个系统，不是某个应用）。
+
+### push 与 pull
+
+| | `mode="push"`（默认） | `mode="pull"` |
+|---|---|---|
+| 谁建连接 | 本机连设备 8090 | 设备连本机 8090（地址存在设备 NVS 里）|
+| 设备重启后 | 电视停在设备界面，要再说一次投屏 | 设备自己连回来，会话由 watchdog 接回，电视自动恢复 |
+| 适用场景 | 同一局域网、临时投一下 | 长期挂着；本机在 NAT 后面；以后换成云上机器 |
+
+拉流时本服务进程内起一个 relay（`8090`/`8091`）：capture-cli 连本机端口，设备连本机网卡地址，
+两边在这里对接。设备断开时 capture-cli 留在原地继续读（帧丢掉），设备重连后 relay 会补发
+它错过的 configure 包（SPS/PPS），画面几秒内自己回来。`stop_cast` 会先清掉设备上的拉流目标，
+再停 relay 和推流进程，所以停机是停得住的。
 
 前置条件：跑过一次 `macos/capture-cli/build.sh`（产物不进 git），并给运行本服务的宿主 App
 屏幕录制授权；二进制路径可用 `HS_MCP_CAPTURE_CLI` 覆盖。

@@ -34,6 +34,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -66,6 +67,10 @@ _CAPTURE_DEFAULT = Path(__file__).resolve().parents[2] / "macos/capture-cli/capt
 CAPTURE_CLI = Path(os.environ.get("HS_MCP_CAPTURE_CLI", _CAPTURE_DEFAULT))
 CAST_PID = SHOT_DIR / "cast.pid"
 CAST_LOG = SHOT_DIR / "cast.log"
+# 拉流时本地 relay 的最小端口（音频用 +1，跟 capture-cli 的约定一致）
+RELAY_PORT = int(os.environ.get("HS_MCP_RELAY_PORT", "8090"))
+# 当前投流的完整命令，watchdog 靠它把断掉的流拉回来
+CAST_STATE = SHOT_DIR / "cast.state"
 
 mcp = FastMCP(
     "hammerspoon",
@@ -600,8 +605,292 @@ def _ensure_mirroring(tv: str = "") -> str:
     return "the TV did not come up in time"
 
 
+# ---- 拉流：设备反过来连这台电脑，断线自己重连 ----
+
+
+def _my_ip() -> str:
+    """这台电脑在设备能看到的那个网络上的地址（HS_MCP_CAST_HOST 可覆盖）。"""
+    forced = os.environ.get("HS_MCP_CAST_HOST", "").strip()
+    if forced:
+        return forced
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True,
+                             timeout=5, stdin=subprocess.DEVNULL).stdout
+    except Exception as e:
+        raise RuntimeError(f"读不到本机地址（{e}）；用 HS_MCP_CAST_HOST=<ip> 指定")
+    device_ip = urllib.parse.urlsplit(_device_base()).hostname or ""
+    same = device_ip.rsplit(".", 1)[0] + "." if device_ip.count(".") == 3 else ""
+    fallback = ""
+    for m in re.finditer(r"\binet (\d+\.\d+\.\d+\.\d+)", out):
+        ip = m.group(1)
+        if ip.startswith(("127.", "169.254", "100.64", "198.18", "198.19")):
+            continue
+        if same and ip.startswith(same):
+            return ip
+        fallback = fallback or ip
+    if not fallback:
+        raise RuntimeError("找不到本机的局域网地址；用 HS_MCP_CAST_HOST=<ip> 指定")
+    return fallback
+
+
+def _set_pull(target: str) -> dict:
+    """让设备来这台电脑拉流（target 空 = 改回等别人推）。"""
+    return _device_get(f"/airplay/pull?host={urllib.parse.quote(target)}")
+
+
+def _close_quietly(sock) -> None:
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+class _Relay:
+    """把 capture-cli 的推流交给主动来拉的设备。
+
+    capture-cli 不关心谁在收，它只连本机端口；设备拉流时连的是这台机器的网卡地址。
+    两边都在这里落脚：来自 127.x 的是推流端，来自局域网地址的是设备。
+
+    设备断开时推流端留着继续读（帧丢掉，它下一个关键帧就把参考链补回来），下一台
+    设备连上接的是同一条流——设备重启后自己连回来，没有人需要重新发起投屏。
+    """
+
+    def __init__(self, port: int):
+        self.port = port
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.listeners: list[socket.socket] = []
+        self.capture: dict[int, socket.socket] = {}
+        self.device: dict[int, socket.socket] = {}
+        # 第一个 configure 包（几何 + SPS/PPS）和设备是否已经收到过数据。
+        # capture-cli 只在连接建立时发一次 configure，设备重连时它早已发过了，
+        # 没有这个包设备就一直停在“未配置”，画面永远不出现。
+        self.configure: dict[int, bytes] = {}
+        self.head_buf: dict[int, bytes] = {}
+        self.forwarded: dict[int, bool] = {}
+
+    def start(self) -> None:
+        for port in (self.port, self.port + 1):
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                srv.bind(("0.0.0.0", port))
+                srv.listen(4)
+            except OSError as e:
+                _close_quietly(srv)
+                raise RuntimeError(
+                    f"本机端口 {port} 起不来（{e}）；用 HS_MCP_RELAY_PORT 换一个")
+            srv.settimeout(0.5)
+            self.listeners.append(srv)
+            threading.Thread(target=self._accept_loop, args=(srv, port),
+                             daemon=True).start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        for srv in self.listeners:
+            _close_quietly(srv)
+        with self.lock:
+            socks = list(self.capture.values()) + list(self.device.values())
+            self.capture.clear()
+            self.device.clear()
+        for sock in socks:
+            _close_quietly(sock)
+
+    def _accept_loop(self, srv: socket.socket, port: int) -> None:
+        while not self.stop_event.is_set():
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if addr[0].startswith("127."):
+                old = self.capture.get(port)
+                self.capture[port] = conn
+                _close_quietly(old)
+                threading.Thread(target=self._pump_capture, args=(conn, port),
+                                 daemon=True).start()
+                _log(f"relay: capture client on {port}")
+            else:
+                old = self.device.get(port)
+                self.device[port] = conn
+                _close_quietly(old)
+                # 重连的设备错过了 configure（它已经当帧被丢掉过一次）：先补上
+                cfg = self.configure.get(port)
+                if cfg and self.forwarded.get(port):
+                    try:
+                        conn.sendall(cfg)
+                        _log(f"relay: replayed the configure packet on {port}")
+                    except OSError:
+                        _close_quietly(conn)
+                        self.device.pop(port, None)
+                        return
+                threading.Thread(target=self._pump_device, args=(conn, port),
+                                 daemon=True).start()
+                _log(f"relay: device {addr[0]} on {port}")
+
+    def _track_configure(self, port: int, data: bytes) -> None:
+        """记住视频端口的 configure 包，供后面的设备重连时重放。"""
+        if port != self.port or port in self.configure:
+            return
+        buf = self.head_buf.get(port, b"") + data
+        if len(buf) < 18:
+            self.head_buf[port] = buf
+            return
+        if buf[:4] != b"APVN" or buf[4] != 1:
+            self.head_buf.pop(port, None)  # 首包不是 configure，不必再找
+            return
+        need = 18 + int.from_bytes(buf[14:16], "big") + int.from_bytes(buf[16:18], "big")
+        if len(buf) < need:
+            self.head_buf[port] = buf
+            return
+        self.configure[port] = buf[:need]
+        self.head_buf.pop(port, None)
+        _log(f"relay: kept the {need}-byte configure packet for reconnects")
+
+    def _pump_capture(self, conn: socket.socket, port: int) -> None:
+        while not self.stop_event.is_set():
+            try:
+                data = conn.recv(65536)
+            except OSError:
+                break
+            if not data:
+                break
+            self._track_configure(port, data)
+            with self.lock:
+                dev = self.device.get(port)
+            if dev is None:
+                continue
+            try:
+                dev.sendall(data)
+                self.forwarded[port] = True
+            except OSError:
+                with self.lock:
+                    if self.device.get(port) is dev:
+                        self.device.pop(port, None)
+                _close_quietly(dev)
+        with self.lock:
+            if self.capture.get(port) is conn:
+                self.capture.pop(port, None)
+        _close_quietly(conn)
+
+    def _pump_device(self, conn: socket.socket, port: int) -> None:
+        """设备发回来的只有音频的 arm byte（以及将来可能的控制字节）。"""
+        while not self.stop_event.is_set():
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                break
+            if not data:
+                break
+            with self.lock:
+                cap = self.capture.get(port)
+            if cap is None:
+                continue
+            try:
+                cap.sendall(data)
+            except OSError:
+                pass
+        with self.lock:
+            if self.device.get(port) is conn:
+                self.device.pop(port, None)
+        _close_quietly(conn)
+
+
+_RELAY: _Relay | None = None
+
+
+def _spawn_capture(args: list[str]) -> subprocess.Popen:
+    SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    with CAST_LOG.open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=log,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    CAST_PID.write_text(str(proc.pid))
+    _log("cast start: " + " ".join(args))
+    return proc
+
+
+def _cast_state_read() -> dict:
+    try:
+        state = json.loads(CAST_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _cast_state_write(state: dict) -> None:
+    try:
+        SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        CAST_STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_watchdog_lock = threading.Lock()
+_watchdog_started = False
+# 刚重开过的会话给足建立时间：会话建立期间 status 也是 running=false，
+# 不等就再开一次，只会把刚接上的会话又敲断
+_last_reopen = 0.0
+
+
+def _start_watchdog() -> None:
+    """盯着推流进程：设备重启、电视重开会话、电脑睡眠都能把它弄死。
+
+    拉流模式下设备会自己连回来，但 capture-cli 本身也因连接断开而退出，所以两种
+    模式都需要这一层：进程没了就按记录下来的命令重起一路。
+    """
+    global _watchdog_started
+    with _watchdog_lock:
+        if _watchdog_started:
+            return
+        _watchdog_started = True
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
+
+
+def _watchdog_loop() -> None:
+    while True:
+        time.sleep(5)
+        try:
+            state = _cast_state_read()
+            if not state.get("args"):
+                continue
+            if _cast_pid() is None:
+                _log("watchdog: the capture stream died, starting it again")
+                _spawn_capture(state["args"])
+                continue
+            if state.get("pull"):
+                _reopen_pull_session(state)
+        except Exception as e:  # 守护线程不能再死一次
+            _log(f"watchdog: {e}")
+
+
+def _reopen_pull_session(state: dict) -> None:
+    """设备重启后会话就没了：流还在拉，但没人在投屏。
+
+    把会话接回去是拉流真正的意义——用户只说了一次“投上去”，设备重启、电视断电
+    回来都不该再问一遍。停机意图由 stop_cast 表达（它会先把拉流目标清掉）。
+    """
+    global _last_reopen
+    if time.time() - _last_reopen < 20:
+        return
+    try:
+        st = _device_get("/airplay/status")
+    except RuntimeError:
+        return  # 设备不在线，下一轮再看
+    if st.get("running") or st.get("pin_required"):
+        return
+    _log("watchdog: the device has no session, reopening it")
+    _last_reopen = time.time()
+    note = _ensure_mirroring(state.get("tv") or "")
+    if note:
+        _log(f"watchdog: cannot reopen the session ({note})")
+
+
 @tool()
-def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20) -> str:
+def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20,
+               mode: str = "push") -> str:
     """把 Mac 上的某个应用窗口（或整个屏幕）投到电视上，电视改显示它而不是设备的界面。
 
     用户说“把某某投到电视”“让电视显示这个窗口”时用这个工具。
@@ -610,8 +899,12 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20) -
     tv 传电视名称（如 "我的Play 5"，取自设备发现列表），空则复用当前/上次的电视；
     局域网里有多台接收器时会报出名字让用户选。
     audio=True 时连 Mac 的系统声音一起送过去（整个系统的输出声音，不是某个应用；默认开）。
+    mode 默认 "push"：这台电脑主动推给设备。"pull"：反过来让设备来这台电脑拉，地址记在
+    设备里，设备重启/断线后自己连回来（电视自动恢复），也适用于这台电脑在 NAT 后面
+    或将来换成云上机器、无法被推的情况。
     停止投回设备界面用 stop_cast。投屏期间助手的声音留在设备扬声器（不占电视的音频通道）。
     """
+    global _RELAY
     cli = _capture_bin()
     note = _ensure_mirroring(tv)
     if note == "pin required":
@@ -635,11 +928,10 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20) -
             names = sorted({w["app"] for w in windows if w["app"]})
             raise RuntimeError(
                 f"没找到 {app} 的窗口。当前有窗口的应用：{', '.join(names[:15])}")
-        target = hit[0]
-        args += ["--window-id", str(target["id"])]
-        label = (f'{target["app"]} "{target["title"]}"' if target["title"]
-                 else target["app"])
-        src_w, src_h = target["w"], target["h"]
+        win = hit[0]
+        args += ["--window-id", str(win["id"])]
+        label = f'{win["app"]} "{win["title"]}"' if win["title"] else win["app"]
+        src_w, src_h = win["w"], win["h"]
     else:
         displays, _ = _capture_list()
         if not displays:
@@ -655,30 +947,44 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20) -
     args += ["--fps", str(fps)]
     if audio:
         args.append("--audio")
-    dev_host = urllib.parse.urlsplit(_device_base()).hostname or ""
-    args += ["--tcp", f"{dev_host}:8090"]
+    pull = mode.strip().lower() == "pull"
+    target = ""
+    if pull:
+        # relay 先就位：设备拉的是它的网卡地址，而 capture-cli 只会连本机端口
+        if _RELAY is None:
+            _RELAY = _Relay(RELAY_PORT)
+            _RELAY.start()
+        args += ["--tcp", f"127.0.0.1:{RELAY_PORT}"]
+    else:
+        dev_host = urllib.parse.urlsplit(_device_base()).hostname or ""
+        args += ["--tcp", f"{dev_host}:8090"]
+        target = f"{dev_host}:8090"
 
-    SHOT_DIR.mkdir(parents=True, exist_ok=True)
-    with CAST_LOG.open("w", encoding="utf-8") as log:
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=log,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-    CAST_PID.write_text(str(proc.pid))
-    _log("cast start: " + " ".join(args))
+    proc = _spawn_capture(args)
+    base_state = {"args": args, "mode": "pull" if pull else "push", "label": label, "tv": tv}
+    _cast_state_write(base_state)
+    if pull:
+        target = f"{_my_ip()}:{RELAY_PORT}"
+        # 设备把这个地址记在 NVS 里，重启后自己连回来，不需要谁再发一次投屏
+        _set_pull(target)
+        _cast_state_write({**base_state, "pull": target})
 
     # 设备检测到推流客户端后会自己重开会话切源，所以这里等会话真的跑在 capture 上：
     # source 是会话开始时就定下的，单看它会被上一场会话骗到
     st = {}
     for _ in range(60):
-        if proc.poll() is not None:
-            CAST_PID.unlink(missing_ok=True)
+        # 看 pid 文件而不是 proc 对象：watchdog 可能已经把它重起过一次了
+        if _cast_pid() is None:
             tail = CAST_LOG.read_text(encoding="utf-8", errors="replace")[-400:].strip()
-            raise RuntimeError(f"capture-cli 退出了（{proc.returncode}）：{tail}")
+            raise RuntimeError(f"capture-cli 退出了：{tail}")
         st = _device_get("/airplay/status")
         if st.get("running") and st.get("capture_client") and st.get("source") == "capture":
             size = f"{w}x{h}@{fps}fps" + (" + audio" if audio else "")
-            return f"casting {label} to the TV ({size})"
+            how = (f"the device pulled it from {target}" if pull
+                   else f"pushed to {target}")
+            return f"casting {label} to the TV ({size}, {how})"
         time.sleep(0.5)
-    return (f"started sending {label} to {dev_host}:8090, but the device still reports "
+    return (f"started sending {label} to {target}, but the device still reports "
             f"source={st.get('source')!r} capture_client={st.get('capture_client')!r}; "
             f"check {CAST_LOG} and the device log")
 
@@ -686,6 +992,18 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20) -
 @tool()
 def stop_cast() -> str:
     """停止把 Mac 窗口/屏幕投到电视，电视回到设备自己的界面。"""
+    global _RELAY
+    state = _cast_state_read()
+    if state.get("pull"):
+        # 留着的拉流目标会让设备重连回来，电视就停不下来
+        try:
+            _set_pull("")
+        except RuntimeError:
+            pass
+    if _RELAY is not None:
+        _RELAY.close()
+        _RELAY = None
+    CAST_STATE.unlink(missing_ok=True)
     pid = _cast_pid()
     if pid is None:
         return "not casting"
@@ -822,6 +1140,7 @@ async def run_xiaozhi(url: str) -> None:
 
 
 def main() -> None:
+    _start_watchdog()
     argv = sys.argv[1:]
     if "--http" in argv:
         uvicorn.run(
