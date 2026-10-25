@@ -31,12 +31,14 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -54,8 +56,11 @@ HS = os.environ.get("HS_MCP_HS", str(Path.home() / "bin/hs"))
 _TYPEIN_DEFAULT = Path(__file__).resolve().parent.parent / "typein"
 TYPEIN = Path(os.environ.get("HS_MCP_TYPEIN", _TYPEIN_DEFAULT))
 SHOT_DIR = Path(os.environ.get("HS_MCP_SHOT_DIR", "/tmp/hs-mcp"))
-# 小智固件设备的台架地址（/vision/explain 端点，见 tools/hs_mcp/README）
-DEVICE = os.environ.get("HS_MCP_DEVICE", "http://192.168.1.137:8080").rstrip("/")
+# 小智固件的台架接口（8080）。不写死地址：设备重启会换 DHCP 地址，
+# 且这个仓库的脚本也会在别的电脑上跑——HS_MCP_DEVICE 显式优先，
+# 否则用上次发现的地址，最后才扫本网段。
+DEVICE_ENV = os.environ.get("HS_MCP_DEVICE", "").rstrip("/")
+DEVICE_CACHE = SHOT_DIR / "device.txt"
 # 仓库自带的屏幕/窗口推流工具（macos/capture-cli/build.sh 构建，需要屏幕录制授权）
 _CAPTURE_DEFAULT = Path(__file__).resolve().parents[2] / "macos/capture-cli/capture-cli"
 CAPTURE_CLI = Path(os.environ.get("HS_MCP_CAPTURE_CLI", _CAPTURE_DEFAULT))
@@ -368,9 +373,10 @@ def _post_vision(jpeg: bytes, question: str) -> str:
         "image": base64.b64encode(jpeg).decode(),
     }).encode()
     last: Exception | None = None
+    base = _device_base()
     for attempt in (1, 2):
         req = urllib.request.Request(
-            f"{DEVICE}/vision/explain", data=body,
+            f"{base}/vision/explain", data=body,
             headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=25) as resp:  # 设备上传视觉模型需数秒
@@ -381,7 +387,7 @@ def _post_vision(jpeg: bytes, question: str) -> str:
             if attempt == 1:
                 time.sleep(0.8)
     raise RuntimeError(
-        f"视觉请求失败（设备 {DEVICE}）：{last}。重试一次仍失败：确认设备在线、固件含 "
+        f"视觉请求失败（设备 {base}）：{last}。重试一次仍失败：确认设备在线、固件含 "
         "/vision/explain；设备刚切换投屏源时也会短暂失败，稍等几秒再问")
 
 # ---- 把 Mac 的窗口/屏幕投到电视（capture-cli → 设备 8090 → AirPlay） ----
@@ -395,12 +401,116 @@ def _capture_bin() -> str:
     return str(CAPTURE_CLI)
 
 
-def _device_get(path: str, timeout: float = 8.0) -> dict:
+def _device_ok(base: str) -> bool:
+    """这个地址是不是小智设备：8080 上得有台架 API 的 /airplay/status。"""
     try:
-        with urllib.request.urlopen(f"{DEVICE}{path}", timeout=timeout) as resp:
+        with urllib.request.urlopen(f"{base}/airplay/status", timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return isinstance(data, dict) and "streamed" in data
+    except Exception:
+        return False
+
+
+def _lan_prefixes() -> list[str]:
+    """本机所有私网 /24 前缀（跳过回环、隧道和 Tailscale 网段）。"""
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True,
+                             timeout=5, stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return []
+    prefixes: list[str] = []
+    for m in re.finditer(r"\binet (\d+\.\d+\.\d+)\.\d+", out):
+        prefix = m.group(1)
+        if prefix.startswith(("127.", "169.254", "100.64", "198.18", "198.19")):
+            continue
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+    return prefixes
+
+
+def _port_open(ip: str, port: int, timeout: float = 0.7) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((ip, port)) == 0
+    finally:
+        s.close()
+
+
+def _scan_lan() -> str | None:
+    """扫本网段 8080，返回第一台台架 API 认得的设备。
+
+    线程池而不是 asyncio：工具函数可能在 MCP 的事件循环里被调用，asyncio.run 会直接报错。
+    """
+    hosts = [f"{p}.{i}" for p in _lan_prefixes() for i in range(1, 255)]
+    if not hosts:
+        return None
+    try:
+        with ThreadPoolExecutor(max_workers=48) as pool:
+            futures = {pool.submit(_port_open, ip, 8080): ip for ip in hosts}
+            for fut in as_completed(futures, timeout=12):
+                if not fut.result():
+                    continue
+                base = f"http://{futures[fut]}:8080"
+                if _device_ok(base):
+                    for f in futures:
+                        f.cancel()
+                    return base
+    except Exception:
+        return None
+    return None
+
+
+def _device_base(refresh: bool = False) -> str:
+    """设备地址：HS_MCP_DEVICE > 上次发现的 > 扫网段。换电脑/换 IP 都靠这条。"""
+    if DEVICE_ENV:
+        return DEVICE_ENV
+    if not refresh:
+        try:
+            cached = DEVICE_CACHE.read_text().strip()
+        except OSError:
+            cached = ""
+        if cached and _device_ok(cached):
+            return cached
+    found = _scan_lan()
+    if found is None:
+        raise RuntimeError(
+            "找不到小智设备：确认它已开机并与这台电脑在同一 Wi-Fi；"
+            "或用 HS_MCP_DEVICE=http://<ip>:8080 显式指定")
+    try:
+        SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        DEVICE_CACHE.write_text(found)
+    except OSError:
+        pass
+    _log(f"device found: {found}")
+    return found
+
+
+@tool()
+def find_device(refresh: bool = True) -> str:
+    """找到小智设备（跑固件的板子）的地址和当前投屏状态。
+
+    看屏幕或投屏前不确定设备地址时用它；换了电脑、设备重启后地址变了也能重新扫出来。
+    refresh=True 强制重新扫本网段（默认），False 只看缓存。
+    """
+    base = _device_base(refresh=refresh)
+    try:
+        st = _device_get("/airplay/status")
+    except RuntimeError as e:
+        return f"{base} ({e})"
+    where = "not mirroring"
+    if st.get("running"):
+        where = f"mirroring to {st.get('host') or '?'} (source={st.get('source')})"
+    return f"device: {base} — {where}"
+
+
+def _device_get(path: str, timeout: float = 8.0) -> dict:
+    base = _device_base()
+    try:
+        with urllib.request.urlopen(f"{base}{path}", timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except Exception as e:
-        raise RuntimeError(f"小智设备 {DEVICE} 不可达：{e}")
+        raise RuntimeError(f"小智设备 {base} 不可达：{e}")
     try:
         return json.loads(raw)
     except ValueError:
@@ -491,7 +601,7 @@ def _ensure_mirroring(tv: str = "") -> str:
 
 
 @tool()
-def cast_to_tv(app: str = "", tv: str = "", audio: bool = False, fps: int = 20) -> str:
+def cast_to_tv(app: str = "", tv: str = "", audio: bool = True, fps: int = 20) -> str:
     """把 Mac 上的某个应用窗口（或整个屏幕）投到电视上，电视改显示它而不是设备的界面。
 
     用户说“把某某投到电视”“让电视显示这个窗口”时用这个工具。
@@ -499,7 +609,7 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = False, fps: int = 20) 
     app 留空则投整个屏幕。
     tv 传电视名称（如 "我的Play 5"，取自设备发现列表），空则复用当前/上次的电视；
     局域网里有多台接收器时会报出名字让用户选。
-    audio=True 时连 Mac 的系统声音一起送过去（整个系统的输出声音，不是某个应用）。
+    audio=True 时连 Mac 的系统声音一起送过去（整个系统的输出声音，不是某个应用；默认开）。
     停止投回设备界面用 stop_cast。投屏期间助手的声音留在设备扬声器（不占电视的音频通道）。
     """
     cli = _capture_bin()
@@ -545,7 +655,7 @@ def cast_to_tv(app: str = "", tv: str = "", audio: bool = False, fps: int = 20) 
     args += ["--fps", str(fps)]
     if audio:
         args.append("--audio")
-    dev_host = urllib.parse.urlsplit(DEVICE).hostname or ""
+    dev_host = urllib.parse.urlsplit(_device_base()).hostname or ""
     args += ["--tcp", f"{dev_host}:8090"]
 
     SHOT_DIR.mkdir(parents=True, exist_ok=True)
