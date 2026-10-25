@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 
+#include "airplay/airplay_http.h"
 #include "airplay/airplay_service.h"
 #include "airplay_screen_camera.h"
 #include "application.h"
@@ -26,8 +27,8 @@ private:
     VirtualDisplay* display_ = nullptr;
     AirplayScreenCamera* screen_camera_ = nullptr;
 
-    /* Created on demand and shared by GetCamera() (for the server's vision
-     * capability) and the self.screen.look tool. */
+    /* Created on demand and shared by GetCamera(), which is how the server
+     * hands this board the cloud vision URL/token (see /vision/explain too). */
     AirplayScreenCamera* ScreenCamera() {
         if (screen_camera_ == nullptr) {
             screen_camera_ = new AirplayScreenCamera(VIRTUAL_DISPLAY_WIDTH, VIRTUAL_DISPLAY_HEIGHT);
@@ -229,33 +230,12 @@ private:
                 return std::string("shown");
             });
 
-        /* Distinct from self.camera.take_photo: that one keeps the generic
-         * camera semantics (and indeed photographs the room on boards with a
-         * camera), while looking at the screen is its own verb on a board
-         * whose only image is the one it mirrors to the TV. */
-        mcp_server.AddTool(
-            "self.screen.look",
-            "Look at the screen: examine what this device is currently showing on the TV it "
-            "mirrors to (its own interface when not mirroring). The image comes from the display "
-            "frame buffer, not from a camera, so this never sees the room or the user.\n"
-            "Use it when the user asks what is on the screen or TV, asks you to look at / check "
-            "the screen, or when you want to verify what you are currently displaying.\n"
-            "Args:\n"
-            "  `question`: what to check about the screen, e.g. \"what text is shown?\" or "
-            "\"what colour is the background?\"\n"
-            "Return:\n"
-            "  A JSON object with the vision service's answer about the screen.",
-            PropertyList({Property("question", kPropertyTypeString)}),
-            [this](const PropertyList& properties) -> ToolResult {
-                auto* camera = ScreenCamera();
-                if (!camera->Capture()) {
-                    return std::unexpected("Failed to capture the screen");
-                }
-                auto result = camera->Explain(properties["question"].value<std::string>());
-                if (!result) {
-                    return std::unexpected(std::move(result.error()));
-                }
-                return std::move(*result);
+        /* Let the bench API (/vision/explain) ask the cloud vision service
+         * about screenshots pushed from the computer, reusing the explain
+         * URL/token the server delivers through GetCamera(). */
+        AirplayHttpSetVisionExplain(
+            [this](const uint8_t* jpeg, size_t jpeg_len, const std::string& question) {
+                return ScreenCamera()->ExplainJpeg(jpeg, jpeg_len, question);
             });
     }
 

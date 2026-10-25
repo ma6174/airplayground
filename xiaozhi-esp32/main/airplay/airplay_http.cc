@@ -1,6 +1,7 @@
 #include "airplay_http.h"
 
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -8,9 +9,16 @@
 #include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include <mbedtls/base64.h>
+
+#include <cJSON.h>
 
 #include "airplay_service.h"
 #include "display/virtual_display.h"
+
+extern "C" {
+#include "media_net.h"
+}
 
 #define TAG "AirplayHttp"
 
@@ -20,6 +28,9 @@ constexpr int kMaxQuery = 96;
 /* One screen of text; the POST body carries it raw so the model can send any
  * UTF-8 without percent-encoding games. */
 constexpr size_t kMaxText = 512;
+/* /vision/explain JSON body cap: base64 of a 1600px JPEG plus the question.
+ * One megabyte covers it with room to spare and stays PSRAM-friendly. */
+constexpr size_t kMaxVisionBody = 1024 * 1024;
 
 /* esp_http_server hands the query string over verbatim, so percent-escapes and
  * '+' for space are still in it. Receiver names are UTF-8 here: the projector
@@ -85,6 +96,33 @@ esp_err_t StartHandler(httpd_req_t* req) {
 esp_err_t StopHandler(httpd_req_t* req) {
     AirplayService::GetInstance().Stop();
     return Reply(req, "{\"stopping\":true}");
+}
+
+/* "host:port" makes the device dial a streaming server instead of waiting for
+ * one. A host that cannot reach the device - a laptop behind NAT, a machine on
+ * another network - still gets its screen on the TV this way, and the target is
+ * kept in NVS so a reboot resumes without asking again. An empty host clears it. */
+esp_err_t PullHandler(httpd_req_t* req) {
+    char host[kMaxQuery] = {0};
+    QueryValue(req, "host", host, sizeof(host));
+    if (host[0] == '\0') {
+        media_net_pull_stop();
+        return Reply(req, "{\"ok\":true,\"pull\":\"\"}");
+    }
+    std::string target(host);
+    uint16_t port = 8090;
+    const size_t colon = target.rfind(':');
+    if (colon != std::string::npos) {
+        port = static_cast<uint16_t>(strtoul(target.c_str() + colon + 1, nullptr, 10));
+        target.erase(colon);
+    }
+    if (!media_net_pull(target.c_str(), port)) {
+        return Reply(req, "{\"ok\":false,\"error\":\"bad pull target\"}");
+    }
+    char body[128];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"pull\":\"%s:%u\"}", target.c_str(),
+             static_cast<unsigned>(port));
+    return Reply(req, body);
 }
 
 esp_err_t PinHandler(httpd_req_t* req) {
@@ -186,6 +224,74 @@ esp_err_t TextHandler(httpd_req_t* req) {
 
 }  // namespace
 
+static httpd_handle_t s_server = nullptr;
+static VisionExplainFn s_vision_explain;
+
+void AirplayHttpSetVisionExplain(VisionExplainFn fn) { s_vision_explain = std::move(fn); }
+
+/* Body: {"question": "...", "image": "<base64 JPEG>"}. Forwards the image to
+ * the cloud vision pipeline and returns its answer text. The upload inside
+ * takes seconds, so callers should keep generous HTTP timeouts. */
+esp_err_t VisionExplainHandler(httpd_req_t* req) {
+    if (!s_vision_explain) {
+        return Reply(req, "{\"ok\":false,\"error\":\"vision explain not wired on this board\"}");
+    }
+    const int content_len = req->content_len;
+    if (content_len <= 0 || static_cast<size_t>(content_len) > kMaxVisionBody) {
+        return Reply(req, "{\"ok\":false,\"error\":\"body missing or too large\"}");
+    }
+    auto* body = static_cast<char*>(heap_caps_malloc(content_len + 1, MALLOC_CAP_SPIRAM));
+    if (body == nullptr) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no memory\"}");
+    }
+    size_t total = 0;
+    while (total < static_cast<size_t>(content_len)) {
+        const int want = content_len - static_cast<int>(total);
+        const int got = httpd_req_recv(req, body + total, want);
+        if (got <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(got);
+    }
+    body[total] = '\0';
+
+    std::string reply;
+    cJSON* json = cJSON_Parse(body);
+    heap_caps_free(body);
+    const cJSON* question = json ? cJSON_GetObjectItem(json, "question") : nullptr;
+    const cJSON* image = json ? cJSON_GetObjectItem(json, "image") : nullptr;
+    if (!cJSON_IsString(question) || !cJSON_IsString(image)) {
+        reply = "{\"ok\":false,\"error\":\"question and image (base64 JPEG) required\"}";
+    } else {
+        const size_t b64_len = strlen(image->valuestring);
+        const size_t jpeg_cap = b64_len / 4 * 3 + 3;
+        auto* jpeg = static_cast<uint8_t*>(heap_caps_malloc(jpeg_cap, MALLOC_CAP_SPIRAM));
+        size_t jpeg_len = 0;
+        if (jpeg == nullptr ||
+            mbedtls_base64_decode(jpeg, jpeg_cap, &jpeg_len,
+                                  reinterpret_cast<const unsigned char*>(image->valuestring),
+                                  b64_len) != 0 ||
+            jpeg_len == 0) {
+            reply = "{\"ok\":false,\"error\":\"invalid base64 image\"}";
+        } else {
+            auto result = s_vision_explain(jpeg, jpeg_len, question->valuestring);
+            if (result) {
+                reply = std::move(*result);
+            } else {
+                std::string escaped;
+                for (char c : result.error()) {
+                    if (c == '"' || c == '\\') escaped += '\\';
+                    escaped += c;
+                }
+                reply = "{\"ok\":false,\"error\":\"" + escaped + "\"}";
+            }
+        }
+        heap_caps_free(jpeg);
+    }
+    cJSON_Delete(json);
+    return Reply(req, reply.c_str());
+}
+
 void AirplayHttpStart() {
     static bool started = false;
     if (started) {
@@ -198,27 +304,38 @@ void AirplayHttpStart() {
     config.lru_purge_enable = true;
     /* The screenshot endpoint runs the software H.264 encoder in the handler. */
     config.stack_size = 32768;
+    /* Built-ins plus board-registered endpoints; over the default 8 new URIs
+     * would silently 404. */
+    config.max_uri_handlers = 16;
+    /* The bench API is polled by one client at a time, so holding seven sockets
+     * open is pure loss: a mirroring session plus a pull connection can need
+     * every one of them, and when the pool runs out httpd stops accepting and
+     * /airplay/status goes silent. */
+    config.max_open_sockets = 4;
 
     httpd_handle_t server = nullptr;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "cannot start the debug HTTP server");
         return;
     }
+    s_server = server;
 
     const httpd_uri_t uris[] = {
         {.uri = "/airplay/status", .method = HTTP_GET, .handler = StatusHandler, .user_ctx = nullptr},
         {.uri = "/airplay/start", .method = HTTP_GET, .handler = StartHandler, .user_ctx = nullptr},
         {.uri = "/airplay/stop", .method = HTTP_GET, .handler = StopHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/pull", .method = HTTP_GET, .handler = PullHandler, .user_ctx = nullptr},
         {.uri = "/airplay/pin", .method = HTTP_GET, .handler = PinHandler, .user_ctx = nullptr},
         {.uri = "/airplay/screen.raw", .method = HTTP_GET, .handler = ScreenHandler, .user_ctx = nullptr},
         {.uri = "/airplay/frame.h264", .method = HTTP_GET, .handler = FrameHandler, .user_ctx = nullptr},
         {.uri = "/airplay/discover", .method = HTTP_GET, .handler = DiscoverHandler, .user_ctx = nullptr},
         {.uri = "/airplay/text", .method = HTTP_POST, .handler = TextHandler, .user_ctx = nullptr},
+        {.uri = "/vision/explain", .method = HTTP_POST, .handler = VisionExplainHandler, .user_ctx = nullptr},
     };
     for (const auto& uri : uris) {
         httpd_register_uri_handler(server, &uri);
     }
     ESP_LOGI(TAG,
              "bench API on http://<device>:8080/airplay/"
-             "{status,start,stop,pin,screen.raw,frame.h264,discover,text}");
+             "{status,start,stop,pull,pin,screen.raw,frame.h264,discover,text} + /vision/explain");
 }

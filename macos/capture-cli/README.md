@@ -140,3 +140,4 @@ converted = sent × 7.982 ms + queues + dropped
 - 窗口捕获（`--window-id`）在开始前会预热 CoreGraphics（`CGWindowListCopyWindowInfo`），
   否则 `SCContentFilter(desktopIndependentWindow:)` 会因 `CGS_REQUIRE_INIT` 断言崩溃。
 - ScreenCaptureKit 只在内容变化时产帧，静止窗口的帧率会低于 `--fps`。
+- **窗口被其他应用完全遮挡后就停止出帧**：macOS 会节流、甚至暂停对被完全遮挡窗口的绘制（CoreAnimation 的省电优化），而 ScreenCaptureKit 只是被动读 WindowServer 里已合成的表面，于是没有新帧、下游停在最后一帧。没有公开 API 能绕开（`NSWindow.occlusionState` 只能读，`SCStreamConfiguration` 也没有相关开关），唯一办法是让目标窗口保持可见。注意这与“不需要在前台”不矛盾：不遮挡就照常出帧，遮挡了才停。

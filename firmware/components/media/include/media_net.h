@@ -26,6 +26,22 @@ bool media_net_start(void);
  * falls back to its other content sources until then. */
 bool media_net_ready(void);
 
+/* Pull mode: the same protocol, but this side opens the connection instead of
+ * waiting for the client. A server that cannot be dialled from outside - a
+ * laptop behind NAT, a machine on another network - can then still feed the
+ * screen, and the device re-establishes the stream on its own after a reboot
+ * rather than waiting for the server to notice it went away.
+ *
+ * The target is remembered in NVS. An empty host clears it. */
+bool media_net_pull(const char *host, uint16_t port);
+
+/* Forgets the target, breaks a connection that is already pulling, and goes
+ * back to waiting for a client. */
+void media_net_pull_stop(void);
+
+/* "host:port" while a target is set, "" otherwise. */
+const char *media_net_pull_target(void);
+
 /* The source for airplay_config_t.live_source, or NULL when no capture client
  * is configured. Geometry tracks the client's configure packet, so call it when
  * the session starts rather than holding on to the pointer across sessions. */

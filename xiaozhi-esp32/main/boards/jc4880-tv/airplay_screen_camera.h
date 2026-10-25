@@ -24,6 +24,10 @@ public:
     bool SetHMirror(bool enabled) override;
     bool SetVFlip(bool enabled) override;
     std::expected<std::string, std::string> Explain(const std::string& question) override;
+    /* Upload an externally-provided JPEG (e.g. a screenshot pushed over the
+     * bench API) through the same cloud vision pipeline as Explain(). */
+    std::expected<std::string, std::string> ExplainJpeg(const uint8_t* jpeg, size_t jpeg_len,
+                                                        const std::string& question);
 
 private:
     uint16_t width_;

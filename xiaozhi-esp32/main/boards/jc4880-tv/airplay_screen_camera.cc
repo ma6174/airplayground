@@ -64,6 +64,24 @@ std::expected<std::string, std::string> AirplayScreenCamera::Explain(const std::
         return std::unexpected("Failed to encode image to JPEG");
     }
 
+    auto result = ExplainJpeg(jpeg, jpeg_len, question);
+    heap_caps_free(jpeg);
+    if (result) {
+        ESP_LOGI(TAG, "Explain: snapshot %u bytes -> jpeg %u bytes, question=%s",
+                 (unsigned)frame_len_, (unsigned)jpeg_len, question.c_str());
+    }
+    return result;
+}
+
+std::expected<std::string, std::string> AirplayScreenCamera::ExplainJpeg(
+        const uint8_t* jpeg, size_t jpeg_len, const std::string& question) {
+    if (explain_url_.empty()) {
+        return std::unexpected("Image explain URL or token is not set");
+    }
+    if (jpeg == nullptr || jpeg_len == 0) {
+        return std::unexpected("No image data");
+    }
+
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
     /* Ten seconds instead of the 30-second default: an unresponsive vision
      * node then fails fast enough for the assistant to retry a different
@@ -82,7 +100,6 @@ std::expected<std::string, std::string> AirplayScreenCamera::Explain(const std::
     auto open = http->Open("POST", explain_url_);
     if (!open) {
         ESP_LOGE(TAG, "Failed to connect to explain URL: %s", open.error().ToString().c_str());
-        heap_caps_free(jpeg);
         return std::unexpected("Failed to connect to explain URL");
     }
 
@@ -110,8 +127,6 @@ std::expected<std::string, std::string> AirplayScreenCamera::Explain(const std::
     if (err.empty()) {
         err = write(reinterpret_cast<const char*>(jpeg), jpeg_len);
     }
-    const size_t jpeg_sent = jpeg_len;
-    heap_caps_free(jpeg);
     if (err.empty()) {
         std::string footer;
         footer += "\r\n--" + boundary + "--\r\n";
@@ -120,6 +135,7 @@ std::expected<std::string, std::string> AirplayScreenCamera::Explain(const std::
     if (err.empty()) {
         err = write("", 0);
     }
+    const size_t jpeg_sent = jpeg_len;
     if (!err.empty()) {
         ESP_LOGE(TAG, "Failed to upload snapshot: %s", err.c_str());
         http->Close();

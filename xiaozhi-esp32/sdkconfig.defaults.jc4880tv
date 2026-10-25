@@ -4,6 +4,10 @@
 CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
 CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
 CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+# 投屏时所有网络流量都挤在这条 SDIO 总线上。默认 40 MHz 在长跑时会出现
+# sdmmc_send_cmd 超时（0x107/0x109），接着 Host is resetting itself，整机复位。
+# 投屏只需要几 Mbps，25 MHz 完全够，留出时序余量。
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=25000
 # esp_hosted 2.13 的 SDIO mempool 默认从内部 DMA 堆分配，这块板的内部堆不够，
 # 会在 app_main 之前的 constructor 里断言循环复位；改从 PSRAM 取即可。
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
@@ -26,4 +30,7 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 # 一个镜像会话自己要占掉控制/视频/音频（TCP+UDP）/NTP/feedback 五六个 socket，
 # 再加上采集端、台架 httpd、mDNS 和小智自己的连接，默认上限 10 个就会耗尽：
 # socket() 失败后 httpd 不再 accept，/airplay/status 在投屏期间完全不应答。
-CONFIG_LWIP_MAX_SOCKETS=24
+# 拉流模式还要多两条（设备主动连过来拉视频/音频），所以留到 32。
+CONFIG_LWIP_MAX_SOCKETS=32
+# 活跃 TCP 的上限：它比 socket 池先见底时，症状一样是 httpd accept 报 ENFILE。
+CONFIG_LWIP_MAX_ACTIVE_TCP=24

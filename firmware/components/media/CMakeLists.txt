@@ -4,6 +4,6 @@ idf_component_register(
     SRCS "src/frames.c" "src/media_avcc.c" "src/media_pattern.c" "src/media_text.c" "src/media_live.c" "src/media_net.c"
     INCLUDE_DIRS "include"
     REQUIRES airplay
-    PRIV_REQUIRES esp_h264 heap lwip
+    PRIV_REQUIRES esp_h264 heap lwip nvs_flash
     EMBED_FILES "font16.bin"
 )
