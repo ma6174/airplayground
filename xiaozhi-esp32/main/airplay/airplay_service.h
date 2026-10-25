@@ -54,6 +54,10 @@ public:
     std::string StatusJson() const;
     bool running() const { return running_.load(); }
 
+    /* True while the session mirrors the capture stream (a pushed or pulled
+     * screen) rather than this device's own UI. */
+    bool showing_capture() const { return capture_source_.load(); }
+
     /* Snapshot of the screen as RGB565 for the bench API. */
     size_t ScreenBytes() const;
     bool CopyScreen(uint8_t* dst, size_t cap);
