@@ -26,4 +26,7 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 # 一个镜像会话自己要占掉控制/视频/音频（TCP+UDP）/NTP/feedback 五六个 socket，
 # 再加上采集端、台架 httpd、mDNS 和小智自己的连接，默认上限 10 个就会耗尽：
 # socket() 失败后 httpd 不再 accept，/airplay/status 在投屏期间完全不应答。
-CONFIG_LWIP_MAX_SOCKETS=24
+# 拉流模式还要多两条（设备主动连过来拉视频/音频），所以留到 32。
+CONFIG_LWIP_MAX_SOCKETS=32
+# 活跃 TCP 的上限：它比 socket 池先见底时，症状一样是 httpd accept 报 ENFILE。
+CONFIG_LWIP_MAX_ACTIVE_TCP=24

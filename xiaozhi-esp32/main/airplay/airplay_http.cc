@@ -307,6 +307,11 @@ void AirplayHttpStart() {
     /* Built-ins plus board-registered endpoints; over the default 8 new URIs
      * would silently 404. */
     config.max_uri_handlers = 16;
+    /* The bench API is polled by one client at a time, so holding seven sockets
+     * open is pure loss: a mirroring session plus a pull connection can need
+     * every one of them, and when the pool runs out httpd stops accepting and
+     * /airplay/status goes silent. */
+    config.max_open_sockets = 4;
 
     httpd_handle_t server = nullptr;
     if (httpd_start(&server, &config) != ESP_OK) {
