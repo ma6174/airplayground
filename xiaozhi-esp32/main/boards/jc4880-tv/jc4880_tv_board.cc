@@ -393,6 +393,104 @@ private:
             [this](const uint8_t* jpeg, size_t jpeg_len, const std::string& question) {
                 return ScreenCamera()->ExplainJpeg(jpeg, jpeg_len, question);
             });
+
+        mcp_server.AddTool(
+            "self.display.image",
+            "Show a picture on the screen people are looking at (the TV this device mirrors to).\n"
+            "The picture fills the screen (black bars keep the aspect ratio) and stays until something "
+            "else takes the screen; an empty url brings the chat user interface back.\n"
+            "Starts mirroring too when nothing is being mirrored yet, and takes the screen away from "
+            "a Mac or server stream that is on it.\n"
+            "Answers at once: the download runs in the background and the picture appears on the TV "
+            "when it is ready (10-40 s for a generated one), so tell the user it is coming instead of "
+            "waiting.\n"
+            "Args:\n"
+            "  `url`: http(s) URL of a JPEG picture: up to 4 MB, up to 2 megapixels, baseline JPEG "
+            "(progressive is refused). An empty string restores the chat UI.\n"
+            "  Anything the user asks to *see or draw* is a generated picture:\n"
+            "    https://image.pollinations.ai/prompt/<prompt>?width=960&height=540\n"
+            "  The prompt is English words with spaces as %20 - \"显示一只猫\" -> "
+            ".../prompt/cat?width=960&height=540, \"画一只柴犬\" -> .../prompt/shiba%20inu?...; "
+            "the generation takes 15-25 s and leaves a small watermark. It is rate limited, "
+            "so call it once per request.\n"
+            "  For a real cat photo instead: https://cataas.com/cat/cute?width=960 - that server "
+            "picks the format of each answer itself and sometimes sends PNG or GIF, which cannot "
+            "be decoded here: call the tool again for another cat.\n"
+            "Return:\n"
+            "  That the picture is on its way (it lands on the TV seconds later), or why not.",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [&airplay, &webcast](const PropertyList& properties) -> ReturnValue {
+                auto url = properties["url"].value<std::string>();
+                if (url.empty()) {
+                    airplay.ShowImageFromUrl("", nullptr);
+                    return std::string("chat user interface restored");
+                }
+                /* A capture or page stream wins the per-session source pick, and
+                 * this picture is the most recent request: let those go so the
+                 * device's own screen is what the TV shows. */
+                const bool was_capture = airplay.showing_capture();
+                media_net_pull_stop();
+                media_net_drop_client();
+                webcast.Stop();
+                /* Fetching the picture takes 15-40 s and a voice turn cannot wait
+                 * that long, so it runs on its own task: the user is answered now,
+                 * the picture lands on the TV when it is ready. */
+                std::string error;
+                if (!airplay.ShowImageFromUrlInBackground(url, &error)) {
+                    return std::string("cannot show the picture: ") + error;
+                }
+                const std::string on_its_way =
+                    "the picture is on its way to the TV (a generated one takes 10-40 s, tell the "
+                    "user it is being drawn)";
+                if (airplay.running()) {
+                    return std::string(was_capture
+                                           ? on_its_way + "; the TV is switching over from the capture "
+                                                          "stream first"
+                                           : on_its_way);
+                }
+                if (!airplay.Start("", false)) {
+                    return std::string(on_its_way + ", but mirroring did not start: ") +
+                           airplay.StatusJson();
+                }
+                switch (airplay.WaitForStart(8000)) {
+                    case AirplayService::StartState::kEstablished:
+                        return on_its_way;
+                    case AirplayService::StartState::kPinRequired:
+                        return std::string(on_its_way +
+                                           ", but the receiver shows a 4-digit code: ask the user for "
+                                           "it and call self.airplay.enter_pin");
+                    case AirplayService::StartState::kFailed:
+                        return std::string(on_its_way + ", but mirroring failed: ") +
+                               airplay.StatusJson();
+                    case AirplayService::StartState::kTimeout:
+                    default:
+                        return std::string(on_its_way + ", mirroring still connecting: ") +
+                               airplay.StatusJson();
+                }
+            });
+
+        mcp_server.AddTool(
+            "self.airplay.photo",
+            "Send a picture to an AirPlay receiver with the photo protocol: the receiver gets the "
+            "original JPEG and renders it at full resolution, without a mirroring session.\n"
+            "Only legacy receivers (old AirTunes boxes, some projectors) accept it; other receivers "
+            "refuse and self.display.image (through mirroring) is the way.\n"
+            "Args:\n"
+            "  `url`: http(s) URL of a JPEG picture (up to 4 MB)\n"
+            "  `host`: receiver address or name from self.airplay.discover; empty = the receiver "
+            "used last time\n"
+            "Return:\n"
+            "  The receiver's answer. Accepting the request does not prove the picture is on "
+            "screen - ask the user to check the TV.",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("host", kPropertyTypeString, std::string("")),
+            }),
+            [&airplay](const PropertyList& properties) -> ReturnValue {
+                auto url = properties["url"].value<std::string>();
+                auto host = properties["host"].value<std::string>();
+                return airplay.SendPhoto(url, host);
+            });
     }
 
 public:

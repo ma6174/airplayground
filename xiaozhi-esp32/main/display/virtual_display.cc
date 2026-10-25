@@ -11,6 +11,7 @@
 
 #include "lvgl_font.h"
 #include "lvgl_theme.h"
+#include "lvgl_display/lvgl_image.h"
 #include "settings.h"
 
 #define TAG "VirtualDisplay"
@@ -20,7 +21,6 @@ LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_material_symbols_30_4);
 LV_FONT_DECLARE(font_noto_emoji_30_4);
 LV_FONT_DECLARE(font_noto_sans_basic_20_4);
-LV_FONT_DECLARE(font_noto_sans_basic_14_1);
 
 /* Content layer layout: the text never touches the edges, and that margin is
  * also what the font fitting below measures against. */
@@ -146,9 +146,12 @@ VirtualDisplay::VirtualDisplay(int width, int height, int fps) : fps_(fps) {
     width_ = width;
     height_ = height;
     /* Copies of the smaller built-in faces: the theme font is the large one, and
-     * the content layer shrinks to these when the text is long. */
+     * the content layer shrinks to these when the text is long. 20 px is the
+     * smallest face linked: the 14 px one only helps a display shorter than the
+     * 540-line frame here, and it costs 35 KB of an app partition that is within
+     * 20 KB of full. "small" therefore lands on the same face as "medium". */
     medium_font_ = font_noto_sans_basic_20_4;
-    small_font_ = height >= 480 ? font_noto_sans_basic_20_4 : font_noto_sans_basic_14_1;
+    small_font_ = medium_font_;
     InitializeLvgl();
     InitializeThemes();
 
@@ -389,6 +392,10 @@ void VirtualDisplay::SetupUI() {
     lv_obj_set_style_text_line_space(content_label_, kContentLineSpace, 0);
     lv_obj_center(content_label_);
 
+    content_image_ = lv_image_create(content_area_);
+    lv_obj_add_flag(content_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(content_image_);
+
     ApplyTheme();
 }
 
@@ -579,8 +586,54 @@ void VirtualDisplay::PageTimer(void* arg) {
     self->UnlockRender();
 }
 
+void VirtualDisplay::EnterContent() {
+    content_active_ = true;
+    lv_obj_remove_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
+    for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
+        if (label != nullptr) {
+            lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void VirtualDisplay::ExitContent() {
+    content_active_ = false;
+    /* Hidden widgets are never rendered, so the pixels can go before the image
+     * widget is reused. */
+    lv_obj_add_flag(content_image_, LV_OBJ_FLAG_HIDDEN);
+    content_image_data_.reset();
+    lv_obj_add_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
+    for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
+        if (label != nullptr) {
+            lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    /* A subtitle may have arrived while the content owned the screen; the face
+     * only comes back when there is nothing to read. */
+    const char* chat_text = chat_message_label_ ? lv_label_get_text(chat_message_label_) : "";
+    if (emoji_label_ != nullptr && (chat_text == nullptr || chat_text[0] == '\0')) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* The status the state machine kept reporting while the content was up. */
+    if (!hidden_status_.empty() && status_label_ != nullptr) {
+        lv_label_set_text(status_label_, hidden_status_.c_str());
+        hidden_status_.clear();
+    }
+}
+
+void VirtualDisplay::StopContentPages() {
+    pages_.clear();
+    page_index_ = 0;
+    UpdatePageTimer();
+}
+
 void VirtualDisplay::ApplyContentStyle() {
     if (content_area_ == nullptr || content_label_ == nullptr) {
+        return;
+    }
+    /* A picture owns the content layer's background (black letterbox) while it
+     * is up; the text style must not repaint it on a theme change. */
+    if (content_image_data_ != nullptr) {
         return;
     }
     auto* theme = static_cast<LvglTheme*>(current_theme_);
@@ -610,54 +663,61 @@ void VirtualDisplay::ShowText(const std::string& text, const DisplayTextStyle& s
         ShowWebcastLocked(false);
     }
     text_style_ = style;
-    content_active_ = !text.empty();
-    if (content_active_) {
-        content_font_ = SelectContentFont(text, style.size);
-        pages_.clear();
-        page_index_ = 0;
-        const int32_t width = width_ - 2 * kContentMarginX;
-        const int32_t height = height_ - 2 * kContentMarginY;
-        lv_point_t measured{};
-        lv_txt_get_size(&measured, text.c_str(), content_font_, 0, kContentLineSpace, width,
-                        LV_TEXT_FLAG_NONE);
-        if (measured.y > height) {
-            SplitPages(text, content_font_);
-        }
-        if (pages_.empty()) {
-            pages_.push_back(text);
-        }
-        ShowPage();
-        ApplyContentStyle();
-        UpdatePageTimer();
-        lv_obj_remove_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
-        for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
-            if (label != nullptr) {
-                lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
+    if (text.empty()) {
+        StopContentPages();
+        ExitContent();
         return;
     }
 
-    pages_.clear();
-    page_index_ = 0;
+    /* The text takes the screen back from a picture that might be up. */
+    content_image_data_.reset();
+    lv_obj_add_flag(content_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+
+    content_font_ = SelectContentFont(text, style.size);
+    StopContentPages();
+    const int32_t width = width_ - 2 * kContentMarginX;
+    const int32_t height = height_ - 2 * kContentMarginY;
+    lv_point_t measured{};
+    lv_txt_get_size(&measured, text.c_str(), content_font_, 0, kContentLineSpace, width,
+                    LV_TEXT_FLAG_NONE);
+    if (measured.y > height) {
+        SplitPages(text, content_font_);
+    }
+    if (pages_.empty()) {
+        pages_.push_back(text);
+    }
+    ShowPage();
+    ApplyContentStyle();
     UpdatePageTimer();
-    lv_obj_add_flag(content_area_, LV_OBJ_FLAG_HIDDEN);
-    for (auto* label : {status_label_, chat_message_label_, emoji_label_}) {
-        if (label != nullptr) {
-            lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
-        }
+    EnterContent();
+}
+
+void VirtualDisplay::ShowImage(std::unique_ptr<LvglImage> image) {
+    if (!lvgl_ready_ || content_image_ == nullptr) {
+        return;
     }
-    /* A subtitle may have arrived while the text owned the screen; the face
-     * only comes back when there is nothing to read. */
-    const char* chat_text = chat_message_label_ ? lv_label_get_text(chat_message_label_) : "";
-    if (emoji_label_ != nullptr && (chat_text == nullptr || chat_text[0] == '\0')) {
-        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    DisplayLockGuard lock(this);
+    /* The page view sits above every widget, so hand the screen back first. */
+    if (webcast_visible_) {
+        ShowWebcastLocked(false);
     }
-    /* The status the state machine kept reporting while the text was up. */
-    if (!hidden_status_.empty() && status_label_ != nullptr) {
-        lv_label_set_text(status_label_, hidden_status_.c_str());
-        hidden_status_.clear();
+    if (image == nullptr) {
+        StopContentPages();
+        ExitContent();
+        return;
     }
+
+    StopContentPages();
+    content_image_data_ = std::move(image);
+    lv_image_set_src(content_image_, content_image_data_->image_dsc());
+    lv_obj_center(content_image_);
+    lv_obj_remove_flag(content_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(content_label_, LV_OBJ_FLAG_HIDDEN);
+    /* Pictures letterbox on black, whatever the theme or last text said. */
+    lv_obj_set_style_bg_color(content_area_, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(content_area_, LV_OPA_COVER, 0);
+    EnterContent();
 }
 
 void VirtualDisplay::ShowWebcastLocked(bool on) {

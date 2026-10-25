@@ -1,10 +1,12 @@
 #include "airplay_http.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <esp_heap_caps.h>
 #include <esp_http_server.h>
@@ -26,6 +28,8 @@ extern "C" {
 namespace {
 
 constexpr int kMaxQuery = 96;
+/* The longest query value any endpoint takes: an image URL. */
+constexpr size_t kMaxValue = 640;
 /* One screen of text; the POST body carries it raw so the model can send any
  * UTF-8 without percent-encoding games. */
 constexpr size_t kMaxText = 512;
@@ -53,13 +57,21 @@ void PercentDecode(char* value) {
     *out = '\0';
 }
 
-bool QueryValue(httpd_req_t* req, const char* key, char* out, size_t out_len) {
-    char query[kMaxQuery];
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+/* `query_len` covers endpoints with long values (image URLs): the default
+ * kMaxQuery buffer cannot hold them. */
+bool QueryValue(httpd_req_t* req, const char* key, char* out, size_t out_len,
+                size_t query_len = kMaxQuery) {
+    std::vector<char> query(query_len);
+    if (httpd_req_get_url_query_str(req, query.data(), query_len) != ESP_OK) {
         return false;
     }
-    char value[kMaxQuery];
-    if (httpd_query_key_value(query, key, value, sizeof(value)) != ESP_OK) {
+    char value[kMaxValue];
+    /* A caller that asks for a buffer as large as this one would lose the
+     * terminating NUL: the value is copied out with room to spare. */
+    if (out_len > sizeof(value)) {
+        return false;
+    }
+    if (httpd_query_key_value(query.data(), key, value, sizeof(value)) != ESP_OK) {
         return false;
     }
     PercentDecode(value);
@@ -215,6 +227,74 @@ esp_err_t WebcastOpenHandler(httpd_req_t* req) {
 esp_err_t WebcastStopHandler(httpd_req_t* req) {
     WebcastClient::GetInstance().Stop();
     return Reply(req, "{\"ok\":true}");
+}
+
+/* POST /airplay/image[?url=...]: the body is a JPEG picture (Content-Length
+ * required), or `url` points at one and the device downloads it. The picture is
+ * decoded and put on the screen, so a running session mirrors it to the TV. */
+esp_err_t ImageHandler(httpd_req_t* req) {
+    auto& service = AirplayService::GetInstance();
+    char url[512] = {0};
+    if (QueryValue(req, "url", url, sizeof(url), 640)) {
+        std::string error;
+        /* `async=1` is the shape the voice tool has: answer now, let the download
+         * run in the background. The default waits, so a test can check the
+         * picture is up before returning. */
+        char async[8] = {0};
+        const bool background =
+            QueryValue(req, "async", async, sizeof(async)) && (async[0] == '1' || async[0] == 't');
+        const bool ok = background ? service.ShowImageFromUrlInBackground(url, &error)
+                                   : service.ShowImageFromUrl(url, &error);
+        if (!ok) {
+            return Reply(req, (std::string("{\"ok\":false,\"error\":\"") + error + "\"}").c_str());
+        }
+        return Reply(req, background ? "{\"ok\":true,\"async\":true}" : "{\"ok\":true}");
+    }
+
+    char length_hdr[16] = {0};
+    size_t total = 0;
+    if (httpd_req_get_hdr_value_str(req, "Content-Length", length_hdr, sizeof(length_hdr)) == ESP_OK) {
+        total = strtoul(length_hdr, nullptr, 10);
+    }
+    if (total == 0 || total > 4u * 1024 * 1024) {
+        return Reply(req, "{\"ok\":false,\"error\":\"send the JPEG as the body with a Content-Length of up to 4 MB, or use ?url=\"}");
+    }
+    auto* body = static_cast<uint8_t*>(heap_caps_malloc(total, MALLOC_CAP_SPIRAM));
+    if (body == nullptr) {
+        return Reply(req, "{\"ok\":false,\"error\":\"no memory\"}");
+    }
+    size_t got = 0;
+    while (got < total) {
+        const int want = static_cast<int>(std::min(total - got, static_cast<size_t>(8192)));
+        const int read = httpd_req_recv(req, reinterpret_cast<char*>(body) + got, want);
+        if (read <= 0) {
+            break;
+        }
+        got += static_cast<size_t>(read);
+    }
+    if (got != total) {
+        heap_caps_free(body);
+        return Reply(req, "{\"ok\":false,\"error\":\"body shorter than Content-Length\"}");
+    }
+    std::string error;
+    const bool ok = service.ShowImageFromJpeg(body, total, &error);
+    heap_caps_free(body);
+    if (!ok) {
+        return Reply(req, (std::string("{\"ok\":false,\"error\":\"") + error + "\"}").c_str());
+    }
+    return Reply(req, "{\"ok\":true}");
+}
+
+/* POST /airplay/photo?url=...[&host=...]: forwards the picture to a receiver
+ * with the AirPlay photo protocol (PUT /photo), no mirroring session involved. */
+esp_err_t PhotoHandler(httpd_req_t* req) {
+    char url[512] = {0};
+    char host[96] = {0};
+    if (!QueryValue(req, "url", url, sizeof(url), 640)) {
+        return Reply(req, "{\"ok\":false,\"error\":\"missing url\"}");
+    }
+    QueryValue(req, "host", host, sizeof(host), 640);
+    return Reply(req, AirplayService::GetInstance().SendPhoto(url, host).c_str());
 }
 
 /* Body is the text itself; an empty body hands the screen back to the chat UI.
@@ -375,6 +455,8 @@ void AirplayHttpStart() {
         {.uri = "/airplay/webcast_open", .method = HTTP_GET, .handler = WebcastOpenHandler, .user_ctx = nullptr},
         {.uri = "/airplay/webcast_stop", .method = HTTP_GET, .handler = WebcastStopHandler, .user_ctx = nullptr},
         {.uri = "/airplay/text", .method = HTTP_POST, .handler = TextHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/image", .method = HTTP_POST, .handler = ImageHandler, .user_ctx = nullptr},
+        {.uri = "/airplay/photo", .method = HTTP_POST, .handler = PhotoHandler, .user_ctx = nullptr},
         {.uri = "/vision/explain", .method = HTTP_POST, .handler = VisionExplainHandler, .user_ctx = nullptr},
     };
     for (const auto& uri : uris) {
@@ -382,5 +464,6 @@ void AirplayHttpStart() {
     }
     ESP_LOGI(TAG,
              "bench API on http://<device>:8080/airplay/"
-             "{status,start,stop,pull,pin,screen.raw,frame.h264,discover,text} + /vision/explain");
+             "{status,start,stop,pull,pin,screen.raw,frame.h264,discover,text,image,photo} + "
+             "/vision/explain");
 }
