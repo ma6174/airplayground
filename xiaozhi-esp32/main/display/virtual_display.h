@@ -7,10 +7,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <esp_timer.h>
+
+class LvglImage;
 
 /** How the assistant wants its text to look on the TV. */
 struct DisplayTextStyle {
@@ -64,6 +67,11 @@ public:
     void ShowWebcast(bool on);
     bool webcast_visible() const { return webcast_visible_; }
 
+    /* Puts a picture on the whole screen, letterboxed on black; nullptr leaves
+     * picture mode. The image must be RGB565 and already sized to fit the
+     * screen; the display keeps the pixel buffer alive while it is shown. */
+    void ShowImage(std::unique_ptr<LvglImage> image);
+
     /* RGB565 frame the sink encodes, and a counter bumped per rendered frame so
      * it can skip re-encoding an unchanged screen. */
     const uint16_t* framebuffer() const { return framebuffer_; }
@@ -102,6 +110,11 @@ private:
     void ShowPage();
     void UpdatePageTimer();
     static void PageTimer(void* arg);
+    /* Shared by the text and picture content modes: takes the screen away from
+     * the chat widgets, and gives it back. */
+    void EnterContent();
+    void ExitContent();
+    void StopContentPages();
 
     uint16_t* framebuffer_ = nullptr;
     std::atomic<uint32_t> frame_counter_{0};
@@ -119,6 +132,9 @@ private:
     lv_obj_t* chat_message_label_ = nullptr;
     lv_obj_t* content_area_ = nullptr;
     lv_obj_t* content_label_ = nullptr;
+    lv_obj_t* content_image_ = nullptr;
+    /* Pixels of the picture on screen, kept alive while content_image_ shows it. */
+    std::unique_ptr<LvglImage> content_image_data_;
     /* The theme font is the largest size; these copies exist only so long text
      * can shrink instead of being cut off. Copies, not references: a fallback
      * chain has to be attached to a mutable lv_font_t. */

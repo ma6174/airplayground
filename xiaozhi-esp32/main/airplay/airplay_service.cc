@@ -1,9 +1,12 @@
 #include "airplay_service.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -17,8 +20,13 @@
 #include "audio_codec.h"
 #include "cJSON.h"
 #include "display/virtual_display.h"
+#include "lvgl_display/lvgl_image.h"
 #include "settings.h"
 #include "webcast_client.h"
+
+#if SOC_JPEG_DECODE_SUPPORTED
+#include "driver/jpeg_decode.h"
+#endif
 
 #include "esp_h264_enc_param.h"
 #include "esp_h264_enc_single.h"
@@ -436,7 +444,346 @@ size_t CaptureAudioFrame(void* ctx, ap_audio_frame_t* frame) {
     return len;
 }
 
+/* ---------- pictures ---------- */
+
+/* Download and body caps: 4 MB covers photo-sized JPEGs without threatening the
+ * PSRAM budget. Decoding is capped separately: the decoder hands out 2 bytes per
+ * pixel, so the cap keeps the transient frame around 4 MB. */
+constexpr size_t kMaxImageBytes = 4u * 1024 * 1024;
+constexpr uint32_t kMaxImagePixels = 2100000; /* 1920x1080 fits. */
+
+bool DownloadUrl(const std::string& url, size_t cap, std::vector<uint8_t>* out, std::string* error) {
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+    http->SetTimeout(10000);
+    if (auto opened = http->Open("GET", url); !opened) {
+        *error = "cannot open " + url + ": " + opened.error().ToString();
+        return false;
+    }
+    auto status = http->GetStatusCode();
+    if (!status) {
+        *error = "no answer from " + url;
+        http->Close();
+        return false;
+    }
+    if (*status != 200) {
+        *error = "HTTP " + std::to_string(*status) + " for " + url;
+        http->Close();
+        return false;
+    }
+    out->clear();
+    char chunk[4096];
+    for (;;) {
+        auto read = http->Read(chunk, sizeof(chunk));
+        if (!read) {
+            *error = "download failed: " + read.error().ToString();
+            http->Close();
+            return false;
+        }
+        if (*read == 0) {
+            break;
+        }
+        if (out->size() + static_cast<size_t>(*read) > cap) {
+            *error = "the picture is larger than the 4 MB limit";
+            http->Close();
+            return false;
+        }
+        out->insert(out->end(), chunk, chunk + *read);
+    }
+    http->Close();
+    if (out->empty()) {
+        *error = "the server sent no body: " + url;
+        return false;
+    }
+    return true;
+}
+
+/* Reads the picture size from the SOF marker, before anything allocates. */
+bool JpegSize(const uint8_t* d, size_t n, int* w, int* h) {
+    if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) {
+        return false;
+    }
+    size_t i = 2;
+    while (i + 4 <= n) {
+        if (d[i] != 0xFF) {
+            i++;
+            continue;
+        }
+        const uint8_t marker = d[i + 1];
+        if (marker == 0xFF) {
+            i++;
+            continue;
+        }
+        /* Standalone markers carry no length field. */
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD9)) {
+            i += 2;
+            continue;
+        }
+        const size_t seg = (static_cast<size_t>(d[i + 2]) << 8) | d[i + 3];
+        if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+            if (i + 9 > n) {
+                return false;
+            }
+            *h = (d[i + 5] << 8) | d[i + 6];
+            *w = (d[i + 7] << 8) | d[i + 8];
+            return *w > 0 && *h > 0;
+        }
+        i += 2 + seg;
+    }
+    return false;
+}
+
+/* Resamples an RGB565 picture to the largest size that fits the screen with the
+ * aspect ratio kept (area average); a picture that already fits is taken 1:1. */
+bool FitToScreen(const uint8_t* src, int sw, int sh, int stride, int screen_w, int screen_h,
+                 uint8_t** out, int* dw, int* dh) {
+    if (sw <= screen_w && sh <= screen_h) {
+        *dw = sw;
+        *dh = sh;
+        *out = static_cast<uint8_t*>(heap_caps_malloc(static_cast<size_t>(sw) * sh * 2,
+                                                      MALLOC_CAP_SPIRAM));
+        if (*out == nullptr) {
+            return false;
+        }
+        for (int y = 0; y < sh; y++) {
+            memcpy(*out + static_cast<size_t>(y) * sw * 2, src + static_cast<size_t>(y) * stride,
+                   static_cast<size_t>(sw) * 2);
+        }
+        return true;
+    }
+
+    /* Aspect-true fit: scale = min(screen_w/sw, screen_h/sh), compared without
+     * floating point. */
+    if (static_cast<int64_t>(screen_w) * sh < static_cast<int64_t>(screen_h) * sw) {
+        *dw = screen_w;
+        *dh = std::max(1, static_cast<int>(static_cast<int64_t>(sh) * screen_w / sw));
+    } else {
+        *dh = screen_h;
+        *dw = std::max(1, static_cast<int>(static_cast<int64_t>(sw) * screen_h / sh));
+    }
+
+    *out = static_cast<uint8_t*>(heap_caps_malloc(static_cast<size_t>(*dw) * *dh * 2,
+                                                  MALLOC_CAP_SPIRAM));
+    if (*out == nullptr) {
+        return false;
+    }
+    for (int y = 0; y < *dh; y++) {
+        const int sy0 = static_cast<int>(static_cast<int64_t>(y) * sh / *dh);
+        int sy1 = static_cast<int>(static_cast<int64_t>(y + 1) * sh / *dh);
+        if (sy1 <= sy0) {
+            sy1 = sy0 + 1;
+        }
+        auto* dst_row = reinterpret_cast<uint16_t*>(*out + static_cast<size_t>(y) * *dw * 2);
+        for (int x = 0; x < *dw; x++) {
+            const int sx0 = static_cast<int>(static_cast<int64_t>(x) * sw / *dw);
+            int sx1 = static_cast<int>(static_cast<int64_t>(x + 1) * sw / *dw);
+            if (sx1 <= sx0) {
+                sx1 = sx0 + 1;
+            }
+            uint32_t r = 0;
+            uint32_t g = 0;
+            uint32_t b = 0;
+            uint32_t count = 0;
+            for (int sy = sy0; sy < sy1; sy++) {
+                const auto* row = reinterpret_cast<const uint16_t*>(src + static_cast<size_t>(sy) * stride);
+                for (int sx = sx0; sx < sx1; sx++) {
+                    const uint16_t p = row[sx];
+                    r += (p >> 11) & 0x1F;
+                    g += (p >> 5) & 0x3F;
+                    b += p & 0x1F;
+                    count++;
+                }
+            }
+            dst_row[x] = static_cast<uint16_t>((r / count) << 11 | (g / count) << 5 | (b / count));
+        }
+    }
+    return true;
+}
+
+#if SOC_JPEG_DECODE_SUPPORTED
+/* The chip decodes JPEG in hardware; calling the driver directly keeps the
+ * 130 KB software codec (esp_new_jpeg) out of the image and is faster too.
+ * Baseline JPEG only: the engine rejects progressive files. */
+bool ShowJpegOnDisplay(VirtualDisplay* display, const uint8_t* jpeg, size_t len, std::string* error) {
+    int w = 0;
+    int h = 0;
+    if (!JpegSize(jpeg, len, &w, &h)) {
+        *error = "the data is not a JPEG picture";
+        return false;
+    }
+    if (static_cast<uint32_t>(w) * h > kMaxImagePixels) {
+        *error = "the picture is " + std::to_string(w) + "x" + std::to_string(h) +
+                 ", above the 2 megapixel decode limit; resize it first";
+        return false;
+    }
+
+    jpeg_decode_engine_cfg_t engine_cfg = {
+        .intr_priority = 1,
+        .timeout_ms = 2000,
+    };
+    jpeg_decoder_handle_t decoder = nullptr;
+    if (jpeg_new_decoder_engine(&engine_cfg, &decoder) != ESP_OK) {
+        *error = "cannot start the JPEG engine";
+        return false;
+    }
+
+    jpeg_decode_memory_alloc_cfg_t tx_cfg = {
+        .buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER,
+    };
+    size_t tx_size = 0;
+    auto* bit_stream = static_cast<uint8_t*>(jpeg_alloc_decoder_mem(len, &tx_cfg, &tx_size));
+    jpeg_decode_memory_alloc_cfg_t rx_cfg = {
+        .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+    };
+    memcpy(bit_stream, jpeg, len);
+
+    /* Ask the engine what the file really is before sizing the output: 420/422
+     * come out padded to whole MCUs (16 px), 444 and gray come out unpadded. */
+    jpeg_decode_picture_info_t info = {};
+    if (jpeg_decoder_get_info(bit_stream, len, &info) != ESP_OK) {
+        heap_caps_free(bit_stream);
+        jpeg_del_decoder_engine(decoder);
+        *error = "not a supported (baseline) JPEG";
+        return false;
+    }
+    const size_t out_w = info.width;
+    const size_t out_h = info.height;
+    size_t out_len = 0;
+    int stride = 0;
+    bool gray = false;
+    switch (info.sample_method) {
+        case JPEG_DOWN_SAMPLING_GRAY:
+            out_len = out_w * out_h * 2;
+            stride = out_w * 2;
+            gray = true;
+            break;
+        case JPEG_DOWN_SAMPLING_YUV444:
+            out_len = out_w * out_h * 2;
+            stride = out_w * 2;
+            break;
+        case JPEG_DOWN_SAMPLING_YUV422:
+        case JPEG_DOWN_SAMPLING_YUV420:
+            out_len = ((out_w + 15) & ~15u) * ((out_h + 15) & ~15u) * 2;
+            stride = static_cast<int>(((out_w + 15) & ~15u) * 2);
+            break;
+        default:
+            heap_caps_free(bit_stream);
+            jpeg_del_decoder_engine(decoder);
+            *error = "the JPEG sampling is not supported";
+            return false;
+    }
+    size_t rx_size = 0;
+    auto* out_buf = static_cast<uint8_t*>(jpeg_alloc_decoder_mem(out_len, &rx_cfg, &rx_size));
+    if (out_buf == nullptr || rx_size < out_len) {
+        heap_caps_free(bit_stream);
+        jpeg_del_decoder_engine(decoder);
+        *error = "no memory for the JPEG decode";
+        return false;
+    }
+
+    jpeg_decode_cfg_t decode_cfg = {
+        .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
+    };
+    uint32_t produced = 0;
+    const bool decoded =
+        jpeg_decoder_process(decoder, &decode_cfg, bit_stream, len, out_buf, out_len, &produced) ==
+            ESP_OK &&
+        (produced == out_len || (gray && produced == out_w * out_h));
+    jpeg_del_decoder_engine(decoder);
+    heap_caps_free(bit_stream);
+    if (!decoded) {
+        heap_caps_free(out_buf);
+        *error = "JPEG decode failed";
+        return false;
+    }
+
+    uint8_t* pixels = out_buf;
+    if (gray) {
+        /* The engine hands grayscale out as one byte per pixel; expand it to
+         * RGB565 in place, from the back so nothing is clobbered. */
+        const size_t count = out_w * out_h;
+        for (size_t i = count; i > 0; i--) {
+            const uint8_t gray_value = pixels[i - 1];
+            const auto r5 = static_cast<uint16_t>(gray_value >> 3);
+            const auto g6 = static_cast<uint16_t>(gray_value >> 2);
+            const uint16_t rgb565 = static_cast<uint16_t>((r5 << 11) | (g6 << 5) | r5);
+            pixels[2 * (i - 1) + 1] = static_cast<uint8_t>(rgb565 >> 8);
+            pixels[2 * (i - 1)] = static_cast<uint8_t>(rgb565);
+        }
+    }
+
+    uint8_t* fitted = nullptr;
+    int fw = 0;
+    int fh = 0;
+    const bool ok = FitToScreen(pixels, w, h, stride, display->width(), display->height(), &fitted,
+                                &fw, &fh);
+    heap_caps_free(out_buf);
+    if (!ok) {
+        *error = "no memory for the picture";
+        return false;
+    }
+
+    auto image = std::make_unique<LvglAllocatedImage>(fitted, static_cast<size_t>(fw) * fh * 2, fw,
+                                                      fh, fw * 2, LV_COLOR_FORMAT_RGB565);
+    if (!image->IsValid()) {
+        *error = "the decoded picture is unusable";
+        return false;
+    }
+    display->ShowImage(std::move(image));
+    ESP_LOGI(TAG, "picture on screen: %dx%d -> %dx%d", w, h, fw, fh);
+    return true;
+}
+#else
+bool ShowJpegOnDisplay(VirtualDisplay* display, const uint8_t* jpeg, size_t len, std::string* error) {
+    (void)display;
+    (void)jpeg;
+    (void)len;
+    *error = "this board cannot decode JPEG";
+    return false;
+}
+#endif
+
+/* The legacy photo protocol is one HTTP PUT of the JPEG bytes to /photo on the
+ * receiver's AirTunes port, with no mirroring session involved. */
+std::string PutPhoto(const std::string& host, uint16_t port, const uint8_t* jpeg, size_t len,
+                     bool* accepted) {
+    const std::string target = "http://" + host + ":" + std::to_string(port) + "/photo";
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+    http->SetTimeout(10000);
+    http->SetHeader("Content-Type", "image/jpeg");
+    http->SetHeader("X-Apple-HDCPStatus", "No HDCP");
+    http->SetContent(std::string(reinterpret_cast<const char*>(jpeg), len));
+    if (auto opened = http->Open("PUT", target); !opened) {
+        *accepted = false;
+        return "cannot reach " + target + ": " + opened.error().ToString();
+    }
+    auto status = http->GetStatusCode();
+    http->Close();
+    if (!status) {
+        *accepted = false;
+        return "the receiver sent no HTTP answer to " + target;
+    }
+    *accepted = *status == 200;
+    if (*accepted) {
+        return "receiver accepted the photo; check the TV to confirm it is showing";
+    }
+    return "receiver refused the photo: HTTP " + std::to_string(*status);
+}
+
 }  // namespace
+
+/* One picture job: what was asked, the payload, and how it ended. Lives on the
+ * heap; the worker frees it after the grace delay (see ImageTask). */
+struct AirplayService::ImageJob {
+    enum class Kind { kShowUrl, kShowJpeg, kPhoto };
+    Kind kind = Kind::kShowUrl;
+    std::string url;
+    std::string host;            /* kPhoto: receiver expression. */
+    std::vector<uint8_t> jpeg;   /* kShowJpeg input; kPhoto payload. */
+    bool ok = false;
+    std::string result;
+    SemaphoreHandle_t done = nullptr;
+};
 
 AirplayService& AirplayService::GetInstance() {
     static AirplayService instance;
@@ -484,6 +831,54 @@ void AirplayService::Remember(const std::string& host, bool legacy) const {
     settings.SetString("legacy", legacy ? "1" : "0");
 }
 
+/* Turns a receiver expression into host + port + transport. An empty expression
+ * falls back to the remembered receiver (with its transport); anything that is
+ * not an address is looked up in the discovery list, which also decides the
+ * transport: AppleTV3,2-style boxes only speak legacy AirTunes. */
+bool AirplayService::ResolveReceiver(const std::string& expr, std::string* host, uint16_t* port,
+                                     bool* legacy, std::string* name) const {
+    std::string target = expr;
+    if (target.empty()) {
+        target = ResolveHost();
+        /* Asked to reuse the last receiver: it was remembered together with the
+         * way it has to be spoken to (a projector only answers legacy AirTunes). */
+        *legacy = *legacy || ResolveLegacy();
+    }
+    name->clear();
+    if (!target.empty() && !LooksLikeAddress(target)) {
+        airplay_target_t found = {};
+        if (!ap_discovery_find(target.c_str(), &found)) {
+            ESP_LOGE(TAG, "no receiver named \"%s\"; self.airplay.discover lists them",
+                     target.c_str());
+            return false;
+        }
+        *name = found.name;
+        *legacy = *legacy || found.legacy;
+        target = std::string(found.host) + ":" + std::to_string(found.port);
+        ESP_LOGI(TAG, "\"%s\" resolved to %s (%s)", found.name, target.c_str(),
+                 found.legacy ? "legacy AirTunes" : "HAP");
+    }
+    if (target.empty()) {
+        ESP_LOGE(TAG, "no receiver address; pass one in or set CONFIG_AIRPLAY_DEFAULT_HOST");
+        return false;
+    }
+
+    /* "host:port" for receivers whose RTSP does not live on 7001/7000; the
+     * projector advertises 7001, the real RTSP service answers on 7002. */
+    uint16_t parsed_port = 7000;
+    const auto colon = target.rfind(':');
+    if (colon != std::string::npos && target.find(':') == colon) {
+        int parsed = atoi(target.c_str() + colon + 1);
+        if (parsed > 0 && parsed < 65536) {
+            parsed_port = static_cast<uint16_t>(parsed);
+            target.resize(colon);
+        }
+    }
+    *host = target;
+    *port = parsed_port;
+    return true;
+}
+
 bool AirplayService::Start(const std::string& host, bool legacy) {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) {
@@ -491,49 +886,14 @@ bool AirplayService::Start(const std::string& host, bool legacy) {
         return false;
     }
 
-    std::string target = host;
-    if (target.empty()) {
-        target = ResolveHost();
-        /* Asked to reuse the last receiver: it was remembered together with the
-         * way it has to be spoken to (a projector only answers legacy AirTunes). */
-        legacy = legacy || ResolveLegacy();
-    }
-    name_.clear();
-    /* A named receiver resolves through the discovery list, which also decides
-     * the transport: AppleTV3,2-style boxes only speak legacy AirTunes. */
-    if (!target.empty() && !LooksLikeAddress(target)) {
-        airplay_target_t found = {};
-        if (!ap_discovery_find(target.c_str(), &found)) {
-            ESP_LOGE(TAG, "no receiver named \"%s\"; self.airplay.discover lists them",
-                     target.c_str());
-            running_ = false;
-            return false;
-        }
-        name_ = found.name;
-        legacy = legacy || found.legacy;
-        target = std::string(found.host) + ":" + std::to_string(found.port);
-        ESP_LOGI(TAG, "\"%s\" resolved to %s (%s)", found.name, target.c_str(),
-                 found.legacy ? "legacy AirTunes" : "HAP");
-    }
-    if (target.empty()) {
-        ESP_LOGE(TAG, "no receiver address; pass one in or set CONFIG_AIRPLAY_DEFAULT_HOST");
+    std::string resolved_host;
+    uint16_t port = 7000;
+    if (!ResolveReceiver(host, &resolved_host, &port, &legacy, &name_)) {
         running_ = false;
         return false;
     }
 
-    /* "host:port" for receivers whose RTSP does not live on 7001/7000; the
-     * projector advertises 7001, the real RTSP service answers on 7002. */
-    uint16_t port = 7000;
-    const auto colon = target.rfind(':');
-    if (colon != std::string::npos && target.find(':') == colon) {
-        int parsed = atoi(target.c_str() + colon + 1);
-        if (parsed > 0 && parsed < 65536) {
-            port = static_cast<uint16_t>(parsed);
-            target.resize(colon);
-        }
-    }
-
-    host_ = target;
+    host_ = resolved_host;
     port_ = port;
     legacy_ = legacy;
     audio_enabled_ = ResolveAudioEnabled();
@@ -857,6 +1217,150 @@ bool AirplayService::EncodeScreenFrame(uint8_t* dst, size_t cap, size_t* len) {
     heap_caps_free(yuv);
     heap_caps_free(annexb);
     return ok;
+}
+
+/* One-shot worker for the picture jobs. Downloading, decoding and the LVGL
+ * update need real stack; the callers (MCP main loop, httpd handler) cannot be
+ * trusted to have it. */
+void AirplayService::ImageTask(void* arg) {
+    auto* job = static_cast<ImageJob*>(arg);
+    auto* self = &AirplayService::GetInstance();
+
+    switch (job->kind) {
+        case ImageJob::Kind::kShowUrl: {
+            std::string error;
+            std::vector<uint8_t> jpeg;
+            if (!DownloadUrl(job->url, kMaxImageBytes, &jpeg, &error)) {
+                job->result = std::move(error);
+                break;
+            }
+            if (!ShowJpegOnDisplay(self->display_, jpeg.data(), jpeg.size(), &error)) {
+                job->result = std::move(error);
+                break;
+            }
+            job->ok = true;
+            break;
+        }
+        case ImageJob::Kind::kShowJpeg: {
+            std::string error;
+            if (!ShowJpegOnDisplay(self->display_, job->jpeg.data(), job->jpeg.size(), &error)) {
+                job->result = std::move(error);
+                break;
+            }
+            job->ok = true;
+            break;
+        }
+        case ImageJob::Kind::kPhoto: {
+            std::string error;
+            if (job->jpeg.empty()) {
+                if (!DownloadUrl(job->url, kMaxImageBytes, &job->jpeg, &error)) {
+                    job->result = std::move(error);
+                    break;
+                }
+            }
+            std::string host;
+            uint16_t port = 7000;
+            bool legacy = false;
+            std::string name;
+            if (!self->ResolveReceiver(job->host, &host, &port, &legacy, &name)) {
+                job->result = "no receiver by that name (self.airplay.discover lists them)";
+                break;
+            }
+            job->result = PutPhoto(host, port, job->jpeg.data(), job->jpeg.size(), &job->ok);
+            break;
+        }
+    }
+
+    if (job->done != nullptr) {
+        xSemaphoreGive(job->done);
+    }
+    /* The caller copies the result right after the semaphore turns; the delay
+     * covers that, and frees the job here when nobody waited for it. */
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    vSemaphoreDelete(job->done);
+    delete job;
+    vTaskDelete(nullptr);
+}
+
+bool AirplayService::RunImageJob(std::unique_ptr<ImageJob> job, std::string* result) {
+    job->done = xSemaphoreCreateBinary();
+    if (job->done == nullptr) {
+        *result = "no memory";
+        return false;
+    }
+    ImageJob* raw = job.release();
+    if (xTaskCreate(ImageTask, "airplay_img", 16 * 1024, raw, 3, nullptr) != pdPASS) {
+        vSemaphoreDelete(raw->done);
+        delete raw;
+        *result = "cannot create the picture task";
+        return false;
+    }
+    /* 30 s covers a slow download plus the decode; past that the attempt is a
+     * failure and the worker cleans the job up on its own. */
+    if (xSemaphoreTake(raw->done, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        *result = "timed out after 30 s";
+        return false;
+    }
+    *result = raw->result;
+    return raw->ok;
+}
+
+bool AirplayService::ShowImageFromUrl(const std::string& url, std::string* error) {
+    if (display_ == nullptr) {
+        if (error != nullptr) {
+            *error = "no screen";
+        }
+        return false;
+    }
+    if (url.empty()) {
+        display_->ShowImage(nullptr);
+        return true;
+    }
+    auto job = std::make_unique<ImageJob>();
+    job->kind = ImageJob::Kind::kShowUrl;
+    job->url = url;
+    std::string result;
+    const bool ok = RunImageJob(std::move(job), &result);
+    if (!ok) {
+        ESP_LOGE(TAG, "show image: %s", result.c_str());
+        if (error != nullptr) {
+            *error = result;
+        }
+    }
+    return ok;
+}
+
+bool AirplayService::ShowImageFromJpeg(const uint8_t* data, size_t len, std::string* error) {
+    if (display_ == nullptr || data == nullptr || len == 0) {
+        if (error != nullptr) {
+            *error = "no screen or no data";
+        }
+        return false;
+    }
+    auto job = std::make_unique<ImageJob>();
+    job->kind = ImageJob::Kind::kShowJpeg;
+    job->jpeg.assign(data, data + len);
+    std::string result;
+    const bool ok = RunImageJob(std::move(job), &result);
+    if (!ok) {
+        ESP_LOGE(TAG, "show image: %s", result.c_str());
+        if (error != nullptr) {
+            *error = result;
+        }
+    }
+    return ok;
+}
+
+std::string AirplayService::SendPhoto(const std::string& url, const std::string& host) {
+    auto job = std::make_unique<ImageJob>();
+    job->kind = ImageJob::Kind::kPhoto;
+    job->url = url;
+    job->host = host;
+    std::string result;
+    if (!RunImageJob(std::move(job), &result)) {
+        return "photo failed: " + result;
+    }
+    return result;
 }
 
 void AirplayService::SessionTask(void* arg) {

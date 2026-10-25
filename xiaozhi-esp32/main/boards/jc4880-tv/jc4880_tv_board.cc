@@ -393,6 +393,49 @@ private:
             [this](const uint8_t* jpeg, size_t jpeg_len, const std::string& question) {
                 return ScreenCamera()->ExplainJpeg(jpeg, jpeg_len, question);
             });
+
+        mcp_server.AddTool(
+            "self.display.image",
+            "Show a picture on the screen people are looking at (the TV this device mirrors to).\n"
+            "The picture fills the screen (black bars keep the aspect ratio) and stays until an empty "
+            "url is passed; the chat user interface comes back then.\n"
+            "Args:\n"
+            "  `url`: http(s) URL of a JPEG picture (up to 4 MB, up to 2 megapixels; progressive "
+            "JPEG is not supported). An empty string restores the chat UI.\n"
+            "Return:\n"
+            "  Whether the picture is now on screen, or why not.",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [&airplay](const PropertyList& properties) -> ReturnValue {
+                auto url = properties["url"].value<std::string>();
+                std::string error;
+                if (!airplay.ShowImageFromUrl(url, &error)) {
+                    return std::string("cannot show the picture: ") + error;
+                }
+                return std::string(url.empty() ? "chat user interface restored" : "picture shown");
+            });
+
+        mcp_server.AddTool(
+            "self.airplay.photo",
+            "Send a picture to an AirPlay receiver with the photo protocol: the receiver gets the "
+            "original JPEG and renders it at full resolution, without a mirroring session.\n"
+            "Only legacy receivers (old AirTunes boxes, some projectors) accept it; other receivers "
+            "refuse and self.display.image (through mirroring) is the way.\n"
+            "Args:\n"
+            "  `url`: http(s) URL of a JPEG picture (up to 4 MB)\n"
+            "  `host`: receiver address or name from self.airplay.discover; empty = the receiver "
+            "used last time\n"
+            "Return:\n"
+            "  The receiver's answer. Accepting the request does not prove the picture is on "
+            "screen - ask the user to check the TV.",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("host", kPropertyTypeString, std::string("")),
+            }),
+            [&airplay](const PropertyList& properties) -> ReturnValue {
+                auto url = properties["url"].value<std::string>();
+                auto host = properties["host"].value<std::string>();
+                return airplay.SendPhoto(url, host);
+            });
     }
 
 public:

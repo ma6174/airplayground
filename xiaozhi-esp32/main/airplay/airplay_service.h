@@ -2,6 +2,7 @@
 #define AIRPLAY_SERVICE_H
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,24 @@ public:
     /* Puts text on the whole screen; an empty string restores the chat UI. The
      * style picks colour, background and text size (auto shrinks long text). */
     bool ShowText(const std::string& text, const DisplayTextStyle& style);
+
+    /* Puts a picture on the whole screen, letterboxed: downloads `url`, decodes
+     * the JPEG and resamples it to the screen. An empty url leaves picture mode.
+     * Blocks (on its own task) until the picture is up or the attempt failed;
+     * the screen content reaches the receiver through the running session.
+     * `error` (optional) carries the reason on failure. */
+    bool ShowImageFromUrl(const std::string& url, std::string* error = nullptr);
+
+    /* Same, for JPEG bytes that are already in memory (the bench API posts them). */
+    bool ShowImageFromJpeg(const uint8_t* data, size_t len, std::string* error = nullptr);
+
+    /* Sends a picture to a receiver with the AirPlay photo protocol: the JPEG is
+     * PUT to the receiver untouched, so it renders at full resolution and without
+     * a mirroring session. Only legacy receivers speak it. `host` follows the
+     * same rules as Start (empty = the receiver used last time). Returns a
+     * one-line result; the HTTP answer says the receiver accepted the request,
+     * not that it rendered the picture. */
+    std::string SendPhoto(const std::string& url, const std::string& host);
 
     /* Feeds the 4-digit code a receiver asks for while pairing. Accepts what
      * speech recognition produces: "1234", "一二三四", or a sentence with the
@@ -91,9 +110,18 @@ private:
     /* Watches for a capture client appearing or going away, and hands the
      * running session over to the source that should be on screen. */
     static void CaptureWatchTask(void* arg);
+    /* One-shot worker for the picture jobs: download + decode + LVGL work must
+     * not depend on the stack of whoever asked (MCP main loop, httpd handler). */
+    struct ImageJob;
+    static void ImageTask(void* arg);
+    bool RunImageJob(std::unique_ptr<ImageJob> job, std::string* result);
     std::string ResolveHost() const;
     bool ResolveLegacy() const;
     bool ResolveAudioEnabled() const;
+    /* Turns a receiver expression (address, address:port, discovery name, or
+     * empty for the remembered one) into host + port + transport. */
+    bool ResolveReceiver(const std::string& expr, std::string* host, uint16_t* port,
+                         bool* legacy, std::string* name) const;
     void Remember(const std::string& host, bool legacy) const;
 
     VirtualDisplay* display_ = nullptr;
